@@ -22,41 +22,57 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/buildutil"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
 func TestStdFlagToPflag(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	cf := cockroachCmd.PersistentFlags()
 	flag.VisitAll(func(f *flag.Flag) {
 		if strings.HasPrefix(f.Name, "test.") {
 			return
 		}
-		n := normalizeStdFlagName(f.Name)
-		if pf := cf.Lookup(n); pf == nil {
-			t.Errorf("unable to find \"%s\"", n)
+		if pf := cf.Lookup(f.Name); pf == nil {
+			t.Errorf("unable to find \"%s\"", f.Name)
 		}
 	})
 }
 
 func TestNoLinkForbidden(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	if build.Default.GOPATH == "" {
 		t.Skip("GOPATH isn't set")
 	}
 
-	imports, err := testutils.TransitiveImports("github.com/cockroachdb/cockroach", true)
+	imports, err := buildutil.TransitiveImports("github.com/cockroachdb/cockroach", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, forbidden := range []string{
-		"testing", // defines flags
+		"testing",  // defines flags
+		"go/build", // probably not something we want in the main binary
 		"github.com/cockroachdb/cockroach/security/securitytest", // contains certificates
 	} {
 		if _, ok := imports[forbidden]; ok {
 			t.Errorf("The cockroach binary includes %s, which is forbidden", forbidden)
 		}
+	}
+}
+
+func TestCacheFlagValue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	f := startCmd.Flags()
+	args := []string{"--cache", "100MB"}
+	if err := f.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := cliContext
+	const expectedCacheSize = 100 * 1000 * 1000
+	if expectedCacheSize != ctx.CacheSize {
+		t.Errorf("expected %d, but got %d", expectedCacheSize, ctx.CacheSize)
 	}
 }

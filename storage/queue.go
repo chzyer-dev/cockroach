@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/context"
 	"golang.org/x/net/trace"
 
 	"github.com/cockroachdb/cockroach/config"
@@ -32,7 +33,8 @@ import (
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
-	"github.com/cockroachdb/cockroach/util/tracing"
+	"github.com/cockroachdb/cockroach/util/timeutil"
+	"github.com/opentracing/opentracing-go"
 )
 
 const (
@@ -110,11 +112,12 @@ type queueImpl interface {
 
 	// shouldQueue accepts current time, a replica, and the system config
 	// and returns whether it should be queued and if so, at what priority.
-	shouldQueue(roachpb.Timestamp, *Replica, *config.SystemConfig) (shouldQueue bool, priority float64)
+	shouldQueue(roachpb.Timestamp, *Replica, config.SystemConfig) (shouldQueue bool, priority float64)
 
 	// process accepts current time, a replica, and the system config
 	// and executes queue-specific work on it.
-	process(roachpb.Timestamp, *Replica, *config.SystemConfig) error
+	// TODO(nvanbenschoten) this should take a context.Context.
+	process(roachpb.Timestamp, *Replica, config.SystemConfig) error
 
 	// timer returns a duration to wait between processing the next item
 	// from the queue.
@@ -140,7 +143,7 @@ func (l queueLog) Infof(logv bool, format string, a ...interface{}) {
 }
 
 func (l queueLog) Errorf(format string, a ...interface{}) {
-	log.Errorf(l.prefix+format, a...)
+	log.ErrorfDepth(1, l.prefix+format, a...)
 	l.traceLog.Errorf(format, a...)
 }
 
@@ -182,6 +185,7 @@ type baseQueue struct {
 	// Some tests in this package disable queues.
 	disabled int32 // updated atomically
 
+	// TODO(tamird): update all queues to use eventLog.
 	eventLog queueLog
 }
 
@@ -252,8 +256,8 @@ func (bq *baseQueue) Add(repl *Replica, priority float64) error {
 // dropped.
 func (bq *baseQueue) MaybeAdd(repl *Replica, now roachpb.Timestamp) {
 	// Load the system config.
-	cfg := bq.gossip.GetSystemConfig()
-	if cfg == nil {
+	cfg, ok := bq.gossip.GetSystemConfig()
+	if !ok {
 		bq.eventLog.Infof(log.V(1), "no system config available. skipping")
 		return
 	}
@@ -350,6 +354,10 @@ func (bq *baseQueue) processLoop(clock *hlc.Clock, stopper *stop.Stopper) {
 
 		for {
 			select {
+			// Exit on stopper.
+			case <-stopper.ShouldStop():
+				return
+
 			// Incoming signal sets the next time to process if there were previously
 			// no replicas in the queue.
 			case <-bq.incoming:
@@ -379,10 +387,6 @@ func (bq *baseQueue) processLoop(clock *hlc.Clock, stopper *stop.Stopper) {
 				} else {
 					nextTime = time.After(bq.impl.timer())
 				}
-
-			// Exit on stopper.
-			case <-stopper.ShouldStop():
-				return
 			}
 		}
 	})
@@ -393,8 +397,8 @@ func (bq *baseQueue) processLoop(clock *hlc.Clock, stopper *stop.Stopper) {
 // while calling this method.
 func (bq *baseQueue) processReplica(repl *Replica, clock *hlc.Clock) error {
 	// Load the system config.
-	cfg := bq.gossip.GetSystemConfig()
-	if cfg == nil {
+	cfg, ok := bq.gossip.GetSystemConfig()
+	if !ok {
 		bq.eventLog.Infof(log.V(1), "no system config available. skipping")
 		return nil
 	}
@@ -411,15 +415,18 @@ func (bq *baseQueue) processReplica(repl *Replica, clock *hlc.Clock) error {
 	// order to be processed, check whether this replica has leader lease
 	// and renew or acquire if necessary.
 	if bq.impl.needsLeaderLease() {
+		sp := repl.store.Tracer().StartSpan(bq.name)
+		ctx := opentracing.ContextWithSpan(repl.context(context.Background()), sp)
+		defer sp.Finish()
 		// Create a "fake" get request in order to invoke redirectOnOrAcquireLease.
-		if err := repl.redirectOnOrAcquireLeaderLease(tracing.NoopSpan()); err != nil {
+		if err := repl.redirectOnOrAcquireLeaderLease(ctx); err != nil {
 			bq.eventLog.Infof(log.V(3), "%s: could not acquire leader lease; skipping", repl)
 			return nil
 		}
 	}
 
 	bq.eventLog.Infof(log.V(3), "%s: processing", repl)
-	start := time.Now()
+	start := timeutil.Now()
 	if err := bq.impl.process(clock.Now(), repl, cfg); err != nil {
 		return err
 	}

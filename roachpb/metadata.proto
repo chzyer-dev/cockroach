@@ -34,6 +34,8 @@ message Attributes {
 // (corresponds to a host:port via lookup on gossip network) and store
 // ID (identifies the device).
 message ReplicaDescriptor {
+  option (gogoproto.populate) = true;
+
   optional int32 node_id = 1 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID"];
   optional int32 store_id = 2 [(gogoproto.nullable) = false,
@@ -68,29 +70,11 @@ message RangeDescriptor {
       (gogoproto.customname) = "NextReplicaID", (gogoproto.casttype) = "ReplicaID"];
 }
 
-// RangeTree holds the root node of the range tree.
-message RangeTree {
-  optional bytes root_key = 1 [(gogoproto.casttype) = "RKey"];
-}
-
-// RangeTreeNode holds the configuration for each node of the Red-Black Tree that references all ranges.
-message RangeTreeNode {
-  optional bytes key = 1 [(gogoproto.casttype) = "RKey"];
-
-  // Color is black if true, red if false.
-  optional bool black = 2 [(gogoproto.nullable) = false];
-
-  // If the parent key is null, this is the root node.
-  optional bytes parent_key = 3 [(gogoproto.casttype) = "RKey"];
-  optional bytes left_key = 4 [(gogoproto.casttype) = "RKey"];
-  optional bytes right_key = 5 [(gogoproto.casttype) = "RKey"];
-}
-
 // StoreCapacity contains capacity information for a storage device.
 message StoreCapacity {
-  optional int64 Capacity = 1 [(gogoproto.nullable) = false];
-  optional int64 Available = 2 [(gogoproto.nullable) = false];
-  optional int32 RangeCount = 3 [(gogoproto.nullable) = false];
+  optional int64 capacity = 1 [(gogoproto.nullable) = false];
+  optional int64 available = 2 [(gogoproto.nullable) = false];
+  optional int32 range_count = 3 [(gogoproto.nullable) = false];
 }
 
 // NodeDescriptor holds details on node physical/network topology.

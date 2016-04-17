@@ -24,7 +24,7 @@ import (
 )
 
 // CreateDatabase creates a database.
-// Privileges: "root" user.
+// Privileges: security.RootUser user.
 //   Notes: postgres requires superuser or "CREATEDB".
 //          mysql uses the mysqladmin command.
 func (p *planner) CreateDatabase(n *parser.CreateDatabase) (planNode, *roachpb.Error) {
@@ -32,7 +32,7 @@ func (p *planner) CreateDatabase(n *parser.CreateDatabase) (planNode, *roachpb.E
 		return nil, roachpb.NewError(errEmptyDatabaseName)
 	}
 
-	if p.user != security.RootUser {
+	if p.session.User != security.RootUser {
 		return nil, roachpb.NewUErrorf("only %s is allowed to create databases", security.RootUser)
 	}
 
@@ -44,7 +44,7 @@ func (p *planner) CreateDatabase(n *parser.CreateDatabase) (planNode, *roachpb.E
 	}
 	if created {
 		// Log Create Database event.
-		if pErr := MakeEventLogger(p.leaseMgr).insertEventRecord(p.txn,
+		if pErr := MakeEventLogger(p.leaseMgr).InsertEventRecord(p.txn,
 			EventLogCreateDatabase,
 			int32(desc.ID),
 			int32(p.evalCtx.NodeID),
@@ -52,7 +52,7 @@ func (p *planner) CreateDatabase(n *parser.CreateDatabase) (planNode, *roachpb.E
 				DatabaseName string
 				Statement    string
 				User         string
-			}{n.Name.String(), n.String(), p.user},
+			}{n.Name.String(), n.String(), p.session.User},
 		); pErr != nil {
 			return nil, pErr
 		}
@@ -142,7 +142,7 @@ func (p *planner) CreateTable(n *parser.CreateTable) (planNode, *roachpb.Error) 
 
 	if len(desc.PrimaryIndex.ColumnNames) == 0 {
 		// Ensure a Primary Key exists.
-		s := "experimental_unique_int()"
+		s := "unique_rowid()"
 		col := ColumnDescriptor{
 			Name: "rowid",
 			Type: ColumnType{
@@ -174,7 +174,7 @@ func (p *planner) CreateTable(n *parser.CreateTable) (planNode, *roachpb.Error) 
 
 	if created {
 		// Log Create Table event.
-		if pErr := MakeEventLogger(p.leaseMgr).insertEventRecord(p.txn,
+		if pErr := MakeEventLogger(p.leaseMgr).InsertEventRecord(p.txn,
 			EventLogCreateTable,
 			int32(desc.ID),
 			int32(p.evalCtx.NodeID),
@@ -182,7 +182,7 @@ func (p *planner) CreateTable(n *parser.CreateTable) (planNode, *roachpb.Error) 
 				TableName string
 				Statement string
 				User      string
-			}{n.Table.String(), n.String(), p.user},
+			}{n.Table.String(), n.String(), p.session.User},
 		); pErr != nil {
 			return nil, pErr
 		}

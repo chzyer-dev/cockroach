@@ -20,13 +20,17 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
 // TestBatchPrevNext tests batch.{Prev,Next}.
 func TestBatchPrevNext(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
+	loc := func(s string) string {
+		return string(keys.RangeDescriptorKey(roachpb.RKey(s)))
+	}
 	span := func(strs ...string) []roachpb.Span {
 		var r []roachpb.Span
 		for i, str := range strs {
@@ -52,6 +56,8 @@ func TestBatchPrevNext(t *testing.T) {
 		{spans: abc, key: "b\x00", expFW: "c", expBW: "b\x00"},
 		{spans: abc, key: "bb", expFW: "c", expBW: "b"},
 		{spans: span(), key: "whatevs", expFW: max, expBW: min},
+		{spans: span(loc("a"), loc("c")), key: "c", expFW: "c", expBW: "c"},
+		{spans: span(loc("a"), loc("c")), key: "c\x00", expFW: max, expBW: "c\x00"},
 	}
 
 	for i, test := range testCases {
@@ -61,10 +67,14 @@ func TestBatchPrevNext(t *testing.T) {
 			args.Key, args.EndKey = span.Key, span.EndKey
 			ba.Add(args)
 		}
-		if next := next(ba, roachpb.RKey(test.key)); !bytes.Equal(next, roachpb.Key(test.expFW)) {
+		if next, err := next(ba, roachpb.RKey(test.key)); err != nil {
+			t.Errorf("%d: %v", i, err)
+		} else if !bytes.Equal(next, roachpb.Key(test.expFW)) {
 			t.Errorf("%d: next: expected %q, got %q", i, test.expFW, next)
 		}
-		if prev := prev(ba, roachpb.RKey(test.key)); !bytes.Equal(prev, roachpb.Key(test.expBW)) {
+		if prev, err := prev(ba, roachpb.RKey(test.key)); err != nil {
+			t.Errorf("%d: %v", i, err)
+		} else if !bytes.Equal(prev, roachpb.Key(test.expBW)) {
 			t.Errorf("%d: prev: expected %q, got %q", i, test.expBW, prev)
 		}
 	}

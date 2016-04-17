@@ -17,73 +17,20 @@
 package util
 
 import (
-	"net"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
-// verifyAddr starts a server listener at the specified addr and
-// then dials a client to verify a connection is established.
-func verifyAddr(addr net.Addr, t *testing.T) {
-	ln, err := net.Listen(addr.Network(), addr.String())
-	if err != nil {
-		t.Error(err)
-		return
-	}
-
-	acceptChan := make(chan struct{})
-	go func() {
-		_, err := ln.Accept()
-		if err != nil {
-			t.Error(err)
-		}
-		close(acceptChan)
-	}()
-
-	addr = ln.Addr()
-	conn, err := net.Dial(addr.Network(), addr.String())
-	if err != nil {
-		t.Errorf("could not connect to %s", addr)
-		return
-	}
-	select {
-	case <-acceptChan:
-		// success.
-	case <-time.After(500 * time.Millisecond):
-		t.Error("timeout waiting for client connection after 500ms")
-	}
-	conn.Close()
-}
-
-func TestCreateTestAddr(t *testing.T) {
-	verifyAddr(CreateTestAddr("unix"), t)
-	verifyAddr(CreateTestAddr("tcp"), t)
-}
-
-func TestTrueWithin(t *testing.T) {
-	// Start with a function that never returns true.
-	if err := IsTrueWithin(func() bool { return false }, 1*time.Millisecond); err == nil {
-		t.Error("expected true within to fail on method which always returns false")
-	}
-	// Try a method which always returns true.
-	if err := IsTrueWithin(func() bool { return true }, 1*time.Millisecond); err != nil {
-		t.Errorf("unexpected error on method which always returns true: %v", err)
-	}
-	// Try a method which returns true on 5th invocation.
-	count := 0
-	if err := IsTrueWithin(func() bool { count++; return count >= 5 }, 1*time.Millisecond); err != nil {
-		t.Errorf("unexpected error on method which returns true after 5 invocations: %v", err)
-	}
-}
-
-func TestSucceedsWithin(t *testing.T) {
+func TestSucceedsSoon(t *testing.T) {
 	// Try a method which always succeeds.
-	SucceedsWithin(t, 1*time.Millisecond, func() error { return nil })
+	SucceedsSoon(t, func() error { return nil })
 
 	// Try a method which succeeds after a known duration.
-	start := time.Now()
+	start := timeutil.Now()
 	duration := time.Millisecond * 10
-	SucceedsWithin(t, 100*duration, func() error {
+	SucceedsSoon(t, func() error {
 		elapsed := time.Since(start)
 		if elapsed > duration {
 			return nil

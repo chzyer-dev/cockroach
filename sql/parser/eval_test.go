@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/testutils"
 )
 
@@ -314,12 +315,14 @@ func TestEval(t *testing.T) {
 		{`b'\xff'`, `b'\xff'`},
 		{`123::text`, `'123'`},
 		{`'2010-09-28'::date`, `2010-09-28`},
+		{`'2010-09-28T12:00:00Z'::date`, `2010-09-28`},
 		{`'2010-09-28'::timestamp`, `2010-09-28 00:00:00+00:00`},
 		{`('2010-09-28 12:00:00.1'::timestamp)::date`, `2010-09-28`},
 		{`'2010-09-28 12:00:00.1'::timestamp`, `2010-09-28 12:00:00.1+00:00`},
 		{`'2010-09-28 12:00:00.1+02:00'::timestamp`, `2010-09-28 10:00:00.1+00:00`},
 		{`'2010-09-28 12:00:00.1-07:00'::timestamp`, `2010-09-28 19:00:00.1+00:00`},
 		{`'2010-09-28T12:00:00'::timestamp`, `2010-09-28 12:00:00+00:00`},
+		{`'2010-09-28T12:00:00Z'::timestamp`, `2010-09-28 12:00:00+00:00`},
 		{`'2010-09-28T12:00:00.1'::timestamp`, `2010-09-28 12:00:00.1+00:00`},
 		{`('2010-09-28'::date)::timestamp`, `2010-09-28 00:00:00+00:00`},
 		{`'12h2m1s23ms'::interval`, `12h2m1.023s`},
@@ -393,12 +396,15 @@ func TestEvalError(t *testing.T) {
 	}{
 		{`1 % 0`, `zero modulus`},
 		{`1 / 0`, `division by zero`},
-		{`'2010-09-28 12:00:00.1'::date`, `parsing time "2010-09-28 12:00:00.1": extra text`},
-		{`'2010-09-28 12:00.1 MST'::timestamp`, `could not parse '2010-09-28 12:00.1 MST' in any supported timestamp format`},
+		{`'2010-09-28 12:00:00.1'::date`,
+			`could not parse '2010-09-28 12:00:00.1' in any supported date format`},
+		{`'2010-09-28 12:00.1 MST'::timestamp`,
+			`could not parse '2010-09-28 12:00.1 MST' in any supported timestamp format`},
 		{`'11h2m'::interval / 0`, `division by zero`},
 		{`'hello' || b'world'`, `unsupported binary operator: <string> || <bytes>`},
 		{`b'\xff\xfe\xfd'::string`, `invalid utf8: "\xff\xfe\xfd"`},
-		{`'' LIKE ` + string([]byte{0x27, 0xc2, 0x30, 0x7a, 0xd5, 0x25, 0x30, 0x27}), `LIKE regexp compilation failed: error parsing regexp: invalid UTF-8: .*`},
+		{`'' LIKE ` + string([]byte{0x27, 0xc2, 0x30, 0x7a, 0xd5, 0x25, 0x30, 0x27}),
+			`LIKE regexp compilation failed: error parsing regexp: invalid UTF-8: .*`},
 		// TODO(pmattis): Check for overflow.
 		// {`~0 + 1`, `0`},
 	}
@@ -471,6 +477,33 @@ func TestSimilarEscape(t *testing.T) {
 	}
 }
 
+func TestClusterTimestampConversion(t *testing.T) {
+	testData := []struct {
+		walltime int64
+		logical  int32
+		expected string
+	}{
+		{0, 0, "0.0000000000"},
+		{42, 0, "42.0000000000"},
+		{-42, 0, "-42.0000000000"},
+		{42, 69, "42.0000000069"},
+		{42, 2147483647, "42.2147483647"},
+		{9223372036854775807, 2147483647, "9223372036854775807.2147483647"},
+	}
+
+	ctx := defaultContext
+	ctx.PrepareOnly = true
+	for _, d := range testData {
+		ts := roachpb.Timestamp{WallTime: d.walltime, Logical: d.logical}
+		ctx.SetClusterTimestamp(ts)
+		dec := ctx.GetClusterTimestamp()
+		final := dec.String()
+		if final != d.expected {
+			t.Errorf("expected %s, but found %s", d.expected, final)
+		}
+	}
+}
+
 var benchmarkLikePatterns = []string{
 	`test%`,
 	`%test%`,
@@ -484,7 +517,7 @@ var benchmarkLikePatterns = []string{
 }
 
 func benchmarkLike(b *testing.B, ctx EvalContext) {
-	likeFn := cmpOps[cmpArgs{Like, stringType, stringType}].fn
+	likeFn := CmpOps[CmpArgs{Like, stringType, stringType}].fn
 	iter := func() {
 		for _, p := range benchmarkLikePatterns {
 			if _, err := likeFn(ctx, DString("test"), DString(p)); err != nil {

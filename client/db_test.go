@@ -24,7 +24,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util"
@@ -285,33 +284,8 @@ func ExampleDB_Put_insecure() {
 	// aa=1
 }
 
-func TestOpenArgs(t *testing.T) {
-	defer leaktest.AfterTest(t)
-	s := server.StartTestServer(t)
-	defer s.Stop()
-
-	testCases := []struct {
-		addr      string
-		expectErr bool
-	}{
-		{"rpcs://" + server.TestUser + "@" + s.ServingAddr() + "?certs=" + security.EmbeddedCertsDir, false},
-		{"rpcs://" + s.ServingAddr() + "?certs=" + security.EmbeddedCertsDir, false},
-		{"rpcs://" + s.ServingAddr() + "?certs=foo", true},
-		{s.ServingAddr(), true},
-	}
-
-	for _, test := range testCases {
-		_, err := client.Open(s.Stopper(), test.addr)
-		if test.expectErr && err == nil {
-			t.Errorf("Open(%q): expected an error; got %v", test.addr, err)
-		} else if !test.expectErr && err != nil {
-			t.Errorf("Open(%q): expected no errors; got %v", test.addr, err)
-		}
-	}
-}
-
 func TestDebugName(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s, db := setup()
 	defer s.Stop()
 
@@ -327,7 +301,7 @@ func TestDebugName(t *testing.T) {
 }
 
 func TestCommonMethods(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	batchType := reflect.TypeOf(&client.Batch{})
 	dbType := reflect.TypeOf(&client.DB{})
 	txnType := reflect.TypeOf(&client.Txn{})
@@ -343,27 +317,35 @@ func TestCommonMethods(t *testing.T) {
 		// request with the information that this particular Get must be
 		// unmarshaled, which didn't seem worth doing as we're not using
 		// Batch.GetProto at the moment.
-		key{dbType, "GetProto"}:  {},
-		key{txnType, "GetProto"}: {},
-
+		key{dbType, "GetProto"}:                   {},
+		key{txnType, "GetProto"}:                  {},
+		key{batchType, "CheckConsistency"}:        {},
 		key{batchType, "InternalAddRequest"}:      {},
+		key{batchType, "PutInline"}:               {},
 		key{dbType, "AdminMerge"}:                 {},
 		key{dbType, "AdminSplit"}:                 {},
+		key{dbType, "CheckConsistency"}:           {},
 		key{dbType, "NewBatch"}:                   {},
 		key{dbType, "Run"}:                        {},
 		key{dbType, "RunWithResponse"}:            {},
 		key{dbType, "Txn"}:                        {},
 		key{dbType, "GetSender"}:                  {},
+		key{dbType, "GetInconsistent"}:            {},
+		key{dbType, "GetProtoInconsistent"}:       {},
+		key{dbType, "ScanInconsistent"}:           {},
+		key{dbType, "PutInline"}:                  {},
 		key{txnType, "Commit"}:                    {},
 		key{txnType, "CommitBy"}:                  {},
 		key{txnType, "CommitInBatch"}:             {},
 		key{txnType, "CommitInBatchWithResponse"}: {},
-		key{txnType, "CommitNoCleanup"}:           {},
+		key{txnType, "CommitOrCleanup"}:           {},
 		key{txnType, "Rollback"}:                  {},
-		key{txnType, "Cleanup"}:                   {},
+		key{txnType, "CleanupOnError"}:            {},
 		key{txnType, "DebugName"}:                 {},
 		key{txnType, "InternalSetPriority"}:       {},
+		key{txnType, "IsFinalized"}:               {},
 		key{txnType, "NewBatch"}:                  {},
+		key{txnType, "Exec"}:                      {},
 		key{txnType, "Run"}:                       {},
 		key{txnType, "RunWithResponse"}:           {},
 		key{txnType, "SetDebugName"}:              {},
@@ -401,26 +383,32 @@ func TestCommonMethods(t *testing.T) {
 	}
 }
 
-// Verifies that a nested transaction returns an error if an inner txn
-// propagates an error to an outer txn.
+// Verifies that an inner transaction in a nested transaction strips the transaction
+// information in its error when propagating it to an other transaction.
 func TestNestedTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s, db := setup()
 	defer s.Stop()
 
-	txnProto := roachpb.NewTransaction("test", roachpb.Key("a"), 1, roachpb.SERIALIZABLE, roachpb.Timestamp{}, 0)
 	pErr := db.Txn(func(txn1 *client.Txn) *roachpb.Error {
 		if pErr := txn1.Put("a", "1"); pErr != nil {
 			t.Fatalf("unexpected put error: %s", pErr)
 		}
-		return db.Txn(func(txn2 *client.Txn) *roachpb.Error {
-			return roachpb.NewErrorWithTxn(util.Errorf("err"), txnProto)
+		iPErr := db.Txn(func(txn2 *client.Txn) *roachpb.Error {
+			txnProto := roachpb.NewTransaction("test", roachpb.Key("a"), 1, roachpb.SERIALIZABLE, roachpb.Timestamp{}, 0)
+			return roachpb.NewErrorWithTxn(util.Errorf("inner txn error"), txnProto)
 		})
+
+		if iPErr.GetTxn() != nil {
+			t.Errorf("error txn must be stripped: %s", iPErr)
+		}
+		return iPErr
+
 	})
 	if pErr == nil {
 		t.Fatal("unexpected success of txn")
 	}
-	if !testutils.IsPError(pErr, "mismatching transaction record in the error") {
+	if !testutils.IsPError(pErr, "inner txn error") {
 		t.Errorf("unexpected failure: %s", pErr)
 	}
 }

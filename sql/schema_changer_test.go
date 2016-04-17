@@ -17,7 +17,9 @@
 package sql_test
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,11 +29,13 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 	"github.com/cockroachdb/cockroach/util/retry"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 func TestSchemaChangeLease(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	server, sqlDB, _ := setup(t)
 	defer cleanup(server, sqlDB)
 
@@ -49,40 +53,40 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	changer := csql.NewSchemaChangerForTesting(id, 0, node, *db, nil)
 
 	// Acquire a lease.
-	lease, err := changer.AcquireLease()
-	if err != nil {
-		t.Fatal(err)
+	lease, pErr := changer.AcquireLease()
+	if pErr != nil {
+		t.Fatal(pErr)
 	}
 
 	if !validExpirationTime(lease.ExpirationTime) {
-		t.Fatalf("invalid expiration time: %s", time.Unix(lease.ExpirationTime, 0))
+		t.Fatalf("invalid expiration time: %s", time.Unix(0, lease.ExpirationTime))
 	}
 
 	// Acquiring another lease will fail.
 	var newLease csql.TableDescriptor_SchemaChangeLease
-	newLease, err = changer.AcquireLease()
-	if err == nil {
+	newLease, pErr = changer.AcquireLease()
+	if pErr == nil {
 		t.Fatalf("acquired new lease: %v, while unexpired lease exists: %v", newLease, lease)
 	}
 
 	// Extend the lease.
-	newLease, err = changer.ExtendLease(lease)
-	if err != nil {
-		t.Fatal(err)
+	newLease, pErr = changer.ExtendLease(lease)
+	if pErr != nil {
+		t.Fatal(pErr)
 	}
 
 	if !validExpirationTime(newLease.ExpirationTime) {
-		t.Fatalf("invalid expiration time: %s", time.Unix(newLease.ExpirationTime, 0))
+		t.Fatalf("invalid expiration time: %s", time.Unix(0, newLease.ExpirationTime))
 	}
 
 	// Extending an old lease fails.
-	_, err = changer.ExtendLease(lease)
-	if err == nil {
+	_, pErr = changer.ExtendLease(lease)
+	if pErr == nil {
 		t.Fatal("extending an old lease succeeded")
 	}
 
 	// Releasing an old lease fails.
-	err = changer.ReleaseLease(lease)
+	err := changer.ReleaseLease(lease)
 	if err == nil {
 		t.Fatal("releasing a old lease succeeded")
 	}
@@ -94,25 +98,25 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	}
 
 	// Extending the lease fails.
-	_, err = changer.ExtendLease(newLease)
-	if err == nil {
+	_, pErr = changer.ExtendLease(newLease)
+	if pErr == nil {
 		t.Fatalf("was able to extend an already released lease: %d, %v", id, lease)
 	}
 
 	// acquiring the lease succeeds
-	lease, err = changer.AcquireLease()
-	if err != nil {
-		t.Fatal(err)
+	lease, pErr = changer.AcquireLease()
+	if pErr != nil {
+		t.Fatal(pErr)
 	}
 }
 
 func validExpirationTime(expirationTime int64) bool {
-	now := time.Now()
+	now := timeutil.Now()
 	return expirationTime > now.Add(csql.LeaseDuration/2).UnixNano() && expirationTime < now.Add(csql.LeaseDuration*3/2).UnixNano()
 }
 
 func TestSchemaChangeProcess(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
 	defer csql.TestDisableTableLeases()()
@@ -136,9 +140,9 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 
 	// Read table descriptor for version.
 	nameKey := csql.MakeNameMetadataKey(keys.MaxReservedDescID+1, "test")
-	gr, err := kvDB.Get(nameKey)
-	if err != nil {
-		t.Fatal(err)
+	gr, pErr := kvDB.Get(nameKey)
+	if pErr != nil {
+		t.Fatal(pErr)
 	}
 	if !gr.Exists() {
 		t.Fatalf("Name entry %q does not exist", nameKey)
@@ -148,16 +152,16 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 
 	// Check that MaybeIncrementVersion doesn't increment the version
 	// when the up_version bit is not set.
-	if err := kvDB.GetProto(descKey, desc); err != nil {
-		t.Fatal(err)
+	if pErr := kvDB.GetProto(descKey, desc); pErr != nil {
+		t.Fatal(pErr)
 	}
 	expectedVersion := desc.GetTable().Version
 
-	if err := changer.MaybeIncrementVersion(); err != nil {
-		t.Fatal(err)
+	if pErr := changer.MaybeIncrementVersion(); pErr != nil {
+		t.Fatal(pErr)
 	}
-	if err := kvDB.GetProto(descKey, desc); err != nil {
-		t.Fatal(err)
+	if pErr := kvDB.GetProto(descKey, desc); pErr != nil {
+		t.Fatal(pErr)
 	}
 	newVersion := desc.GetTable().Version
 	if newVersion != expectedVersion {
@@ -175,8 +179,8 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	// correctly.
 	expectedVersion++
 	desc.GetTable().UpVersion = true
-	if err := kvDB.Put(descKey, desc); err != nil {
-		t.Fatal(err)
+	if pErr := kvDB.Put(descKey, desc); pErr != nil {
+		t.Fatal(pErr)
 	}
 	isDone, err = changer.IsDone()
 	if err != nil {
@@ -185,11 +189,11 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	if isDone {
 		t.Fatalf("table expected to have an outstanding schema change: %v", desc.GetTable())
 	}
-	if err := changer.MaybeIncrementVersion(); err != nil {
-		t.Fatal(err)
+	if pErr := changer.MaybeIncrementVersion(); pErr != nil {
+		t.Fatal(pErr)
 	}
-	if err := kvDB.GetProto(descKey, desc); err != nil {
-		t.Fatal(err)
+	if pErr := kvDB.GetProto(descKey, desc); pErr != nil {
+		t.Fatal(pErr)
 	}
 	newVersion = desc.GetTable().Version
 	if newVersion != expectedVersion {
@@ -208,8 +212,8 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	if err := changer.RunStateMachineBeforeBackfill(); err != nil {
 		t.Fatal(err)
 	}
-	if err := kvDB.GetProto(descKey, desc); err != nil {
-		t.Fatal(err)
+	if pErr := kvDB.GetProto(descKey, desc); pErr != nil {
+		t.Fatal(pErr)
 	}
 	newVersion = desc.GetTable().Version
 	if newVersion != expectedVersion {
@@ -217,13 +221,13 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	}
 
 	// Check that RunStateMachineBeforeBackfill functions properly.
-	if err := kvDB.GetProto(descKey, desc); err != nil {
-		t.Fatal(err)
+	if pErr := kvDB.GetProto(descKey, desc); pErr != nil {
+		t.Fatal(pErr)
 	}
 	table := desc.GetTable()
 	expectedVersion = table.Version
 	// Make a copy of the index for use in a mutation.
-	index := util.CloneProto(&table.Indexes[0]).(*csql.IndexDescriptor)
+	index := protoutil.Clone(&table.Indexes[0]).(*csql.IndexDescriptor)
 	index.Name = "bar"
 	index.ID = table.NextIndexID
 	table.NextIndexID++
@@ -240,8 +244,8 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	for _, direction := range []csql.DescriptorMutation_Direction{csql.DescriptorMutation_ADD, csql.DescriptorMutation_DROP} {
 		table.Mutations[0].Direction = direction
 		expectedVersion++
-		if err := kvDB.Put(descKey, desc); err != nil {
-			t.Fatal(err)
+		if pErr := kvDB.Put(descKey, desc); pErr != nil {
+			t.Fatal(pErr)
 		}
 		// The expected end state.
 		expectedState := csql.DescriptorMutation_WRITE_ONLY
@@ -253,8 +257,8 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 			if err := changer.RunStateMachineBeforeBackfill(); err != nil {
 				t.Fatal(err)
 			}
-			if err := kvDB.GetProto(descKey, desc); err != nil {
-				t.Fatal(err)
+			if pErr := kvDB.GetProto(descKey, desc); pErr != nil {
+				t.Fatal(pErr)
 			}
 			table = desc.GetTable()
 			newVersion = table.Version
@@ -279,7 +283,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 }
 
 func TestAsyncSchemaChanger(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// Disable synchronous schema change execution so
 	// the asynchronous schema changer executes all
 	// schema changes.
@@ -347,7 +351,7 @@ CREATE INDEX foo ON t.test (v)
 		descKey: descKey,
 		desc:    desc,
 	}
-	indexQuery := `SELECT * FROM t.test@foo`
+	indexQuery := `SELECT v FROM t.test@foo`
 	_ = mTest.checkQueryResponse(indexQuery, [][]string{{"b"}, {"d"}})
 
 	// Ensure that the version has been incremented.
@@ -402,7 +406,125 @@ ALTER INDEX t.test@foo RENAME TO ufo
 		}
 	}
 	for i := 0; i < count; i++ {
-		indexQuery := fmt.Sprintf(`SELECT * FROM t.test@foo%d`, i)
+		indexQuery := fmt.Sprintf(`SELECT v FROM t.test@foo%d`, i)
 		_ = mTest.checkQueryResponse(indexQuery, [][]string{{"b"}, {"d"}})
+	}
+}
+
+// Test schema change backfills are not affected by various operations
+// that run simultaneously.
+func TestRaceWithBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	server, sqlDB, kvDB := setup(t)
+	defer cleanup(server, sqlDB)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	max_value := 2000
+	insert := fmt.Sprintf(`INSERT INTO t.test VALUES (%d, %d)`, 0, max_value)
+	for i := 1; i <= max_value; i++ {
+		insert += fmt.Sprintf(` ,(%d, %d)`, i, max_value-i)
+	}
+	if _, err := sqlDB.Exec(insert); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read table descriptor for version.
+	nameKey := csql.MakeNameMetadataKey(keys.MaxReservedDescID+1, "test")
+	gr, pErr := kvDB.Get(nameKey)
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+	if !gr.Exists() {
+		t.Fatalf("Name entry %q does not exist", nameKey)
+	}
+	descKey := csql.MakeDescMetadataKey(csql.ID(gr.ValueInt()))
+	desc := &csql.Descriptor{}
+	if pErr := kvDB.GetProto(descKey, desc); pErr != nil {
+		t.Fatal(pErr)
+	}
+	version := desc.GetTable().Version
+
+	// Run the schema changes in a separate goroutine.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		start := timeutil.Now()
+		// Start schema change that eventually runs a number of backfills.
+		if _, err := sqlDB.Exec(`
+BEGIN;
+ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4');
+CREATE UNIQUE INDEX foo ON t.test (v);
+END;
+`); err != nil {
+			t.Error(err)
+		}
+		t.Logf("schema changes took %v", time.Since(start))
+		wg.Done()
+	}()
+
+	// Wait until the backfills for the schema changes above have
+	// started.
+	util.SucceedsSoon(t, func() error {
+		if pErr := kvDB.GetProto(descKey, desc); pErr != nil {
+			t.Fatal(pErr)
+		}
+		if desc.GetTable().Version == version+2 {
+			// Version upgrade has happened, backfills can proceed.
+			return nil
+		}
+		return errors.New("version not updated")
+	})
+
+	// TODO(vivek): uncomment these inserts when #5817 is fixed.
+	// Insert some new rows in the table while the backfills are running.
+	//num_values := 5
+	//for i := 0; i < num_values; i++ {
+	//	t.Logf("inserting a new value into the table")
+	//	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES($1, $2)`, max_value+i+1, max_value+i+1); err != nil {
+	//		t.Fatal(err)
+	//	}
+	//}
+
+	// Renaming an index in the middle of the backfills will not affect
+	// the backfills because the above schema changes have the schema change
+	// lease on the table. All future schema changes have to wait in line for
+	// the lease.
+	if _, err := sqlDB.Exec(`
+ALTER INDEX t.test@foo RENAME TO bar;
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until schema changes have completed.
+	wg.Wait()
+
+	// Verify that the index over v is consistent.
+	rows, err := sqlDB.Query(`SELECT v from t.test@bar`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	i := 0
+	for ; rows.Next(); i++ {
+		var val int
+		if err := rows.Scan(&val); err != nil {
+			t.Fatal(err)
+		}
+		if i != val {
+			t.Errorf("e = %d, v = %d", i, val)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if max_value+1 != i {
+		t.Fatalf("read the wrong number of rows: e = %d, v = %d", max_value+1, i)
 	}
 }

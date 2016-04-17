@@ -17,6 +17,7 @@
 package keys
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"testing"
@@ -25,17 +26,22 @@ import (
 	"gopkg.in/inf.v0"
 
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/util/duration"
 	"github.com/cockroachdb/cockroach/util/encoding"
-	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
 
 func TestPrettyPrint(t *testing.T) {
-	defer leaktest.AfterTest(t)
 
-	tm, _ := time.Parse(time.UnixDate, "Sat Mar  7 11:06:39 UTC 2015")
+	tm, _ := time.Parse(time.RFC3339Nano, "2016-03-30T13:40:35.053725008Z")
+	duration := duration.Duration{Months: 1, Days: 1, Nanos: 1 * time.Second.Nanoseconds()}
+	durationAsc, _ := encoding.EncodeDurationAscending(nil, duration)
+	durationDesc, _ := encoding.EncodeDurationDescending(nil, duration)
 	txnID := uuid.NewV4()
 
+	// The following test cases encode keys with a mixture of ascending and descending direction,
+	// but always decode keys in the ascending direction. This is why some of the decoded values
+	// seem bizarre.
 	testCases := []struct {
 		key roachpb.Key
 		exp string
@@ -43,22 +49,24 @@ func TestPrettyPrint(t *testing.T) {
 		// local
 		{StoreIdentKey(), "/Local/Store/storeIdent"},
 		{StoreGossipKey(), "/Local/Store/gossipBootstrap"},
-		{SequenceCacheKeyPrefix(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/SequenceCache/%q`, txnID)},
-		{SequenceCacheKey(roachpb.RangeID(1000001), txnID, uint32(111), uint32(222)), fmt.Sprintf(`/Local/RangeID/1000001/SequenceCache/%q/epoch:111/seq:222`, txnID)},
-		{RaftLeaderLeaseKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/RaftLeaderLease"},
-		{RaftTombstoneKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/RaftTombstone"},
-		{RaftHardStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/RaftHardState"},
-		{RaftAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/RaftAppliedIndex"},
-		{RaftLogKey(roachpb.RangeID(1000001), uint64(200001)), "/Local/RangeID/1000001/RaftLog/logIndex:200001"},
-		{RaftTruncatedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/RaftTruncatedState"},
-		{RaftLastIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/RaftLastIndex"},
-		{RangeLastVerificationTimestampKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/RangeLastVerificationTimestamp"},
-		{RangeStatsKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/RangeStats"},
+
+		{AbortCacheKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortCache/%q`, txnID)},
+		{RaftTombstoneKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTombstone"},
+		{RaftAppliedIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftAppliedIndex"},
+		{RaftTruncatedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RaftTruncatedState"},
+		{RangeLeaderLeaseKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLeaderLease"},
+		{RangeStatsKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeStats"},
+
+		{RaftHardStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftHardState"},
+		{RaftLastIndexKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftLastIndex"},
+		{RaftLogKey(roachpb.RangeID(1000001), uint64(200001)), "/Local/RangeID/1000001/u/RaftLog/logIndex:200001"},
+		{RangeLastReplicaGCTimestampKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeLastReplicaGCTimestamp"},
+		{RangeLastVerificationTimestampKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeLastVerificationTimestamp"},
 
 		{MakeRangeKeyPrefix(roachpb.RKey("ok")), `/Local/Range/"ok"`},
-		{RangeDescriptorKey(roachpb.RKey("111")), `/Local/Range/RangeDescriptor/"111"`},
-		{RangeTreeNodeKey(roachpb.RKey("111")), `/Local/Range/RangeTreeNode/"111"`},
-		{TransactionKey(roachpb.Key("111"), txnID), fmt.Sprintf(`/Local/Range/Transaction/addrKey:/"111"/id:%q`, txnID)},
+		{RangeDescriptorKey(roachpb.RKey("111")), `/Local/Range/"111"/RangeDescriptor`},
+		{RangeTreeNodeKey(roachpb.RKey("111")), `/Local/Range/"111"/RangeTreeNode`},
+		{TransactionKey(roachpb.Key("111"), txnID), fmt.Sprintf(`/Local/Range/"111"/Transaction/addrKey:/id:%q`, txnID)},
 
 		{LocalMax, `/Meta1/""`}, // LocalMax == Meta1Prefix
 
@@ -67,7 +75,6 @@ func TestPrettyPrint(t *testing.T) {
 		{makeKey(Meta1Prefix, roachpb.Key("foo")), `/Meta1/"foo"`},
 		{RangeMetaKey(roachpb.RKey("f")), `/Meta2/"f"`},
 
-		{StoreStatusKey(2222), "/System/StatusStore/2222"},
 		{NodeStatusKey(1111), "/System/StatusNode/1111"},
 
 		{SystemMax, "/System/Max"},
@@ -118,22 +125,28 @@ func TestPrettyPrint(t *testing.T) {
 			roachpb.RKey(encoding.EncodeNotNullAscending(nil))), "/Table/42/#"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(encoding.EncodeTimeAscending(nil, tm))),
-			"/Table/42/Sat Mar  7 11:06:39 UTC 2015"},
+			"/Table/42/2016-03-30T13:40:35.053725008Z"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(encoding.EncodeTimeDescending(nil, tm))),
-			"/Table/42/Sat Mar  7 11:06:39 UTC 2015"},
+			"/Table/42/1923-10-04T10:19:23.946274991Z"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(encoding.EncodeDecimalAscending(nil, inf.NewDec(1234, 2)))),
 			"/Table/42/12.34"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(encoding.EncodeDecimalDescending(nil, inf.NewDec(1234, 2)))),
 			"/Table/42/-12.34"},
+		{makeKey(MakeTablePrefix(42),
+			roachpb.RKey(durationAsc)),
+			"/Table/42/1m1d1s"},
+		{makeKey(MakeTablePrefix(42),
+			roachpb.RKey(durationDesc)),
+			"/Table/42/-2m-2d743h59m58.999999999s"},
 
 		// others
 		{makeKey([]byte("")), "/Min"},
 		{Meta1KeyMax, "/Meta1/Max"},
 		{Meta2KeyMax, "/Meta2/Max"},
-		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x21, 'a', 0x00, 0x02})), "/Table/42/<util/encoding/encoding.go:9999: unknown escape sequence: 0x0 0x2>"},
+		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x12, 'a', 0x00, 0x02})), "/Table/42/<util/encoding/encoding.go:9999: unknown escape sequence: 0x0 0x2>"},
 	}
 	for i, test := range testCases {
 		keyInfo := MassagePrettyPrintedSpanForTest(PrettyPrint(test.key), nil)
@@ -144,6 +157,20 @@ func TestPrettyPrint(t *testing.T) {
 
 		if exp != MassagePrettyPrintedSpanForTest(test.key.String(), nil) {
 			t.Errorf("%d: expected %s, got %s", i, exp, test.key.String())
+		}
+
+		parsed, err := UglyPrint(keyInfo)
+		if err != nil {
+			if _, ok := err.(*errUglifyUnsupported); !ok {
+				t.Errorf("%d: %s: %s", i, keyInfo, err)
+			} else {
+				t.Logf("%d: skipping parsing of %s; key is unsupported: %v", i, keyInfo, err)
+			}
+		} else if exp, act := test.key, parsed; !bytes.Equal(exp, act) {
+			t.Errorf("%d: expected %q, got %q", i, exp, act)
+		}
+		if t.Failed() {
+			return
 		}
 	}
 }

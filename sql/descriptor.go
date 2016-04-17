@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/sql/privilege"
-	"github.com/cockroachdb/cockroach/util"
 )
 
 var (
@@ -62,13 +61,13 @@ type descriptorProto interface {
 	Validate() error
 }
 
-// checkPrivilege verifies that p.user has `privilege` on `descriptor`.
+// checkPrivilege verifies that p.session.User has `privilege` on `descriptor`.
 func (p *planner) checkPrivilege(descriptor descriptorProto, privilege privilege.Kind) error {
-	if descriptor.GetPrivileges().CheckPrivilege(p.user, privilege) {
+	if descriptor.GetPrivileges().CheckPrivilege(p.session.User, privilege) {
 		return nil
 	}
 	return fmt.Errorf("user %s does not have %s privilege on %s %s",
-		p.user, privilege, descriptor.TypeName(), descriptor.GetName())
+		p.session.User, privilege, descriptor.TypeName(), descriptor.GetName())
 }
 
 // createDescriptor takes a Table or Database descriptor and creates it if
@@ -115,12 +114,12 @@ func (p *planner) createDescriptor(plainKey descriptorKey, descriptor descriptor
 	b.CPut(idKey, descID, nil)
 	b.CPut(descKey, descDesc, nil)
 
-	p.testingVerifyMetadata = func(systemConfig config.SystemConfig) error {
+	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		if err := expectDescriptorID(systemConfig, idKey, descID); err != nil {
 			return err
 		}
 		return expectDescriptor(systemConfig, descKey, descDesc)
-	}
+	})
 
 	return true, p.txn.Run(&b)
 }
@@ -184,9 +183,9 @@ func (p *planner) getDescriptorsFromTargetList(targets parser.TargetList) (
 	}
 	descs := make([]descriptorProto, 0, len(targets.Tables))
 	for _, tableGlob := range targets.Tables {
-		tables, err := p.expandTableGlob(tableGlob)
-		if err != nil {
-			return nil, roachpb.NewError(err)
+		tables, pErr := p.expandTableGlob(tableGlob)
+		if pErr != nil {
+			return nil, pErr
 		}
 		for _, table := range tables {
 			descriptor, err := p.getTableDesc(table)
@@ -207,17 +206,17 @@ func (p *planner) getDescriptorsFromTargetList(targets parser.TargetList) (
 // 		table
 // 		*
 func (p *planner) expandTableGlob(expr *parser.QualifiedName) (
-	parser.QualifiedNames, error) {
+	parser.QualifiedNames, *roachpb.Error) {
 	if len(expr.Indirect) == 0 {
 		return parser.QualifiedNames{expr}, nil
 	}
 
 	if err := expr.QualifyWithDatabase(p.session.Database); err != nil {
-		return nil, err
+		return nil, roachpb.NewError(err)
 	}
 	// We must have a single indirect: either .table or .*
 	if len(expr.Indirect) != 1 {
-		return nil, util.Errorf("invalid table glob: %s", expr)
+		return nil, roachpb.NewErrorf("invalid table glob: %s", expr)
 	}
 
 	switch expr.Indirect[0].(type) {
@@ -226,15 +225,15 @@ func (p *planner) expandTableGlob(expr *parser.QualifiedName) (
 	case parser.StarIndirection:
 		dbDesc, pErr := p.getDatabaseDesc(string(expr.Base))
 		if pErr != nil {
-			return nil, pErr.GoError()
+			return nil, pErr
 		}
 		tableNames, pErr := p.getTableNames(dbDesc)
 		if pErr != nil {
-			return nil, pErr.GoError()
+			return nil, pErr
 		}
 		return tableNames, nil
 	default:
-		return nil, util.Errorf("invalid table glob: %s", expr)
+		return nil, roachpb.NewErrorf("invalid table glob: %s", expr)
 	}
 }
 

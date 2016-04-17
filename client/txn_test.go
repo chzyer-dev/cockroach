@@ -25,7 +25,6 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
@@ -33,7 +32,7 @@ import (
 var (
 	testKey     = roachpb.Key("a")
 	testTS      = roachpb.Timestamp{WallTime: 1, Logical: 1}
-	testPutResp = &roachpb.PutResponse{ResponseHeader: roachpb.ResponseHeader{Timestamp: testTS}}
+	testPutResp = roachpb.PutResponse{}
 )
 
 func newDB(sender Sender) *DB {
@@ -50,7 +49,9 @@ func newTestSender(pre, post func(roachpb.BatchRequest) (*roachpb.BatchResponse,
 	txnID := uuid.NewV4()
 
 	return func(_ context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-		ba.UserPriority = 1
+		if ba.UserPriority == 0 {
+			ba.UserPriority = 1
+		}
 		if ba.Txn != nil && ba.Txn.ID == nil {
 			ba.Txn.Key = txnKey
 			ba.Txn.ID = txnID
@@ -71,9 +72,9 @@ func newTestSender(pre, post func(roachpb.BatchRequest) (*roachpb.BatchResponse,
 		for i, req := range ba.Requests {
 			args := req.GetInner()
 			if _, ok := args.(*roachpb.PutRequest); ok {
-				if !br.Responses[i].SetValue(util.CloneProto(testPutResp).(roachpb.Response)) {
-					panic("failed to set put response")
-				}
+				testPutRespCopy := testPutResp
+				union := &br.Responses[i] // avoid operating on copy
+				union.MustSetInner(&testPutRespCopy)
 			}
 			if roachpb.IsTransactionWrite(args) {
 				writing = true
@@ -116,7 +117,7 @@ func testPut() roachpb.BatchRequest {
 // TestTxnRequestTxnTimestamp verifies response txn timestamp is
 // always upgraded on successive requests.
 func TestTxnRequestTxnTimestamp(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	makeTS := func(walltime int64, logical int32) roachpb.Timestamp {
 		return roachpb.ZeroTimestamp.Add(walltime, logical)
 	}
@@ -147,7 +148,7 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 		return br, nil
 	}))
 
-	txn := NewTxn(*db)
+	txn := NewTxn(context.Background(), *db)
 
 	for testIdx = range testCases {
 		if _, pErr := txn.db.sender.Send(context.Background(), ba); pErr != nil {
@@ -158,12 +159,12 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 
 // TestTxnResetTxnOnAbort verifies transaction is reset on abort.
 func TestTxnResetTxnOnAbort(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		return nil, roachpb.NewErrorWithTxn(&roachpb.TransactionAbortedError{}, ba.Txn)
 	}, nil))
 
-	txn := NewTxn(*db)
+	txn := NewTxn(context.Background(), *db)
 	_, pErr := txn.db.sender.Send(context.Background(), testPut())
 	if _, ok := pErr.GetDetail().(*roachpb.TransactionAbortedError); !ok {
 		t.Fatalf("expected TransactionAbortedError, got %v", pErr)
@@ -179,7 +180,7 @@ func TestTxnResetTxnOnAbort(t *testing.T) {
 // Also verifies that the UserPriority is propagated to the
 // transactional client.
 func TestTransactionConfig(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	db := NewDB(newTestSender(nil, nil))
 	db.userPriority = 101
 	if pErr := db.Txn(func(txn *Txn) *roachpb.Error {
@@ -196,7 +197,7 @@ func TestTransactionConfig(t *testing.T) {
 // committed but EndTransaction is not sent if only read-only
 // operations were performed.
 func TestCommitReadOnlyTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	var calls []roachpb.Method
 	db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
@@ -218,7 +219,7 @@ func TestCommitReadOnlyTransaction(t *testing.T) {
 // transaction with an explicit EndTransaction call does not send
 // that call.
 func TestCommitReadOnlyTransactionExplicit(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	for _, withGet := range []bool{true, false} {
 		var calls []roachpb.Method
 		db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -247,7 +248,7 @@ func TestCommitReadOnlyTransactionExplicit(t *testing.T) {
 // TestCommitMutatingTransaction verifies that transaction is committed
 // upon successful invocation of the retryable func.
 func TestCommitMutatingTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	var calls []roachpb.Method
 	db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -292,7 +293,7 @@ func TestCommitMutatingTransaction(t *testing.T) {
 // TestTxnInsertBeginTransaction verifies that a begin transaction
 // request is inserted just before the first mutating command.
 func TestTxnInsertBeginTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	var calls []roachpb.Method
 	db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
@@ -312,11 +313,32 @@ func TestTxnInsertBeginTransaction(t *testing.T) {
 	}
 }
 
+// TestBeginTransactionErrorIndex verifies that the error index is cleared
+// when a BeginTransaction command causes an error.
+func TestBeginTransactionErrorIndex(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		pErr := roachpb.NewError(&roachpb.WriteIntentError{})
+		pErr.SetErrorIndex(0)
+		return nil, pErr
+	}, nil))
+	pErr := db.Txn(func(txn *Txn) *roachpb.Error {
+		return txn.Put("a", "b")
+	})
+	// Verify that the original error type is preserved, but the error index is unset.
+	if _, ok := pErr.GetDetail().(*roachpb.WriteIntentError); !ok {
+		t.Fatalf("unexpected error %s", pErr)
+	}
+	if pErr.Index != nil {
+		t.Errorf("error index must not be set, but got %s", pErr.Index)
+	}
+}
+
 // TestCommitTransactionOnce verifies that if the transaction is
 // ended explicitly in the retryable func, it is not automatically
 // ended a second time at completion of retryable func.
 func TestCommitTransactionOnce(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	count := 0
 	db := NewDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		count++
@@ -337,7 +359,7 @@ func TestCommitTransactionOnce(t *testing.T) {
 // TestAbortReadOnlyTransaction verifies that aborting a read-only
 // transaction does not prompt an EndTransaction call.
 func TestAbortReadOnlyTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		if _, ok := ba.GetArg(roachpb.EndTransaction); ok {
 			t.Errorf("did not expect EndTransaction")
@@ -357,7 +379,7 @@ func TestAbortReadOnlyTransaction(t *testing.T) {
 // able didn't, regardless of whether there is an error
 // or not.
 func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	for _, success := range []bool{true, false} {
 		expCalls := []roachpb.Method{roachpb.BeginTransaction, roachpb.Put, roachpb.EndTransaction}
 		var calls []roachpb.Method
@@ -390,7 +412,7 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 // TestAbortMutatingTransaction verifies that transaction is aborted
 // upon failed invocation of the retryable func.
 func TestAbortMutatingTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	var calls []roachpb.Method
 	db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
@@ -417,15 +439,16 @@ func TestAbortMutatingTransaction(t *testing.T) {
 // TestRunTransactionRetryOnErrors verifies that the transaction
 // is retried on the correct errors.
 func TestRunTransactionRetryOnErrors(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		err   error
 		retry bool // Expect retry?
 	}{
-		{&roachpb.ReadWithinUncertaintyIntervalError{}, true},
+		{roachpb.NewReadWithinUncertaintyIntervalError(roachpb.ZeroTimestamp, roachpb.ZeroTimestamp), true},
 		{&roachpb.TransactionAbortedError{}, true},
 		{&roachpb.TransactionPushError{}, true},
 		{&roachpb.TransactionRetryError{}, true},
+		{&roachpb.WriteTooOldError{}, true},
 		{&roachpb.RangeNotFoundError{}, false},
 		{&roachpb.RangeKeyMismatchError{}, false},
 		{&roachpb.TransactionStatusError{}, false},
@@ -465,16 +488,56 @@ func TestRunTransactionRetryOnErrors(t *testing.T) {
 	}
 }
 
-// TestAbortTransactionOnCommitErrors verifies that non-exec transactions are
+// TestAbortedRetryPreservesTimestamp verifies that the minimum timestamp
+// set by the client is preserved across retries of aborted transactions.
+func TestAbortedRetryPreservesTimestamp(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Create a TestSender that aborts a transaction 2 times before succeeding.
+	count := 0
+	db := newDB(newTestSender(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		if _, ok := ba.GetArg(roachpb.Put); ok {
+			count++
+			if count < 3 {
+				return nil, roachpb.NewError(&roachpb.TransactionAbortedError{})
+			}
+		}
+		return ba.CreateReply(), nil
+	}, nil))
+
+	txnClosure := func(txn *Txn, opt *TxnExecOptions) *roachpb.Error {
+		// Ensure the KV transaction is created.
+		return txn.Put("a", "b")
+	}
+
+	txn := NewTxn(context.Background(), *db)
+
+	// Request a client-defined timestamp.
+	refTimestamp := roachpb.Timestamp{WallTime: 42, Logical: 69}
+	execOpt := TxnExecOptions{AutoRetry: true, AutoCommit: true}
+	execOpt.MinInitialTimestamp = refTimestamp
+
+	// Perform the transaction.
+	if pErr := txn.Exec(execOpt, txnClosure); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Check the timestamp was preserved.
+	if txn.Proto.OrigTimestamp != refTimestamp {
+		t.Errorf("expected txn orig ts to be %s; got %s", refTimestamp, txn.Proto.OrigTimestamp)
+	}
+}
+
+// TestAbortTransactionOnCommitErrors verifies that transactions are
 // aborted on the correct errors.
 func TestAbortTransactionOnCommitErrors(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testCases := []struct {
 		err   error
 		abort bool
 	}{
-		{&roachpb.ReadWithinUncertaintyIntervalError{}, true},
+		{roachpb.NewReadWithinUncertaintyIntervalError(roachpb.ZeroTimestamp, roachpb.ZeroTimestamp), true},
 		{&roachpb.TransactionAbortedError{}, false},
 		{&roachpb.TransactionPushError{}, true},
 		{&roachpb.TransactionRetryError{}, true},
@@ -498,11 +561,11 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 			return ba.CreateReply(), nil
 		}, nil))
 
-		txn := NewTxn(*db)
+		txn := NewTxn(context.Background(), *db)
 		if pErr := txn.Put("a", "b"); pErr != nil {
 			t.Fatalf("put failed: %s", pErr)
 		}
-		if pErr := txn.Commit(); pErr == nil {
+		if pErr := txn.CommitOrCleanup(); pErr == nil {
 			t.Fatalf("unexpected commit success")
 		}
 
@@ -520,12 +583,12 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 // TestTransactionStatus verifies that transactions always have their
 // status updated correctly.
 func TestTransactionStatus(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	db := NewDB(newTestSender(nil, nil))
 	for _, write := range []bool{true, false} {
 		for _, commit := range []bool{true, false} {
-			txn := NewTxn(*db)
+			txn := NewTxn(context.Background(), *db)
 
 			if _, pErr := txn.Get("a"); pErr != nil {
 				t.Fatal(pErr)
@@ -536,7 +599,7 @@ func TestTransactionStatus(t *testing.T) {
 				}
 			}
 			if commit {
-				if pErr := txn.Commit(); pErr != nil {
+				if pErr := txn.CommitOrCleanup(); pErr != nil {
 					t.Fatal(pErr)
 				}
 				if a, e := txn.Proto.Status, roachpb.COMMITTED; a != e {
@@ -555,11 +618,77 @@ func TestTransactionStatus(t *testing.T) {
 }
 
 func TestCommitInBatchWithResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	db := NewDB(newTestSender(nil, nil))
-	txn := NewTxn(*db)
+	txn := NewTxn(context.Background(), *db)
 	b := &Batch{}
 	if _, pErr := txn.CommitInBatchWithResponse(b); pErr == nil {
 		t.Error("this batch should not be committed")
+	}
+}
+
+// TestTimestampSelectionInOptions verifies that a client can set the
+// Txn timestamp using client.TxnExecOptions.
+func TestTimestampSelectionInOptions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	db := newDB(newTestSender(nil, nil))
+	txn := NewTxn(context.Background(), *db)
+
+	var execOpt TxnExecOptions
+	refTimestamp := roachpb.Timestamp{WallTime: 42, Logical: 69}
+	execOpt.MinInitialTimestamp = refTimestamp
+
+	txnClosure := func(txn *Txn, opt *TxnExecOptions) *roachpb.Error {
+		// Ensure the KV transaction is created.
+		return txn.Put("a", "b")
+	}
+
+	if pErr := txn.Exec(execOpt, txnClosure); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Check the timestamp was preserved.
+	if txn.Proto.OrigTimestamp != refTimestamp {
+		t.Errorf("expected txn orig ts to be %s; got %s", refTimestamp, txn.Proto.OrigTimestamp)
+	}
+}
+
+// TestSetPriority verifies that the batch UserPriority is correctly set
+// depending on the transaction priority.
+func TestSetPriority(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var expected roachpb.UserPriority
+
+	db := NewDB(newTestSender(
+		func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+			if ba.UserPriority != expected {
+				pErr := roachpb.NewErrorf("Priority not set correctly in the batch! "+
+					"(expected: %s, value: %s)", expected, ba.UserPriority)
+				return nil, pErr
+			}
+
+			br := &roachpb.BatchResponse{}
+			br.Txn = &roachpb.Transaction{}
+			br.Txn.Update(ba.Txn) // copy
+			return br, nil
+		}, nil))
+
+	// Verify the normal priority setting path.
+	expected = roachpb.HighUserPriority
+	txn := NewTxn(context.Background(), *db)
+	if err := txn.SetUserPriority(expected); err != nil {
+		t.Fatal(err)
+	}
+	if _, pErr := txn.db.sender.Send(context.Background(), roachpb.BatchRequest{}); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Verify the internal (fixed value) priority setting path.
+	expected = roachpb.UserPriority(-13)
+	txn = NewTxn(context.Background(), *db)
+	txn.InternalSetPriority(13)
+	if _, pErr := txn.db.sender.Send(context.Background(), roachpb.BatchRequest{}); pErr != nil {
+		t.Fatal(pErr)
 	}
 }

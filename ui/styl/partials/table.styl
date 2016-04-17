@@ -28,8 +28,7 @@ $stats-table-tr--bg     = white
 $stats-table-tr--bg-alt = $secondary-gray-7
 
 // ---- Data table ----
-.stats-table, .sql-table
-  overflow scroll
+.stats-table, .sql-table, .event-table, .logs-table
   table
     border-collapse collapse
     margin-bottom 2rem
@@ -38,6 +37,7 @@ $stats-table-tr--bg-alt = $secondary-gray-7
     tr
       border $stats-table-cell--border
       border-left none
+      border-top none
       height 30px
       vertical-align top
       &.header-section
@@ -63,7 +63,7 @@ $stats-table-tr--bg-alt = $secondary-gray-7
   th
     color $stats-table-th--fg
     font-family Lato-Bold
-    font-size 13px
+    font-size 12px
     letter-spacing .27px
     font-weight normal
     text-align left
@@ -87,7 +87,7 @@ $stats-table-tr--bg-alt = $secondary-gray-7
       font-size 19px
       padding-top 0
       .units
-        font-size 15px
+        font-size 13px
 
     &.sorted
       &:after
@@ -98,8 +98,8 @@ $stats-table-tr--bg-alt = $secondary-gray-7
 
   td
     color $stats-table-td--fg
-    font-family Lato-Light
-    font-size 16px
+    font-family Lato-Regular
+    font-size 13px
     letter-spacing .33px
     white-space nowrap
     .units
@@ -107,7 +107,7 @@ $stats-table-tr--bg-alt = $secondary-gray-7
 
   td
   th
-    padding 10px 20px 0
+    padding 10px 15px
     border-right $stats-table-cell--border
     .missing
       color $secondary-red
@@ -131,3 +131,44 @@ table
   .title
     display inline-block
     width 20rem
+
+.stats-table
+  table
+    min-width 100%
+
+.node-overview
+  .stats-table
+    table
+      td, th
+        &:first-child
+          width: calc(45px - 3rem)
+
+.event-table
+  table
+    width 100%
+    margin-bottom 0
+    tbody
+      td
+        border 0
+        padding 20px
+        &:first-child
+          padding-left 3rem
+        font-size 16px
+        font-family Lato-Medium
+        &:first-child
+          width 50px
+        &:nth-child(2)
+          width 75px
+
+        .message
+          font-size 14px
+
+      tr
+        height 60px
+        width 100%
+
+        &:first-child
+          border 0
+
+.logs-table
+  padding 0

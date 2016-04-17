@@ -31,8 +31,8 @@ import (
 type Insert struct {
 	Table     *QualifiedName
 	Columns   QualifiedNames
-	Rows      SelectStatement
-	Returning SelectExprs
+	Rows      *Select
+	Returning ReturningExprs
 }
 
 func (node *Insert) String() string {
@@ -46,13 +46,11 @@ func (node *Insert) String() string {
 	} else {
 		fmt.Fprintf(&buf, " %s", node.Rows)
 	}
-	if node.Returning != nil {
-		fmt.Fprintf(&buf, " RETURNING %s", node.Returning)
-	}
+	buf.WriteString(node.Returning.String())
 	return buf.String()
 }
 
 // DefaultValues returns true iff only default values are being inserted.
 func (node *Insert) DefaultValues() bool {
-	return node.Rows == nil
+	return node.Rows.Select == nil
 }

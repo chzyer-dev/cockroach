@@ -23,6 +23,8 @@ import (
 	"sort"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -52,13 +54,17 @@ func meta2Key(key roachpb.RKey) []byte {
 }
 
 func metaKey(key roachpb.RKey) []byte {
-	return keys.Addr(keys.RangeMetaKey(key))
+	rk, err := keys.Addr(keys.RangeMetaKey(key))
+	if err != nil {
+		panic(err)
+	}
+	return rk
 }
 
 // TestUpdateRangeAddressing verifies range addressing records are
 // correctly updated on creation of new range descriptors.
 func TestUpdateRangeAddressing(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
 
@@ -133,7 +139,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Scan meta keys directly from engine.
-		kvs, _, err := engine.MVCCScan(store.Engine(), keys.MetaMin, keys.MetaMax, 0, roachpb.MaxTimestamp, true, nil)
+		kvs, _, err := engine.MVCCScan(context.Background(), store.Engine(), keys.MetaMin, keys.MetaMax, 0, roachpb.MaxTimestamp, true, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +212,7 @@ func TestUpdateRangeAddressing(t *testing.T) {
 // attempt to update range addressing records that would allow a split
 // of meta1 records.
 func TestUpdateRangeAddressingSplitMeta1(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	left := &roachpb.RangeDescriptor{StartKey: roachpb.RKeyMin, EndKey: meta1Key(roachpb.RKey("a"))}
 	right := &roachpb.RangeDescriptor{StartKey: meta1Key(roachpb.RKey("a")), EndKey: roachpb.RKeyMax}
 	if err := splitRangeAddressing(&client.Batch{}, left, right); err == nil {

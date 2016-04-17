@@ -19,6 +19,8 @@ package storage
 import (
 	"sync"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
 )
@@ -44,7 +46,7 @@ type rangeStats struct {
 // require the values to be read from the engine).
 func newRangeStats(rangeID roachpb.RangeID, e engine.Engine) (*rangeStats, error) {
 	rs := &rangeStats{rangeID: rangeID}
-	if err := engine.MVCCGetRangeStats(e, rangeID, &rs.MVCCStats); err != nil {
+	if err := engine.MVCCGetRangeStats(context.Background(), e, rangeID, &rs.MVCCStats); err != nil {
 		return nil, err
 	}
 	return rs, nil
@@ -89,7 +91,7 @@ func (rs *rangeStats) MergeMVCCStats(e engine.Engine, ms engine.MVCCStats) error
 	rs.Lock()
 	defer rs.Unlock()
 	rs.MVCCStats.Add(ms)
-	return engine.MVCCSetRangeStats(e, rs.rangeID, &rs.MVCCStats)
+	return engine.MVCCSetRangeStats(context.Background(), e, rs.rangeID, &rs.MVCCStats)
 }
 
 // SetStats sets stats wholesale.
@@ -97,7 +99,7 @@ func (rs *rangeStats) SetMVCCStats(e engine.Engine, ms engine.MVCCStats) error {
 	rs.Lock()
 	defer rs.Unlock()
 	rs.MVCCStats = ms
-	return engine.MVCCSetRangeStats(e, rs.rangeID, &ms)
+	return engine.MVCCSetRangeStats(context.Background(), e, rs.rangeID, &ms)
 }
 
 // GetAvgIntentAge returns the average age of outstanding intents,
@@ -108,9 +110,11 @@ func (rs *rangeStats) GetAvgIntentAge(nowNanos int64) float64 {
 	if rs.IntentCount == 0 {
 		return 0
 	}
+	// Make a copy so that rs is not updated.
+	cp := rs.MVCCStats
 	// Advance age by any elapsed time since last computed.
-	rs.AgeTo(nowNanos)
-	return float64(rs.IntentAge) / float64(rs.IntentCount)
+	cp.AgeTo(nowNanos)
+	return float64(cp.IntentAge) / float64(cp.IntentCount)
 }
 
 // GetGCBytesAge returns the total age of outstanding gc'able
@@ -120,6 +124,26 @@ func (rs *rangeStats) GetAvgIntentAge(nowNanos int64) float64 {
 func (rs *rangeStats) GetGCBytesAge(nowNanos int64) int64 {
 	rs.Lock()
 	defer rs.Unlock()
-	rs.AgeTo(nowNanos)
-	return rs.GCBytesAge
+	// Make a copy so that rs is not updated.
+	cp := rs.MVCCStats
+	cp.AgeTo(nowNanos)
+	return cp.GCBytesAge
+}
+
+// ComputeStatsForRange computes the stats for a given range by
+// iterating over all key ranges for the given range that should
+// be accounted for in its stats.
+func ComputeStatsForRange(d *roachpb.RangeDescriptor, e engine.Engine, nowNanos int64) (engine.MVCCStats, error) {
+	iter := e.NewIterator(nil)
+	defer iter.Close()
+
+	ms := engine.MVCCStats{}
+	for _, r := range makeReplicatedKeyRanges(d) {
+		msDelta, err := iter.ComputeStats(r.start, r.end, nowNanos)
+		if err != nil {
+			return engine.MVCCStats{}, err
+		}
+		ms.Add(msDelta)
+	}
+	return ms, nil
 }

@@ -18,12 +18,10 @@ package storage
 
 import (
 	"container/heap"
-	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/keys"
@@ -35,16 +33,14 @@ import (
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
-const queueItemProcessTimeout = 250 * time.Millisecond
-
 func gossipForTest(t *testing.T) (*gossip.Gossip, *stop.Stopper) {
 	stopper := stop.NewStopper()
 
 	// Setup fake zone config handler.
 	config.TestingSetupZoneConfigHook(stopper)
 
-	rpcContext := rpc.NewContext(&base.Context{}, hlc.NewClock(hlc.UnixNano), stopper)
-	g := gossip.New(rpcContext, gossip.TestBootstrap, stopper)
+	rpcContext := rpc.NewContext(nil, nil, stopper)
+	g := gossip.New(rpcContext, nil, stopper)
 	// Have to call g.SetNodeID before call g.AddInfo
 	g.SetNodeID(roachpb.NodeID(1))
 	// Put an empty system config into gossip.
@@ -54,11 +50,12 @@ func gossipForTest(t *testing.T) (*gossip.Gossip, *stop.Stopper) {
 	}
 
 	// Wait for SystemConfig.
-	if err := util.IsTrueWithin(func() bool {
-		return g.GetSystemConfig() != nil
-	}, 100*time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
+	util.SucceedsSoon(t, func() error {
+		if _, ok := g.GetSystemConfig(); !ok {
+			return util.Errorf("expected system config to be set")
+		}
+		return nil
+	})
 
 	return g, stopper
 }
@@ -77,11 +74,11 @@ type testQueueImpl struct {
 func (tq *testQueueImpl) needsLeaderLease() bool     { return false }
 func (tq *testQueueImpl) acceptsUnsplitRanges() bool { return tq.acceptUnsplit }
 
-func (tq *testQueueImpl) shouldQueue(now roachpb.Timestamp, r *Replica, _ *config.SystemConfig) (bool, float64) {
+func (tq *testQueueImpl) shouldQueue(now roachpb.Timestamp, r *Replica, _ config.SystemConfig) (bool, float64) {
 	return tq.shouldQueueFn(now, r)
 }
 
-func (tq *testQueueImpl) process(now roachpb.Timestamp, r *Replica, _ *config.SystemConfig) error {
+func (tq *testQueueImpl) process(now roachpb.Timestamp, r *Replica, _ config.SystemConfig) error {
 	atomic.AddInt32(&tq.processed, 1)
 	return tq.err
 }
@@ -102,7 +99,7 @@ func (tq *testQueueImpl) purgatoryChan() <-chan struct{} {
 
 // TestQueuePriorityQueue verifies priority queue implementation.
 func TestQueuePriorityQueue(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// Create a priority queue, put the items in it, and
 	// establish the priority queue (heap) invariants.
 	const count = 3
@@ -141,7 +138,7 @@ func TestQueuePriorityQueue(t *testing.T) {
 // queue including adding ranges which both should and shouldn't be
 // queued, updating an existing range, and removing a range.
 func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	g, stopper := gossipForTest(t)
 	defer stopper.Stop()
 
@@ -230,7 +227,7 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 // TestBaseQueueAdd verifies that calling Add() directly overrides the
 // ShouldQueue method.
 func TestBaseQueueAdd(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	g, stopper := gossipForTest(t)
 	defer stopper.Stop()
 
@@ -259,7 +256,7 @@ func TestBaseQueueAdd(t *testing.T) {
 // TestBaseQueueProcess verifies that items from the queue are
 // processed according to the timer function.
 func TestBaseQueueProcess(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	g, stopper := gossipForTest(t)
 	defer stopper.Stop()
 
@@ -291,24 +288,30 @@ func TestBaseQueueProcess(t *testing.T) {
 	}
 
 	testQueue.blocker <- struct{}{}
-	if err := util.IsTrueWithin(func() bool {
-		return atomic.LoadInt32(&testQueue.processed) == 1
-	}, queueItemProcessTimeout); err != nil {
-		t.Error(err)
-	}
+	util.SucceedsSoon(t, func() error {
+		if pc := atomic.LoadInt32(&testQueue.processed); pc != int32(1) {
+			return util.Errorf("expected %d processed replicas; got %d", 1, pc)
+		}
+		return nil
+	})
 
 	testQueue.blocker <- struct{}{}
-	if err := util.IsTrueWithin(func() bool {
-		return atomic.LoadInt32(&testQueue.processed) >= 2
-	}, queueItemProcessTimeout); err != nil {
-		t.Error(err)
-	}
+	util.SucceedsSoon(t, func() error {
+		if pc := atomic.LoadInt32(&testQueue.processed); pc < int32(2) {
+			return util.Errorf("expected >= %d processed replicas; got %d", 2, pc)
+		}
+		return nil
+	})
+
+	// Ensure the test queue is not blocked on a stray call to
+	// testQueueImpl.timer().
+	close(testQueue.blocker)
 }
 
 // TestBaseQueueAddRemove adds then removes a range; ensure range is
 // not processed.
 func TestBaseQueueAddRemove(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	g, stopper := gossipForTest(t)
 	defer stopper.Stop()
 
@@ -348,16 +351,21 @@ func TestBaseQueueAddRemove(t *testing.T) {
 // TestAcceptsUnsplitRanges verifies that ranges that need to split are properly
 // rejected when the queue has 'acceptsUnsplitRanges = false'.
 func TestAcceptsUnsplitRanges(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	g, stopper := gossipForTest(t)
 	defer stopper.Stop()
+
+	dataMaxAddr, err := keys.Addr(keys.SystemConfigTableDataMax)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// This range can never be split due to zone configs boundaries.
 	neverSplits := &Replica{RangeID: 1}
 	if err := neverSplits.setDesc(&roachpb.RangeDescriptor{
 		RangeID:  1,
 		StartKey: roachpb.RKeyMin,
-		EndKey:   keys.Addr(keys.SystemConfigTableDataMax),
+		EndKey:   dataMaxAddr,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +374,7 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	willSplit := &Replica{RangeID: 2}
 	if err := willSplit.setDesc(&roachpb.RangeDescriptor{
 		RangeID:  2,
-		StartKey: keys.Addr(keys.SystemConfigTableDataMax),
+		StartKey: dataMaxAddr,
 		EndKey:   roachpb.RKeyMax,
 	}); err != nil {
 		t.Fatal(err)
@@ -388,9 +396,9 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	bq.Start(clock, stopper)
 
 	// Check our config.
-	sysCfg := g.GetSystemConfig()
-	if sysCfg == nil {
-		t.Fatal("nil config")
+	sysCfg, ok := g.GetSystemConfig()
+	if !ok {
+		t.Fatal("config not set")
 	}
 	neverSplitsDesc := neverSplits.Desc()
 	if sysCfg.NeedsSplit(neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
@@ -406,11 +414,12 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	bq.MaybeAdd(neverSplits, roachpb.ZeroTimestamp)
 	bq.MaybeAdd(willSplit, roachpb.ZeroTimestamp)
 
-	if err := util.IsTrueWithin(func() bool {
-		return atomic.LoadInt32(&testQueue.processed) == 2
-	}, queueItemProcessTimeout); err != nil {
-		t.Error(err)
-	}
+	util.SucceedsSoon(t, func() error {
+		if pc := atomic.LoadInt32(&testQueue.processed); pc != int32(2) {
+			return util.Errorf("expected %d processed replicas; got %d", 2, pc)
+		}
+		return nil
+	})
 
 	if pc := atomic.LoadInt32(&queued); pc != 2 {
 		t.Errorf("expected queued count of 2; got %d", pc)
@@ -434,11 +443,12 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	bq.MaybeAdd(neverSplits, roachpb.ZeroTimestamp)
 	bq.MaybeAdd(willSplit, roachpb.ZeroTimestamp)
 
-	if err := util.IsTrueWithin(func() bool {
-		return atomic.LoadInt32(&testQueue.processed) == 3
-	}, queueItemProcessTimeout); err != nil {
-		t.Error(err)
-	}
+	util.SucceedsSoon(t, func() error {
+		if pc := atomic.LoadInt32(&testQueue.processed); pc != int32(3) {
+			return util.Errorf("expected %d processed replicas; got %d", 3, pc)
+		}
+		return nil
+	})
 
 	if pc := atomic.LoadInt32(&queued); pc != 3 {
 		t.Errorf("expected queued count of 3; got %d", pc)
@@ -458,7 +468,7 @@ func (*testError) purgatoryErrorMarker() {
 // queue, items are added to the purgatory. Verifies that sending on
 // the purgatory channel causes the replicas to be reprocessed.
 func TestBaseQueuePurgatory(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	g, stopper := gossipForTest(t)
 	defer stopper.Stop()
 
@@ -486,9 +496,9 @@ func TestBaseQueuePurgatory(t *testing.T) {
 		bq.MaybeAdd(r, roachpb.ZeroTimestamp)
 	}
 
-	util.SucceedsWithin(t, queueItemProcessTimeout, func() error {
+	util.SucceedsSoon(t, func() error {
 		if pc := atomic.LoadInt32(&testQueue.processed); pc != int32(replicaCount) {
-			return fmt.Errorf("expected %d processed replicas; got %d", replicaCount, pc)
+			return util.Errorf("expected %d processed replicas; got %d", replicaCount, pc)
 		}
 		return nil
 	})
@@ -507,9 +517,9 @@ func TestBaseQueuePurgatory(t *testing.T) {
 	// Now, signal that purgatoried replicas should retry.
 	testQueue.pChan <- struct{}{}
 
-	util.SucceedsWithin(t, queueItemProcessTimeout, func() error {
+	util.SucceedsSoon(t, func() error {
 		if pc := atomic.LoadInt32(&testQueue.processed); pc != int32(replicaCount*2) {
-			return fmt.Errorf("expected %d processed replicas; got %d", replicaCount*2, pc)
+			return util.Errorf("expected %d processed replicas; got %d", replicaCount*2, pc)
 		}
 		return nil
 	})
@@ -529,9 +539,9 @@ func TestBaseQueuePurgatory(t *testing.T) {
 	testQueue.err = nil
 	testQueue.pChan <- struct{}{}
 
-	util.SucceedsWithin(t, queueItemProcessTimeout, func() error {
+	util.SucceedsSoon(t, func() error {
 		if pc := atomic.LoadInt32(&testQueue.processed); pc != int32(replicaCount*3) {
-			return fmt.Errorf("expected %d processed replicas; got %d", replicaCount*3, pc)
+			return util.Errorf("expected %d processed replicas; got %d", replicaCount*3, pc)
 		}
 		return nil
 	})

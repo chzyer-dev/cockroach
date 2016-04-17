@@ -18,8 +18,11 @@ package sql
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"math/big"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/inf.v0"
 
@@ -28,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/duration"
 	"github.com/cockroachdb/cockroach/util/encoding"
 )
 
@@ -63,6 +67,7 @@ func makeTableDesc(p *parser.CreateTable, parentID ID) (TableDescriptor, error) 
 	}
 	desc.Name = p.Table.Table()
 	desc.ParentID = parentID
+	desc.FormatVersion = BaseFormatVersion
 	// We don't use version 0.
 	desc.Version = 1
 
@@ -170,6 +175,17 @@ func makeColumnDefDescs(d *parser.ColumnTableDef) (*ColumnDescriptor, *IndexDesc
 		return nil, nil, util.Errorf("unexpected type %T", t)
 	}
 
+	if col.Type.Kind == ColumnType_DECIMAL {
+		switch {
+		case col.Type.Precision == 0 && col.Type.Width > 0:
+			// TODO (seif): Find right range for error message.
+			return nil, nil, errors.New("invalid NUMERIC precision 0")
+		case col.Type.Precision < col.Type.Width:
+			return nil, nil, fmt.Errorf("NUMERIC scale %d must be between 0 and precision %d",
+				col.Type.Width, col.Type.Precision)
+		}
+	}
+
 	if d.DefaultExpr != nil {
 		// Verify the default expression type is compatible with the column type.
 		defaultType, err := d.DefaultExpr.TypeCheck(nil)
@@ -183,6 +199,12 @@ func makeColumnDefDescs(d *parser.ColumnTableDef) (*ColumnDescriptor, *IndexDesc
 
 		s := d.DefaultExpr.String()
 		col.DefaultExpr = &s
+	}
+
+	if d.CheckExpr != nil {
+		// TODO(guanqun): add more checks here.
+		s := d.CheckExpr.String()
+		col.CheckExpr = &s
 	}
 
 	var idx *IndexDescriptor
@@ -453,9 +475,9 @@ func encodeTableKey(b []byte, val parser.Datum, dir encoding.Direction) ([]byte,
 		return encoding.EncodeTimeDescending(b, t.Time), nil
 	case parser.DInterval:
 		if dir == encoding.Ascending {
-			return encoding.EncodeVarintAscending(b, int64(t.Duration)), nil
+			return encoding.EncodeDurationAscending(b, t.Duration)
 		}
-		return encoding.EncodeVarintDescending(b, int64(t.Duration)), nil
+		return encoding.EncodeDurationDescending(b, t.Duration)
 	}
 	return nil, util.Errorf("unable to encode table key: %T", val)
 }
@@ -538,16 +560,22 @@ func decodeIndexKey(desc *TableDescriptor, indexID IndexID,
 // len(valTypes). The types of the decoded values will match the corresponding
 // entry in the valTypes parameter with the exception that a value might also
 // be parser.DNull. The remaining bytes in the key after decoding the values
-// are returned.
+// are returned. A slice of directions can be provided to enforce encoding
+// direction on each value in valTypes. If this slice is nil, the direction
+// used will default to encoding.Ascending.
 func decodeKeyVals(valTypes, vals []parser.Datum, directions []encoding.Direction,
 	key []byte) ([]byte, error) {
-	if len(directions) != len(valTypes) {
+	if directions != nil && len(directions) != len(valTypes) {
 		return nil, util.Errorf("encoding directions doesn't parallel valTypes: %d vs %d.",
 			len(directions), len(valTypes))
 	}
 	for j := range valTypes {
+		direction := encoding.Ascending
+		if directions != nil {
+			direction = directions[j]
+		}
 		var err error
-		vals[j], key, err = decodeTableKey(valTypes[j], key, directions[j])
+		vals[j], key, err = decodeTableKey(valTypes[j], key, direction)
 		if err != nil {
 			return nil, err
 		}
@@ -586,9 +614,9 @@ func decodeTableKey(valType parser.Datum, key []byte, dir encoding.Direction) (
 	case parser.DFloat:
 		var f float64
 		if dir == encoding.Ascending {
-			rkey, f, err = encoding.DecodeFloatAscending(key, nil)
+			rkey, f, err = encoding.DecodeFloatAscending(key)
 		} else {
-			rkey, f, err = encoding.DecodeFloatDescending(key, nil)
+			rkey, f, err = encoding.DecodeFloatDescending(key)
 		}
 		return parser.DFloat(f), rkey, err
 	case *parser.DDecimal:
@@ -634,13 +662,13 @@ func decodeTableKey(valType parser.Datum, key []byte, dir encoding.Direction) (
 		}
 		return parser.DTimestamp{Time: t}, rkey, err
 	case parser.DInterval:
-		var d int64
+		var d duration.Duration
 		if dir == encoding.Ascending {
-			rkey, d, err = encoding.DecodeVarintAscending(key)
+			rkey, d, err = encoding.DecodeDurationAscending(key)
 		} else {
-			rkey, d, err = encoding.DecodeVarintDescending(key)
+			rkey, d, err = encoding.DecodeDurationDescending(key)
 		}
-		return parser.DInterval{Duration: time.Duration(d)}, rkey, err
+		return parser.DInterval{Duration: d}, rkey, err
 	default:
 		return nil, nil, util.Errorf("TODO(pmattis): decoded index key: %s", valType.Type())
 	}
@@ -861,12 +889,54 @@ func unmarshalColumnValue(kind ColumnType_Kind, value *roachpb.Value) (parser.Da
 		}
 		return parser.DTimestamp{Time: v}, nil
 	case ColumnType_INTERVAL:
-		v, err := value.GetInt()
+		d, err := value.GetDuration()
 		if err != nil {
 			return nil, err
 		}
-		return parser.DInterval{Duration: time.Duration(v)}, nil
+		return parser.DInterval{Duration: d}, nil
 	default:
 		return nil, util.Errorf("unsupported column type: %s", kind)
 	}
+}
+
+// checkValueWidth checks that the width (for strings/byte arrays) and
+// scale (for decimals) of the value fits the specified column type.
+// Used by INSERT and UPDATE.
+func checkValueWidth(col ColumnDescriptor, val parser.Datum) error {
+	switch col.Type.Kind {
+	case ColumnType_STRING:
+		if v, ok := val.(parser.DString); ok {
+			if col.Type.Width > 0 && utf8.RuneCountInString(string(v)) > int(col.Type.Width) {
+				return fmt.Errorf("value too long for type %s (column %q)", col.Type.SQLString(), col.Name)
+			}
+		}
+	case ColumnType_DECIMAL:
+		if v, ok := val.(*parser.DDecimal); ok {
+			if col.Type.Precision > 0 {
+				// http://www.postgresql.org/docs/9.5/static/datatype-numeric.html
+				// "If the scale of a value to be stored is greater than
+				// the declared scale of the column, the system will round the
+				// value to the specified number of fractional digits. Then,
+				// if the number of digits to the left of the decimal point
+				// exceeds the declared precision minus the declared scale, an
+				// error is raised."
+
+				if col.Type.Width > 0 {
+					// Rounding half up, as per round_var() in PostgreSQL 9.5.
+					v.Dec.Round(&v.Dec, inf.Scale(col.Type.Width), inf.RoundHalfUp)
+				}
+
+				// Check that the precision is not exceeded.
+				maxDigitsLeft := big.NewInt(10)
+				maxDigitsLeft.Exp(maxDigitsLeft, big.NewInt(int64(col.Type.Precision-col.Type.Width)), nil)
+
+				var absRounded inf.Dec
+				absRounded.Abs(&v.Dec)
+				if absRounded.Cmp(inf.NewDecBig(maxDigitsLeft, 0)) != -1 {
+					return fmt.Errorf("too many digits for type %s (column %q)", col.Type.SQLString(), col.Name)
+				}
+			}
+		}
+	}
+	return nil
 }

@@ -25,11 +25,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/lib/pq/oid"
-
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/pq"
+	"github.com/cockroachdb/pq/oid"
 )
 
 //go:generate stringer -type=formatCode
@@ -82,7 +82,7 @@ func typeForDatum(d parser.Datum) pgType {
 		return pgType{oid.T_date, 8}
 
 	case parser.DTimestamp:
-		return pgType{oid.T_timestamp, 8}
+		return pgType{oid.T_timestamptz, 8}
 
 	case parser.DInterval:
 		return pgType{oid.T_interval, 8}
@@ -201,8 +201,8 @@ func (b *writeBuffer) writeBinaryDatum(d parser.Datum) error {
 
 const pgTimeStampFormat = "2006-01-02 15:04:05.999999999-07:00"
 
-// formatTs formats t into a format lib/pq understands.
-// Mostly cribbed from github.com/lib/pq.
+// formatTs formats t into a format cockroachdb/pq understands.
+// Mostly cribbed from github.com/cockroachdb/pq.
 func formatTs(t time.Time) (b []byte) {
 	// Need to send dates before 0001 A.D. with " BC" suffix, instead of the
 	// minus sign preferred by Go.
@@ -236,20 +236,41 @@ func formatTs(t time.Time) (b []byte) {
 	return b
 }
 
+// parseTs parses timestamps in any of the formats that Postgres accepts over
+// the wire protocol.
+//
+// Postgres is lenient in what it accepts as a timestamp, so we must also be
+// lenient. As new drivers are used with CockroachDB and formats are found that
+// we don't support but Postgres does, add them here. Then create an integration
+// test for the driver and add a case to TestParseTs.
+func parseTs(str string) (time.Time, error) {
+	// RFC3339Nano is sent by github.com/lib/pq (go).
+	if ts, err := time.Parse(time.RFC3339Nano, str); err == nil {
+		return ts, nil
+	}
+
+	// pq.ParseTimestamp parses the timestamp format that both Postgres and
+	// CockroachDB send in responses, so this allows roundtripping of the encoded
+	// timestamps that we send.
+	return pq.ParseTimestamp(nil, str)
+}
+
 var (
 	oidToDatum = map[oid.Oid]parser.Datum{
-		oid.T_bool:      parser.DummyBool,
-		oid.T_bytea:     parser.DummyBytes,
-		oid.T_date:      parser.DummyDate,
-		oid.T_float4:    parser.DummyFloat,
-		oid.T_float8:    parser.DummyFloat,
-		oid.T_int2:      parser.DummyInt,
-		oid.T_int4:      parser.DummyInt,
-		oid.T_int8:      parser.DummyInt,
-		oid.T_interval:  parser.DummyInterval,
-		oid.T_numeric:   parser.DummyDecimal,
-		oid.T_text:      parser.DummyString,
-		oid.T_timestamp: parser.DummyTimestamp,
+		oid.T_bool:        parser.DummyBool,
+		oid.T_bytea:       parser.DummyBytes,
+		oid.T_date:        parser.DummyDate,
+		oid.T_float4:      parser.DummyFloat,
+		oid.T_float8:      parser.DummyFloat,
+		oid.T_int2:        parser.DummyInt,
+		oid.T_int4:        parser.DummyInt,
+		oid.T_int8:        parser.DummyInt,
+		oid.T_interval:    parser.DummyInterval,
+		oid.T_numeric:     parser.DummyDecimal,
+		oid.T_text:        parser.DummyString,
+		oid.T_timestamp:   parser.DummyTimestamp,
+		oid.T_timestamptz: parser.DummyTimestamp,
+		oid.T_varchar:     parser.DummyString,
 	}
 	// Using reflection to support unhashable types.
 	datumToOid = map[reflect.Type]oid.Oid{
@@ -261,7 +282,7 @@ var (
 		reflect.TypeOf(parser.DummyInterval):  oid.T_interval,
 		reflect.TypeOf(parser.DummyDecimal):   oid.T_numeric,
 		reflect.TypeOf(parser.DummyString):    oid.T_text,
-		reflect.TypeOf(parser.DummyTimestamp): oid.T_timestamp,
+		reflect.TypeOf(parser.DummyTimestamp): oid.T_timestamptz,
 	}
 )
 
@@ -382,7 +403,7 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 		default:
 			return d, fmt.Errorf("unsupported numeric format code: %d", code)
 		}
-	case oid.T_text:
+	case oid.T_text, oid.T_varchar:
 		switch code {
 		case formatText:
 			d = parser.DString(b)
@@ -412,7 +433,29 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 		default:
 			return d, fmt.Errorf("unsupported bytea format code: %d", code)
 		}
-	// TODO(mjibson): implement date/time types
+	case oid.T_timestamp, oid.T_timestamptz:
+		switch code {
+		case formatText:
+			ts, err := parseTs(string(b))
+			if err != nil {
+				return d, fmt.Errorf("could not parse string %q as timestamp", b)
+			}
+			d = parser.DTimestamp{Time: ts}
+		case formatBinary:
+			return d, fmt.Errorf("unsupported timestamp format code: %d", code)
+		}
+	case oid.T_date:
+		switch code {
+		case formatText:
+			ts, err := parseTs(string(b))
+			if err != nil {
+				return d, fmt.Errorf("could not parse string %q as date", b)
+			}
+			daysSinceEpoch := ts.Unix() / secondsInDay
+			d = parser.DDate(daysSinceEpoch)
+		case formatBinary:
+			return d, fmt.Errorf("unsupported date format code: %d", code)
+		}
 	default:
 		return d, fmt.Errorf("unsupported OID: %v", id)
 	}

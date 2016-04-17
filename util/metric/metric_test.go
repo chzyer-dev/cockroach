@@ -38,7 +38,15 @@ func TestGauge(t *testing.T) {
 		t.Fatalf("unexpected value: %d", v)
 	}
 	testMarshal(t, g, "10")
+}
 
+func TestGaugeFloat64(t *testing.T) {
+	g := NewGaugeFloat64()
+	g.Update(10.4)
+	if v := g.Value(); v != 10.4 {
+		t.Fatalf("unexpected value: %f", v)
+	}
+	testMarshal(t, g, "10.4")
 }
 
 func TestCounter(t *testing.T) {
@@ -59,6 +67,7 @@ func setNow(d time.Duration) {
 }
 
 func TestHistogramRotate(t *testing.T) {
+	defer TestingSetNow(nil)()
 	setNow(0)
 	h := NewHistogram(histWrapNum*time.Second, 1000+10*histWrapNum, 3)
 	var cur time.Duration
@@ -87,6 +96,8 @@ func TestHistogramRotate(t *testing.T) {
 }
 
 func TestHistogramJSON(t *testing.T) {
+	defer TestingSetNow(nil)()
+	setNow(0)
 	h := NewHistogram(0, 1, 3)
 	testMarshal(t, h, `[{"Quantile":100,"Count":0,"ValueAt":0}]`)
 	h.RecordValue(1)
@@ -94,6 +105,7 @@ func TestHistogramJSON(t *testing.T) {
 }
 
 func TestRateRotate(t *testing.T) {
+	defer TestingSetNow(nil)()
 	setNow(0)
 	const interval = 10 * time.Second
 	r := NewRate(interval)

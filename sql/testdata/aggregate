@@ -238,6 +238,26 @@ SELECT k FROM kv HAVING k > 7;
 query error syntax error at or near ","
 SELECT COUNT(*, 1) FROM kv
 
+query I
+SELECT COUNT(*);
+----
+1
+
+query I
+SELECT COUNT(k) from kv;
+----
+6
+
+query I
+SELECT COUNT(1);
+----
+1
+
+query I
+SELECT COUNT(1) from kv;
+----
+6
+
 query error unknown signature for COUNT: COUNT\(int, int\)
 SELECT COUNT(k, v) FROM kv
 
@@ -501,6 +521,12 @@ EXPLAIN SELECT MIN(x) FROM xyz WHERE (y, z) = (2, 3.0)
 0 group MIN(x)
 1 scan  xyz@zyx 1:/3/2/#-/3/3
 
+query ITTT
+EXPLAIN (DEBUG) SELECT MIN(x) FROM xyz WHERE (y, z) = (2, 3.0)
+----
+0 /xyz/zyx/3.0/2/1 NULL BUFFERED
+0 0                (1)  ROW
+
 query I
 SELECT MAX(x) FROM xyz WHERE (z, y) = (3.0, 2)
 ----
@@ -513,33 +539,46 @@ EXPLAIN SELECT MAX(x) FROM xyz WHERE (z, y) = (3.0, 2)
 1 revscan xyz@zyx 1:/3/2/#-/3/3
 
 query RRR
-SELECT VARIANCE(x), VARIANCE(y::decimal), VARIANCE(z) FROM xyz;
+SELECT VARIANCE(x), VARIANCE(y::decimal), VARIANCE(z) FROM xyz
 ----
 9.0000000000000000 4.5000000000000000 6.333333333333333
 
+query ITTT
+EXPLAIN (DEBUG) SELECT VARIANCE(x), VARIANCE(y::decimal), VARIANCE(z) FROM xyz
+----
+0 /xyz/primary/1    NULL                                                          PARTIAL
+0 /xyz/primary/1/y  2                                                             PARTIAL
+0 /xyz/primary/1/z  3.0                                                           BUFFERED
+1 /xyz/primary/4    NULL                                                          PARTIAL
+1 /xyz/primary/4/y  5                                                             PARTIAL
+1 /xyz/primary/4/z  6.0                                                           BUFFERED
+2 /xyz/primary/7    NULL                                                          PARTIAL
+2 /xyz/primary/7/z  8.0                                                           BUFFERED
+0 0                 (9.0000000000000000,  4.5000000000000000,  6.333333333333333) ROW
+
 query R
-SELECT VARIANCE(x) FROM xyz WHERE x = 10;
+SELECT VARIANCE(x) FROM xyz WHERE x = 10
 ----
 NULL
 
 query R
-SELECT VARIANCE(x) FROM xyz WHERE x = 1;
+SELECT VARIANCE(x) FROM xyz WHERE x = 1
 ----
 NULL
 
 query ITT
-EXPLAIN SELECT VARIANCE(x) FROM xyz WHERE x = 1;
+EXPLAIN SELECT VARIANCE(x) FROM xyz WHERE x = 1
 ----
 0 group VARIANCE(x)
 1 scan xyz@xy /1-/2
 
 query RRR
-SELECT STDDEV(x), STDDEV(y::decimal), STDDEV(z) FROM xyz;
+SELECT STDDEV(x), STDDEV(y::decimal), STDDEV(z) FROM xyz
 ----
 3.0000000000000000 2.1213203435596426 2.516611478423583
 
 query R
-SELECT STDDEV(x) FROM xyz WHERE x = 1;
+SELECT STDDEV(x) FROM xyz WHERE x = 1
 ----
 NULL
 
@@ -547,4 +586,36 @@ NULL
 query ITTT
 EXPLAIN (DEBUG) SELECT MIN(z) FROM xyz
 ----
-0 /xyz/zyx/3.0/2/1 NULL ROW 
+0 /xyz/zyx/3.0/2/1 NULL  BUFFERED
+0 0                (3.0) ROW
+
+query RRR
+SELECT AVG(1::int), AVG(2::float), AVG(3::decimal)
+----
+1 2 3
+
+query III
+SELECT COUNT(2::int), COUNT(3::float), COUNT(4::decimal)
+----
+1 1 1
+
+query IRR
+SELECT SUM(1::int), SUM(2::float), SUM(3::decimal)
+----
+1 2 3
+
+query RRR
+SELECT VARIANCE(1::int), VARIANCE(1::float), VARIANCE(1::decimal)
+----
+NULL NULL NULL
+
+query RRR
+SELECT STDDEV(1::int), STDDEV(1::float), STDDEV(1::decimal)
+----
+NULL NULL NULL
+
+# Ensure subqueries don't trigger aggregation.
+query B
+SELECT x > (SELECT avg(0)) FROM xyz LIMIT 1
+----
+true

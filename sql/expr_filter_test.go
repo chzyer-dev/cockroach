@@ -29,11 +29,7 @@ type countVarsVisitor struct {
 	numQNames, numQValues int
 }
 
-func (v *countVarsVisitor) Visit(expr parser.Expr, pre bool) (parser.Visitor, parser.Expr) {
-	if !pre {
-		return nil, expr
-	}
-
+func (v *countVarsVisitor) VisitPre(expr parser.Expr) (recurse bool, newExpr parser.Expr) {
 	switch expr.(type) {
 	case *qvalue:
 		v.numQValues++
@@ -41,20 +37,22 @@ func (v *countVarsVisitor) Visit(expr parser.Expr, pre bool) (parser.Visitor, pa
 		v.numQNames++
 	}
 
-	return v, expr
+	return true, expr
 }
+
+func (*countVarsVisitor) VisitPost(expr parser.Expr) parser.Expr { return expr }
 
 // countVars counts how many *QualifiedName and *qvalue nodes are in an expression.
 func countVars(expr parser.Expr) (numQNames, numQValues int) {
 	v := countVarsVisitor{}
 	if expr != nil {
-		parser.WalkExpr(&v, expr)
+		parser.WalkExprConst(&v, expr)
 	}
 	return v.numQNames, v.numQValues
 }
 
 func TestSplitFilter(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	// In each testcase, we are splitting the filter in expr according to the set of variables in
 	// vars.
@@ -134,6 +132,7 @@ func TestSplitFilter(t *testing.T) {
 			return false, nil
 		}
 		expr, _ := parseAndNormalizeExpr(t, d.expr)
+		exprStr := expr.String()
 		res, rem := splitFilter(expr, conv)
 		// We use Sprint to handle the 'nil' case correctly.
 		resStr := fmt.Sprint(res)
@@ -155,6 +154,11 @@ func TestSplitFilter(t *testing.T) {
 		if numQNames != 0 {
 			t.Errorf("`%s` split along (%s): remainder expressions `%s` has converted qvalues!",
 				d.expr, strings.Join(d.vars, ","), remStr)
+		}
+		// Verify the original expression didn't change.
+		if exprStr != expr.String() {
+			t.Errorf("Expression changed after splitFilter; before: `%s` after: `%s`",
+				exprStr, expr.String())
 		}
 	}
 }

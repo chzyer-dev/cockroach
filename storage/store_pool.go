@@ -41,9 +41,8 @@ const (
 )
 
 type storeDetail struct {
-	desc            roachpb.StoreDescriptor
+	desc            *roachpb.StoreDescriptor
 	dead            bool
-	gossiped        bool // Was this store updated via gossip?
 	timesDied       int
 	foundDeadOn     roachpb.Timestamp
 	lastUpdatedTime roachpb.Timestamp // This is also the priority for the queue.
@@ -55,15 +54,18 @@ func (sd *storeDetail) markDead(foundDeadOn roachpb.Timestamp) {
 	sd.dead = true
 	sd.foundDeadOn = foundDeadOn
 	sd.timesDied++
-	log.Warningf("store %s on node %s is now considered offline", sd.desc.StoreID, sd.desc.Node.NodeID)
+	if sd.desc != nil {
+		// sd.desc can still be nil if it was markedAlive and enqueued in getStoreDetailLocked
+		// and never markedAlive again.
+		log.Warningf("store %s on node %s is now considered offline", sd.desc.StoreID, sd.desc.Node.NodeID)
+	}
 }
 
 // markAlive sets the storeDetail to alive(active) and saves the updated time
 // and descriptor.
-func (sd *storeDetail) markAlive(foundAliveOn roachpb.Timestamp, storeDesc roachpb.StoreDescriptor, gossiped bool) {
+func (sd *storeDetail) markAlive(foundAliveOn roachpb.Timestamp, storeDesc *roachpb.StoreDescriptor) {
 	sd.desc = storeDesc
 	sd.dead = false
-	sd.gossiped = gossiped
 	sd.lastUpdatedTime = foundAliveOn
 }
 
@@ -179,7 +181,7 @@ func (sp *StorePool) storeGossipUpdate(_ string, content roachpb.Value) {
 		detail = &storeDetail{index: -1}
 		sp.stores[storeDesc.StoreID] = detail
 	}
-	detail.markAlive(sp.clock.Now(), storeDesc, true)
+	detail.markAlive(sp.clock.Now(), &storeDesc)
 	sp.queue.enqueue(detail)
 }
 
@@ -224,26 +226,27 @@ func (sp *StorePool) start(stopper *stop.Stopper) {
 	})
 }
 
-// GetStoreDescriptor returns the store detail for the given storeID.
-func (sp *StorePool) getStoreDetail(storeID roachpb.StoreID) storeDetail {
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
-
+// getStoreDetailLocked returns the store detail for the given storeID.
+// The lock must be held *in write mode* even though this looks like a
+// read-only method.
+func (sp *StorePool) getStoreDetailLocked(storeID roachpb.StoreID) storeDetail {
 	detail, ok := sp.stores[storeID]
 	if !ok {
-		// We don't seem to have that store yet, create a new detail and add
-		// it to the queue. This will give it the full timeout before it is
-		// considered dead.
+		// We don't have this store yet (this is normal when we're
+		// starting up and don't have full information from the gossip
+		// network). The first time this occurs, presume the store is
+		// alive, but start the clock so it will become dead if enough
+		// time passes without updates from gossip.
 		detail = &storeDetail{index: -1}
 		sp.stores[storeID] = detail
-		detail.markAlive(sp.clock.Now(), roachpb.StoreDescriptor{StoreID: storeID}, false)
+		detail.markAlive(sp.clock.Now(), nil)
 		sp.queue.enqueue(detail)
 	}
 
 	return *detail
 }
 
-// GetStoreDescriptor returns the latest store descriptor for the given
+// getStoreDescriptor returns the latest store descriptor for the given
 // storeID.
 func (sp *StorePool) getStoreDescriptor(storeID roachpb.StoreID) *roachpb.StoreDescriptor {
 	sp.mu.RLock()
@@ -254,21 +257,18 @@ func (sp *StorePool) getStoreDescriptor(storeID roachpb.StoreID) *roachpb.StoreD
 		return nil
 	}
 
-	// Only return gossiped stores.
-	if !detail.gossiped {
-		return nil
-	}
-
-	desc := detail.desc
-	return &desc
+	return detail.desc
 }
 
-// findDeadReplicas returns any replicas from the supplied slice that are
+// deadReplicas returns any replicas from the supplied slice that are
 // located on dead stores.
 func (sp *StorePool) deadReplicas(repls []roachpb.ReplicaDescriptor) []roachpb.ReplicaDescriptor {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
 	var deadReplicas []roachpb.ReplicaDescriptor
 	for _, repl := range repls {
-		if sp.getStoreDetail(repl.StoreID).dead {
+		if sp.getStoreDetailLocked(repl.StoreID).dead {
 			deadReplicas = append(deadReplicas, repl)
 		}
 	}
@@ -303,11 +303,12 @@ func (sl *StoreList) add(s *roachpb.StoreDescriptor) {
 }
 
 // GetStoreList returns a storeList that contains all active stores that
-// contain the required attributes and their associated stats.
+// contain the required attributes and their associated stats. It also returns
+// the number of total alive stores.
 // TODO(embark, spencer): consider using a reverse index map from
 // Attr->stores, for efficiency. Ensure that entries in this map still
 // have an opportunity to be garbage collected.
-func (sp *StorePool) getStoreList(required roachpb.Attributes, deterministic bool) StoreList {
+func (sp *StorePool) getStoreList(required roachpb.Attributes, deterministic bool) (StoreList, int) {
 	sp.mu.RLock()
 	defer sp.mu.RUnlock()
 
@@ -321,12 +322,15 @@ func (sp *StorePool) getStoreList(required roachpb.Attributes, deterministic boo
 		sort.Sort(storeIDs)
 	}
 	sl := StoreList{}
+	var aliveStoreCount int
 	for _, storeID := range storeIDs {
 		detail := sp.stores[roachpb.StoreID(storeID)]
-		if !detail.dead && required.IsSubset(*detail.desc.CombinedAttrs()) {
-			desc := detail.desc
-			sl.add(&desc)
+		if !detail.dead && detail.desc != nil {
+			aliveStoreCount++
+			if required.IsSubset(*detail.desc.CombinedAttrs()) {
+				sl.add(detail.desc)
+			}
 		}
 	}
-	return sl
+	return sl, aliveStoreCount
 }

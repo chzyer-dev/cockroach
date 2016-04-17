@@ -28,7 +28,6 @@ type IndirectionElem interface {
 }
 
 func (NameIndirection) indirectionElem()   {}
-func (IndexIndirection) indirectionElem()  {}
 func (StarIndirection) indirectionElem()   {}
 func (*ArrayIndirection) indirectionElem() {}
 
@@ -49,13 +48,6 @@ type NameIndirection Name
 
 func (n NameIndirection) String() string {
 	return fmt.Sprintf(".%s", Name(n))
-}
-
-// IndexIndirection represents ":<name>" in an indirection expression.
-type IndexIndirection Name
-
-func (n IndexIndirection) String() string {
-	return fmt.Sprintf("@%s", Name(n))
 }
 
 // StarIndirection represents ".*" in an indirection expression.

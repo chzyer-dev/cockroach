@@ -78,16 +78,6 @@ func TestBatchSplit(t *testing.T) {
 	}
 }
 
-func TestFlagsToStr(t *testing.T) {
-	var ba BatchRequest
-	ba.Add(&PutRequest{})
-	ba.Add(&AdminSplitRequest{})
-	exp := "AdWrAl"
-	if act := flagsToStr(ba.flags()); act != exp {
-		t.Fatalf("expected %s, got %s", exp, act)
-	}
-}
-
 func TestBatchRequestGetArg(t *testing.T) {
 	testCases := []struct {
 		bu         []RequestUnion
@@ -109,5 +99,18 @@ func TestBatchRequestGetArg(t *testing.T) {
 			t.Errorf("%d: unexpected get match for %v: %v", i, c.bu, r)
 		}
 
+	}
+}
+
+func TestBatchRequestString(t *testing.T) {
+	br := BatchRequest{}
+	for i := 0; i < 100; i++ {
+		br.Requests = append(br.Requests, RequestUnion{Get: &GetRequest{}})
+	}
+	br.Requests = append(br.Requests, RequestUnion{EndTransaction: &EndTransactionRequest{}})
+
+	e := `Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), Get ["",""), ... 76 skipped ..., Get ["",""), Get ["",""), Get ["",""), Get ["",""), EndTransaction ["","")`
+	if e != br.String() {
+		t.Fatalf("e = %s, v = %s", e, br.String())
 	}
 }

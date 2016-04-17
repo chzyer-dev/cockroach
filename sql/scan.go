@@ -19,7 +19,6 @@ package sql
 import (
 	"bytes"
 	"fmt"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -30,68 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/util/tracing"
 )
 
-type span struct {
-	start roachpb.Key // inclusive key
-	end   roachpb.Key // exclusive key
-	count int64
-}
-
-type spans []span
-
-// implement Sort.Interface
-func (a spans) Len() int           { return len(a) }
-func (a spans) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a spans) Less(i, j int) bool { return a[i].start.Compare(a[j].start) < 0 }
-
-// prettyKey pretty-prints the specified key, skipping over the first `skip`
-// fields. The pretty printed key looks like:
-//
-//   /Table/<tableID>/<indexID>/...
-//
-// We always strip off the /Table prefix and then `skip` more fields. Note that
-// this assumes that the fields themselves do not contain '/', but that is
-// currently true for the fields we care about stripping (the table and index
-// ID).
-func prettyKey(key roachpb.Key, skip int) string {
-	p := key.String()
-	for i := 0; i <= skip; i++ {
-		n := strings.IndexByte(p[1:], '/')
-		if n == -1 {
-			return ""
-		}
-		p = p[n+1:]
-	}
-	return p
-}
-
-func prettyDatums(vals []parser.Datum) string {
-	var buf bytes.Buffer
-	for _, v := range vals {
-		fmt.Fprintf(&buf, "/%v", v)
-	}
-	return buf.String()
-}
-
-func prettySpan(span span, skip int) string {
-	var buf bytes.Buffer
-	if span.count != 0 {
-		fmt.Fprintf(&buf, "%d:", span.count)
-	}
-	fmt.Fprintf(&buf, "%s-%s", prettyKey(span.start, skip), prettyKey(span.end, skip))
-	return buf.String()
-}
-
-func prettySpans(spans []span, skip int) string {
-	var buf bytes.Buffer
-	for i, span := range spans {
-		if i > 0 {
-			buf.WriteString(" ")
-		}
-		buf.WriteString(prettySpan(span, skip))
-	}
-	return buf.String()
-}
-
 // A scanNode handles scanning over the key/value pairs for a table and
 // reconstructing them into rows.
 type scanNode struct {
@@ -100,43 +37,53 @@ type scanNode struct {
 	desc    TableDescriptor
 	index   *IndexDescriptor
 
-	// visibleCols are normally a copy of desc.Columns (even when we are using an index). The only
-	// exception is when we are selecting from a specific index (SELECT * from t@abc), in which case
-	// it contains only the columns in the index.
-	visibleCols []ColumnDescriptor
-	// There is a 1-1 correspondence between visibleCols and resultColumns.
+	// Set if an index was explicitly specified.
+	specifiedIndex *IndexDescriptor
+	// Set if the NO_INDEX_JOIN hint was given.
+	noIndexJoin bool
+
+	// There is a 1-1 correspondence between desc.Column sand resultColumns.
 	resultColumns []ResultColumn
-	// row contains values for the current row. There is a 1-1 correspondence between resultColumns and vals.
+	// row contains values for the current row. There is a 1-1 correspondence
+	// between resultColumns and vals.
 	row parser.DTuple
-	// for each column in resultColumns, indicates if the value is needed (used as an optimization
-	// when the upper layer doesn't need all values).
+	// for each column in resultColumns, indicates if the value is needed (used
+	// as an optimization when the upper layer doesn't need all values).
 	valNeededForCol []bool
 
-	// Map used to get the index for columns in visibleCols.
+	// Map used to get the index for columns in desc.Columns.
 	colIdxMap map[ColumnID]int
 
 	spans            []span
 	isSecondaryIndex bool
 	reverse          bool
-	columns          []ResultColumn
-	originalCols     []ResultColumn // copy of `columns` before additions (e.g. by sort or group)
 	columnIDs        []ColumnID
 	// The direction with which the corresponding column was encoded.
 	columnDirs       []encoding.Direction
 	ordering         orderingInfo
 	pErr             *roachpb.Error
-	indexKey         []byte            // the index key of the current row
-	kvs              []client.KeyValue // the raw key/value pairs
-	kvIndex          int               // current index into the key/value pairs
-	rowIndex         int               // the index of the current row
-	colID            ColumnID          // column ID of the current key
-	valTypes         []parser.Datum    // the index key value types for the current row
-	vals             []parser.Datum    // the index key values for the current row
-	implicitValTypes []parser.Datum    // the implicit value types for unique indexes
-	implicitVals     []parser.Datum    // the implicit values for unique indexes
+	indexKey         []byte         // the index key of the current row
+	rowIndex         int            // the index of the current row
+	colID            ColumnID       // column ID of the current key
+	valTypes         []parser.Datum // the index key value types for the current row
+	vals             []parser.Datum // the index key values for the current row
+	implicitValTypes []parser.Datum // the implicit value types for unique indexes
+	implicitVals     []parser.Datum // the implicit values for unique indexes
 	explain          explainMode
 	explainValue     parser.Datum
 	debugVals        debugValues
+
+	// filter that can be evaluated using only this table/index; it contains scanQValues.
+	filter parser.Expr
+	// qvalues (one per column) which can be part of the filter expression.
+	qvals []scanQValue
+
+	scanInitialized bool
+	fetcher         kvFetcher
+	// The current key/value, unless kvEnd is true.
+	kv        client.KeyValue
+	kvEnd     bool
+	limitHint int64
 }
 
 func (n *scanNode) Columns() []ResultColumn {
@@ -151,11 +98,37 @@ func (n *scanNode) Values() parser.DTuple {
 	return n.row
 }
 
+func (n *scanNode) MarkDebug(mode explainMode) {
+	if mode != explainDebug {
+		panic(fmt.Sprintf("unknown debug mode %d", mode))
+	}
+	n.explain = mode
+}
+
 func (n *scanNode) DebugValues() debugValues {
 	if n.explain != explainDebug {
 		panic(fmt.Sprintf("node not in debug mode (mode %d)", n.explain))
 	}
 	return n.debugVals
+}
+
+func (n *scanNode) SetLimitHint(numRows int64, soft bool) {
+	n.limitHint = numRows
+	if soft || n.filter != nil {
+		// Read a multiple of the limit if the limit is "soft".
+		n.limitHint *= 2
+	}
+}
+
+// nextKey gets the next key and sets kv and kvEnd. Returns false on errors.
+func (n *scanNode) nextKey() bool {
+	var ok bool
+	ok, n.kv, n.pErr = n.fetcher.nextKV()
+	if n.pErr != nil {
+		return false
+	}
+	n.kvEnd = !ok
+	return true
 }
 
 func (n *scanNode) Next() bool {
@@ -165,8 +138,13 @@ func (n *scanNode) Next() bool {
 		return false
 	}
 
-	if n.kvs == nil {
+	if !n.scanInitialized {
 		if !n.initScan() {
+			// Hit error.
+			return false
+		}
+		if !n.nextKey() {
+			// Hit error.
 			return false
 		}
 	}
@@ -181,13 +159,18 @@ func (n *scanNode) Next() bool {
 		if n.maybeOutputRow() {
 			return n.pErr == nil
 		}
-		if n.kvIndex == len(n.kvs) {
+		if n.kvEnd {
+			// End of scan.
 			return false
 		}
-		if !n.processKV(n.kvs[n.kvIndex]) {
+		if !n.processKV(n.kv) {
+			// Hit error.
 			return false
 		}
-		n.kvIndex++
+		if !n.nextKey() {
+			// Hit error.
+			return false
+		}
 	}
 }
 
@@ -207,7 +190,9 @@ func (n *scanNode) ExplainPlan() (name, description string, children []planNode)
 
 // Initializes a scanNode with a tableName. Returns the table or index name that can be used for
 // fully-qualified columns if an alias is not specified.
-func (n *scanNode) initTable(p *planner, tableName *parser.QualifiedName) (string, *roachpb.Error) {
+func (n *scanNode) initTable(
+	p *planner, tableName *parser.QualifiedName, indexHints *parser.IndexHints,
+) (string, *roachpb.Error) {
 	if n.desc, n.pErr = p.getTableLease(tableName); n.pErr != nil {
 		return "", n.pErr
 	}
@@ -218,61 +203,32 @@ func (n *scanNode) initTable(p *planner, tableName *parser.QualifiedName) (strin
 
 	alias := n.desc.Name
 
-	indexName := tableName.Index()
-	if indexName != "" && !equalName(n.desc.PrimaryIndex.Name, indexName) {
-		for i := range n.desc.Indexes {
-			if equalName(n.desc.Indexes[i].Name, indexName) {
-				// Remove all but the matching index from the descriptor.
-				n.desc.Indexes = n.desc.Indexes[i : i+1]
-				n.index = &n.desc.Indexes[0]
-				break
+	if indexHints != nil && indexHints.Index != "" {
+		indexName := NormalizeName(string(indexHints.Index))
+		if indexName == NormalizeName(n.desc.PrimaryIndex.Name) {
+			n.specifiedIndex = &n.desc.PrimaryIndex
+		} else {
+			for i := range n.desc.Indexes {
+				if indexName == NormalizeName(n.desc.Indexes[i].Name) {
+					n.specifiedIndex = &n.desc.Indexes[i]
+					break
+				}
 			}
-		}
-		if n.index == nil {
-			n.pErr = roachpb.NewUErrorf("index \"%s\" not found", indexName)
-			return "", n.pErr
-		}
-		// Use the index name instead of the table name for fully-qualified columns in the
-		// expression.
-		alias = n.index.Name
-		// Strip out any columns from the table that are not present in the
-		// index.
-		visibleCols := make([]ColumnDescriptor, 0, len(n.index.ColumnIDs)+len(n.index.ImplicitColumnIDs))
-		for _, colID := range n.index.ColumnIDs {
-			col, err := n.desc.FindColumnByID(colID)
-			n.pErr = roachpb.NewError(err)
-			if n.pErr != nil {
+			if n.specifiedIndex == nil {
+				n.pErr = roachpb.NewUErrorf("index \"%s\" not found", indexName)
 				return "", n.pErr
 			}
-			visibleCols = append(visibleCols, *col)
 		}
-		for _, colID := range n.index.ImplicitColumnIDs {
-			col, err := n.desc.FindColumnByID(colID)
-			n.pErr = roachpb.NewError(err)
-			if n.pErr != nil {
-				return "", n.pErr
-			}
-			visibleCols = append(visibleCols, *col)
-		}
-		n.isSecondaryIndex = true
-		n.initVisibleCols(visibleCols, len(n.index.ImplicitColumnIDs))
-	} else {
-		n.initDescDefaults()
 	}
-
+	n.noIndexJoin = (indexHints != nil && indexHints.NoIndexJoin)
+	n.initDescDefaults()
 	return alias, nil
 }
 
-func (n *scanNode) initDescDefaults() {
-	n.index = &n.desc.PrimaryIndex
-	n.initVisibleCols(n.desc.Columns, 0)
-}
-
-// makeResultColumns converts ColumnDescriptors to ResultColumns. The last numImplicit columns are
-// marked as hidden.
-func makeResultColumns(colDescs []ColumnDescriptor, numImplicit int) []ResultColumn {
+// makeResultColumns converts ColumnDescriptors to ResultColumns.
+func makeResultColumns(colDescs []ColumnDescriptor) []ResultColumn {
 	cols := make([]ResultColumn, 0, len(colDescs))
-	for idx, colDesc := range colDescs {
+	for _, colDesc := range colDescs {
 		// Convert the ColumnDescriptor to ResultColumn.
 		var typ parser.Datum
 
@@ -298,7 +254,7 @@ func makeResultColumns(colDescs []ColumnDescriptor, numImplicit int) []ResultCol
 		default:
 			panic(fmt.Sprintf("unsupported column type: %s", colDesc.Type.Kind))
 		}
-		hidden := colDesc.Hidden || idx >= len(colDescs)-numImplicit
+		hidden := colDesc.Hidden
 		cols = append(cols, ResultColumn{Name: colDesc.Name, Typ: typ, hidden: hidden})
 	}
 	return cols
@@ -313,28 +269,27 @@ func (n *scanNode) setNeededColumns(needed []bool) {
 	copy(n.valNeededForCol, needed)
 }
 
-// Initializes the visibleCols and associated structures (resultColumns, colIdxMap).
-// The last numImplicit columns are marked as hidden.
-func (n *scanNode) initVisibleCols(visibleCols []ColumnDescriptor, numImplicit int) {
-	n.visibleCols = visibleCols
-	n.resultColumns = makeResultColumns(visibleCols, numImplicit)
-	n.colIdxMap = make(map[ColumnID]int, len(visibleCols))
-	for i, c := range visibleCols {
+// Initializes the column structures.
+func (n *scanNode) initDescDefaults() {
+	n.index = &n.desc.PrimaryIndex
+	cols := n.desc.Columns
+	n.resultColumns = makeResultColumns(cols)
+	n.colIdxMap = make(map[ColumnID]int, len(cols))
+	for i, c := range cols {
 		n.colIdxMap[c.ID] = i
 	}
-	n.valNeededForCol = make([]bool, len(visibleCols))
-	for i := range visibleCols {
+	n.valNeededForCol = make([]bool, len(cols))
+	for i := range cols {
 		n.valNeededForCol[i] = true
 	}
-	n.row = make([]parser.Datum, len(visibleCols))
+	n.row = make([]parser.Datum, len(cols))
+	n.qvals = make([]scanQValue, len(cols))
+	for i := range n.qvals {
+		n.qvals[i] = n.makeQValue(i)
+	}
 }
 
-// initScan initializes (and performs) the key-value scan.
-//
-// TODO(pmattis): The key-value scan currently reads all of the key-value
-// pairs, but they could just as easily be read in chunks. Probably worthwhile
-// to separate out the retrieval of the key-value pairs into a separate
-// structure.
+// initScan initializes but does not perform the key-value scan.
 func (n *scanNode) initScan() bool {
 	// Initialize our key/values.
 	if len(n.spans) == 0 {
@@ -345,29 +300,6 @@ func (n *scanNode) initScan() bool {
 			start: start,
 			end:   start.PrefixEnd(),
 		})
-	}
-
-	// Retrieve all the spans.
-	b := &client.Batch{}
-	if n.reverse {
-		for i := len(n.spans) - 1; i >= 0; i-- {
-			b.ReverseScan(n.spans[i].start, n.spans[i].end, n.spans[i].count)
-		}
-	} else {
-		for i := 0; i < len(n.spans); i++ {
-			b.Scan(n.spans[i].start, n.spans[i].end, n.spans[i].count)
-		}
-	}
-	if n.pErr = n.txn.Run(b); n.pErr != nil {
-		return false
-	}
-
-	for _, result := range b.Results {
-		if n.kvs == nil {
-			n.kvs = result.Rows
-		} else {
-			n.kvs = append(n.kvs, result.Rows...)
-		}
 	}
 
 	if n.valTypes == nil {
@@ -394,6 +326,24 @@ func (n *scanNode) initScan() bool {
 			n.implicitVals = make([]parser.Datum, len(n.implicitValTypes))
 		}
 	}
+
+	// If we have a limit hint, we limit the first batch size. Subsequent
+	// batches get larger to avoid making things too slow (e.g. in case we have
+	// a very restrictive filter and actually have to retrieve a lot of rows).
+	firstBatchLimit := n.limitHint
+	if firstBatchLimit != 0 {
+		// For a secondary index, we have one key per row.
+		if !n.isSecondaryIndex {
+			// We have a sentinel key per row plus at most one key per non-PK column. Of course, we
+			// may have other keys due to a schema change, but this is only a hint.
+			firstBatchLimit *= int64(1 + len(n.desc.Columns) - len(n.index.ColumnIDs))
+		}
+		// We need an extra key to make sure we form the last row.
+		firstBatchLimit++
+	}
+
+	n.fetcher = makeKVFetcher(n.txn, n.spans, n.reverse, firstBatchLimit)
+	n.scanInitialized = true
 	return true
 }
 
@@ -407,7 +357,7 @@ func (n *scanNode) initOrdering(exactPrefix int) {
 	n.ordering = n.computeOrdering(n.index, exactPrefix, n.reverse)
 }
 
-// computeOrdering calculates ordering information for table columns (visibleCols) assuming that:
+// computeOrdering calculates ordering information for table columns assuming that:
 //    - we scan a given index (potentially in reverse order), and
 //    - the first `exactPrefix` columns of the index each have an exact (single value) match
 //      (see orderingInfo).
@@ -431,7 +381,13 @@ func (n *scanNode) computeOrdering(index *IndexDescriptor, exactPrefix int, reve
 			ordering.addColumn(idx, dir)
 		}
 	}
+	// We included any implicit columns, so the results are unique.
+	ordering.unique = true
 	return ordering
+}
+
+func (n *scanNode) readIndexKey(k roachpb.Key) ([]byte, error) {
+	return decodeIndexKey(&n.desc, n.index.ID, n.valTypes, n.vals, n.columnDirs, k)
 }
 
 func (n *scanNode) processKV(kv client.KeyValue) bool {
@@ -445,7 +401,7 @@ func (n *scanNode) processKV(kv client.KeyValue) bool {
 
 	var remaining []byte
 	var err error
-	remaining, err = decodeIndexKey(&n.desc, n.index.ID, n.valTypes, n.vals, n.columnDirs, kv.Key)
+	remaining, err = n.readIndexKey(kv.Key)
 	n.pErr = roachpb.NewError(err)
 	if n.pErr != nil {
 		return false
@@ -496,12 +452,8 @@ func (n *scanNode) processKV(kv client.KeyValue) bool {
 		}
 	} else {
 		if n.implicitVals != nil {
-			implicitDirs := make([]encoding.Direction, 0, len(n.index.ImplicitColumnIDs))
-			for range n.index.ImplicitColumnIDs {
-				implicitDirs = append(implicitDirs, encoding.Ascending)
-			}
 			var err error
-			_, err = decodeKeyVals(n.implicitValTypes, n.implicitVals, implicitDirs, kv.ValueBytes())
+			_, err = decodeKeyVals(n.implicitValTypes, n.implicitVals, nil, kv.ValueBytes())
 			n.pErr = roachpb.NewError(err)
 			if n.pErr != nil {
 				return false
@@ -558,13 +510,13 @@ func (n *scanNode) maybeOutputRow() bool {
 	// secondary index as secondary indexes have only one key per row.
 
 	if n.indexKey != nil &&
-		(n.isSecondaryIndex || n.kvIndex == len(n.kvs) ||
-			!bytes.HasPrefix(n.kvs[n.kvIndex].Key, n.indexKey)) {
+		(n.isSecondaryIndex || n.kvEnd ||
+			!bytes.HasPrefix(n.kv.Key, n.indexKey)) {
 		// The current key belongs to a new row. Output the current row.
 		n.indexKey = nil
 
 		// Fill in any missing values with NULLs
-		for i, col := range n.visibleCols {
+		for i, col := range n.desc.Columns {
 			if n.valNeededForCol[i] && n.row[i] == nil {
 				if !col.Nullable {
 					panic("Non-nullable column with no value!")
@@ -572,19 +524,27 @@ func (n *scanNode) maybeOutputRow() bool {
 				n.row[i] = parser.DNull
 			}
 		}
-		if n.explainValue != nil {
-			n.explainDebug(true)
+
+		// Run the filter.
+		passesFilter, err := runFilter(n.filter, n.planner.evalCtx)
+		if err != nil {
+			n.pErr = roachpb.NewError(err)
+			return true
 		}
-		return true
+		if n.explainValue != nil {
+			n.explainDebug(true, passesFilter)
+			return true
+		}
+		return passesFilter
 	} else if n.explainValue != nil {
-		n.explainDebug(false)
+		n.explainDebug(false, false)
 		return true
 	}
 	return false
 }
 
 // explainDebug fills in n.debugVals.
-func (n *scanNode) explainDebug(endOfRow bool) {
+func (n *scanNode) explainDebug(endOfRow bool, passesFilter bool) {
 	n.debugVals.rowIdx = n.rowIndex
 	n.debugVals.key = n.prettyKey()
 
@@ -600,7 +560,11 @@ func (n *scanNode) explainDebug(endOfRow bool) {
 		n.debugVals.value = n.explainValue.String()
 	}
 	if endOfRow {
-		n.debugVals.output = debugValueRow
+		if passesFilter {
+			n.debugVals.output = debugValueRow
+		} else {
+			n.debugVals.output = debugValueFiltered
+		}
 		n.rowIndex++
 	} else {
 		n.debugVals.output = debugValuePartial
@@ -628,8 +592,48 @@ func (n *scanNode) unmarshalValue(kv client.KeyValue) (parser.Datum, bool) {
 		n.pErr = roachpb.NewUErrorf("column-id \"%d\" does not exist", n.colID)
 		return nil, false
 	}
-	kind := n.visibleCols[idx].Type.Kind
+	kind := n.desc.Columns[idx].Type.Kind
 	d, err := unmarshalColumnValue(kind, kv.Value)
 	n.pErr = roachpb.NewError(err)
 	return d, n.pErr == nil
+}
+
+// scanQValue implements the parser.VariableExpr interface and is used as a replacement node for
+// QualifiedNames in expressions that can change their values for each row.
+//
+// It is analogous to qvalue but allows expressions to be evaluated in the context of a scanNode.
+type scanQValue struct {
+	scan   *scanNode
+	colIdx int
+}
+
+var _ parser.VariableExpr = &scanQValue{}
+
+func (*scanQValue) Variable() {}
+
+func (q *scanQValue) String() string {
+	return string(q.scan.resultColumns[q.colIdx].Name)
+}
+
+func (q *scanQValue) Walk(_ parser.Visitor) parser.Expr {
+	panic("not implemented")
+}
+
+func (q *scanQValue) TypeCheck(args parser.MapArgs) (parser.Datum, error) {
+	return q.scan.resultColumns[q.colIdx].Typ.TypeCheck(args)
+}
+
+func (q *scanQValue) Eval(ctx parser.EvalContext) (parser.Datum, error) {
+	return q.scan.row[q.colIdx].Eval(ctx)
+}
+
+func (n *scanNode) makeQValue(colIdx int) scanQValue {
+	if colIdx < 0 || colIdx >= len(n.row) {
+		panic(fmt.Sprintf("invalid colIdx %d (columns: %d)", colIdx, len(n.row)))
+	}
+	return scanQValue{n, colIdx}
+}
+
+func (n *scanNode) getQValue(colIdx int) *scanQValue {
+	return &n.qvals[colIdx]
 }

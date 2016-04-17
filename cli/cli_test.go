@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 type cliTest struct {
@@ -76,11 +78,12 @@ func newCLITest() cliTest {
 	security.ResetReadFileFn()
 
 	assets := []string{
-		security.CACertPath(security.EmbeddedCertsDir),
-		security.ClientCertPath(security.EmbeddedCertsDir, security.RootUser),
-		security.ClientKeyPath(security.EmbeddedCertsDir, security.RootUser),
-		security.ClientCertPath(security.EmbeddedCertsDir, security.NodeUser),
-		security.ClientKeyPath(security.EmbeddedCertsDir, security.NodeUser),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCAKey),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootCert),
+		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootKey),
 	}
 
 	for _, a := range assets {
@@ -149,6 +152,8 @@ func (c cliTest) RunWithCapture(line string) (out string, err error) {
 }
 
 func (c cliTest) RunWithArgs(a []string) {
+	cliContext.execStmts = nil
+
 	var args []string
 	args = append(args, a[0])
 	h, err := c.ServingHost()
@@ -159,18 +164,24 @@ func (c cliTest) RunWithArgs(a []string) {
 	if err != nil {
 		fmt.Println(err)
 	}
-	pg, err := c.PGPort()
 	if err != nil {
 		fmt.Println(err)
 	}
 	args = append(args, fmt.Sprintf("--host=%s", h))
-	if a[0] == "kv" || a[0] == "quit" || a[0] == "range" || a[0] == "exterminate" || a[0] == "node" {
-		args = append(args, fmt.Sprintf("--port=%s", p))
+	if a[0] == "node" || a[0] == "quit" {
+		_, httpPort, err := net.SplitHostPort(c.HTTPAddr())
+		if err != nil {
+			fmt.Println(err)
+		}
+		args = append(args, fmt.Sprintf("--http-port=%s", httpPort))
 	} else {
-		args = append(args, fmt.Sprintf("--pgport=%s", pg))
+		args = append(args, fmt.Sprintf("--port=%s", p))
 	}
-	// Always load test certs.
-	args = append(args, fmt.Sprintf("--certs=%s", c.certsDir))
+	// Always run in secure mode and use test certs.
+	args = append(args, "--insecure=false")
+	args = append(args, fmt.Sprintf("--ca-cert=%s", filepath.Join(c.certsDir, security.EmbeddedCACert)))
+	args = append(args, fmt.Sprintf("--cert=%s", filepath.Join(c.certsDir, security.EmbeddedNodeCert)))
+	args = append(args, fmt.Sprintf("--key=%s", filepath.Join(c.certsDir, security.EmbeddedNodeKey)))
 	args = append(args, a[1:]...)
 
 	fmt.Fprintf(os.Stderr, "%s\n", args)
@@ -181,7 +192,7 @@ func (c cliTest) RunWithArgs(a []string) {
 }
 
 func TestQuit(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	c := newCLITest()
 	c.Run("quit")
 	// Wait until this async command stops the server.
@@ -195,57 +206,57 @@ func Example_basic() {
 	c := newCLITest()
 	defer c.stop()
 
-	c.Run("kv put a 1 b 2 c 3")
-	c.Run("kv scan")
-	c.Run("kv revscan")
-	c.Run("kv del a c")
-	c.Run("kv get a")
-	c.Run("kv get b")
-	c.Run("kv inc c 1")
-	c.Run("kv inc c 10")
-	c.Run("kv inc c 100")
-	c.Run("kv inc c -- -60")
-	c.Run("kv inc c -- -9")
-	c.Run("kv scan")
-	c.Run("kv revscan")
-	c.Run("kv inc c b")
+	c.Run("debug kv put a 1 b 2 c 3")
+	c.Run("debug kv scan")
+	c.Run("debug kv revscan")
+	c.Run("debug kv del a c")
+	c.Run("debug kv get a")
+	c.Run("debug kv get b")
+	c.Run("debug kv inc c 1")
+	c.Run("debug kv inc c 10")
+	c.Run("debug kv inc c 100")
+	c.Run("debug kv inc c -- -60")
+	c.Run("debug kv inc c -- -9")
+	c.Run("debug kv scan")
+	c.Run("debug kv revscan")
+	c.Run("debug kv inc c b")
 
 	// Output:
-	// kv put a 1 b 2 c 3
-	// kv scan
+	// debug kv put a 1 b 2 c 3
+	// debug kv scan
 	// "a"	"1"
 	// "b"	"2"
 	// "c"	"3"
 	// 3 result(s)
-	// kv revscan
+	// debug kv revscan
 	// "c"	"3"
 	// "b"	"2"
 	// "a"	"1"
 	// 3 result(s)
-	// kv del a c
-	// kv get a
+	// debug kv del a c
+	// debug kv get a
 	// "a" not found
-	// kv get b
+	// debug kv get b
 	// "2"
-	// kv inc c 1
+	// debug kv inc c 1
 	// 1
-	// kv inc c 10
+	// debug kv inc c 10
 	// 11
-	// kv inc c 100
+	// debug kv inc c 100
 	// 111
-	// kv inc c -- -60
+	// debug kv inc c -- -60
 	// 51
-	// kv inc c -- -9
+	// debug kv inc c -- -9
 	// 42
-	// kv scan
+	// debug kv scan
 	// "b"	"2"
 	// "c"	42
 	// 2 result(s)
-	// kv revscan
+	// debug kv revscan
 	// "c"	42
 	// "b"	"2"
 	// 2 result(s)
-	// kv inc c b
+	// debug kv inc c b
 	// invalid increment: b: strconv.ParseInt: parsing "b": invalid syntax
 }
 
@@ -253,33 +264,33 @@ func Example_quoted() {
 	c := newCLITest()
 	defer c.stop()
 
-	c.Run(`kv put a\x00 日本語`)                                  // UTF-8 input text
-	c.Run(`kv put a\x01 \u65e5\u672c\u8a9e`)                   // explicit Unicode code points
-	c.Run(`kv put a\x02 \U000065e5\U0000672c\U00008a9e`)       // explicit Unicode code points
-	c.Run(`kv put a\x03 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e`) // explicit UTF-8 bytes
-	c.Run(`kv scan`)
-	c.Run(`kv get a\x00`)
-	c.Run(`kv del a\x00`)
-	c.Run(`kv inc 1\x01`)
-	c.Run(`kv get 1\x01`)
+	c.Run(`debug kv put a\x00 日本語`)                                  // UTF-8 input text
+	c.Run(`debug kv put a\x01 \u65e5\u672c\u8a9e`)                   // explicit Unicode code points
+	c.Run(`debug kv put a\x02 \U000065e5\U0000672c\U00008a9e`)       // explicit Unicode code points
+	c.Run(`debug kv put a\x03 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e`) // explicit UTF-8 bytes
+	c.Run(`debug kv scan`)
+	c.Run(`debug kv get a\x00`)
+	c.Run(`debug kv del a\x00`)
+	c.Run(`debug kv inc 1\x01`)
+	c.Run(`debug kv get 1\x01`)
 
 	// Output:
-	// kv put a\x00 日本語
-	// kv put a\x01 \u65e5\u672c\u8a9e
-	// kv put a\x02 \U000065e5\U0000672c\U00008a9e
-	// kv put a\x03 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e
-	// kv scan
+	// debug kv put a\x00 日本語
+	// debug kv put a\x01 \u65e5\u672c\u8a9e
+	// debug kv put a\x02 \U000065e5\U0000672c\U00008a9e
+	// debug kv put a\x03 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e
+	// debug kv scan
 	// "a\x00"	"日本語"
 	// "a\x01"	"日本語"
 	// "a\x02"	"日本語"
 	// "a\x03"	"日本語"
 	// 4 result(s)
-	// kv get a\x00
+	// debug kv get a\x00
 	// "日本語"
-	// kv del a\x00
-	// kv inc 1\x01
+	// debug kv del a\x00
+	// debug kv inc 1\x01
 	// 1
-	// kv get 1\x01
+	// debug kv get 1\x01
 	// 1
 }
 
@@ -293,12 +304,12 @@ func Example_insecure() {
 	}
 	defer c.stop()
 
-	c.Run("kv --insecure put a 1 b 2")
-	c.Run("kv --insecure scan")
+	c.Run("debug kv put --insecure a 1 b 2")
+	c.Run("debug kv scan --insecure")
 
 	// Output:
-	// kv --insecure put a 1 b 2
-	// kv --insecure scan
+	// debug kv put --insecure a 1 b 2
+	// debug kv scan --insecure
 	// "a"	"1"
 	// "b"	"2"
 	// 2 result(s)
@@ -308,84 +319,59 @@ func Example_ranges() {
 	c := newCLITest()
 	defer c.stop()
 
-	c.Run("kv put a 1 b 2 c 3 d 4")
-	c.Run("kv scan")
-	c.Run("kv revscan")
-	c.Run("range split c")
-	c.Run("range ls")
-	c.Run("kv scan")
-	c.Run("kv revscan")
-	c.Run("range merge b")
-	c.Run("range ls")
-	c.Run("kv scan")
-	c.Run("kv revscan")
-	c.Run("kv delrange a c")
-	c.Run("kv scan")
+	c.Run("debug kv put a 1 b 2 c 3 d 4")
+	c.Run("debug kv scan")
+	c.Run("debug kv revscan")
+	c.Run("debug range split c")
+	c.Run("debug range ls")
+	c.Run("debug kv scan")
+	c.Run("debug kv revscan")
+	c.Run("debug kv delrange a c")
+	c.Run("debug kv scan")
 
 	// Output:
-	// kv put a 1 b 2 c 3 d 4
-	// kv scan
+	// debug kv put a 1 b 2 c 3 d 4
+	// debug kv scan
 	// "a"	"1"
 	// "b"	"2"
 	// "c"	"3"
 	// "d"	"4"
 	// 4 result(s)
-	// kv revscan
+	// debug kv revscan
 	// "d"	"4"
 	// "c"	"3"
 	// "b"	"2"
 	// "a"	"1"
 	// 4 result(s)
-	// range split c
-	// range ls
+	// debug range split c
+	// debug range ls
 	// /Min-"c" [1]
 	// 	0: node-id=1 store-id=1
-	// "c"-/Table/11 [5]
+	// "c"-/Table/11 [6]
 	// 	0: node-id=1 store-id=1
 	// /Table/11-/Table/12 [2]
 	// 	0: node-id=1 store-id=1
 	// /Table/12-/Table/13 [3]
-	// 	0: node-id=1 store-id=1
-	// /Table/13-/Max [4]
-	// 	0: node-id=1 store-id=1
-	// 5 result(s)
-	// kv scan
+	//	0: node-id=1 store-id=1
+	// /Table/13-/Table/14 [4]
+	//	0: node-id=1 store-id=1
+	// /Table/14-/Max [5]
+	//	0: node-id=1 store-id=1
+	// 6 result(s)
+	// debug kv scan
 	// "a"	"1"
 	// "b"	"2"
 	// "c"	"3"
 	// "d"	"4"
 	// 4 result(s)
-	// kv revscan
+	// debug kv revscan
 	// "d"	"4"
 	// "c"	"3"
 	// "b"	"2"
 	// "a"	"1"
 	// 4 result(s)
-	// range merge b
-	// range ls
-	// /Min-/Table/11 [1]
-	// 	0: node-id=1 store-id=1
-	// /Table/11-/Table/12 [2]
-	// 	0: node-id=1 store-id=1
-	// /Table/12-/Table/13 [3]
-	// 	0: node-id=1 store-id=1
-	// /Table/13-/Max [4]
-	// 	0: node-id=1 store-id=1
-	// 4 result(s)
-	// kv scan
-	// "a"	"1"
-	// "b"	"2"
-	// "c"	"3"
-	// "d"	"4"
-	// 4 result(s)
-	// kv revscan
-	// "d"	"4"
-	// "c"	"3"
-	// "b"	"2"
-	// "a"	"1"
-	// 4 result(s)
-	// kv delrange a c
-	// kv scan
+	// debug kv delrange a c
+	// debug kv scan
 	// "c"	"3"
 	// "d"	"4"
 	// 2 result(s)
@@ -395,49 +381,61 @@ func Example_logging() {
 	c := newCLITest()
 	defer c.stop()
 
-	c.Run("kv --alsologtostderr=false scan")
-	c.Run("kv --log-backtrace-at=foo.go:1 scan")
-	c.Run("kv --log-dir='' scan")
-	c.Run("kv --logtostderr=true scan")
-	c.Run("kv --verbosity=0 scan")
-	c.Run("kv --vmodule=foo=1 scan")
+	c.RunWithArgs([]string{"sql", "--alsologtostderr=false", "-e", "select 1"})
+	c.RunWithArgs([]string{"sql", "--log-backtrace-at=foo.go:1", "-e", "select 1"})
+	c.RunWithArgs([]string{"sql", "--log-dir=", "-e", "select 1"})
+	c.RunWithArgs([]string{"sql", "--logtostderr=true", "-e", "select 1"})
+	c.RunWithArgs([]string{"sql", "--verbosity=0", "-e", "select 1"})
+	c.RunWithArgs([]string{"sql", "--vmodule=foo=1", "-e", "select 1"})
 
 	// Output:
-	// kv --alsologtostderr=false scan
-	// 0 result(s)
-	// kv --log-backtrace-at=foo.go:1 scan
-	// 0 result(s)
-	// kv --log-dir='' scan
-	// 0 result(s)
-	// kv --logtostderr=true scan
-	// 0 result(s)
-	// kv --verbosity=0 scan
-	// 0 result(s)
-	// kv --vmodule=foo=1 scan
-	// 0 result(s)
+	// sql --alsologtostderr=false -e select 1
+	// 1 row
+	// 1
+	// 1
+	// sql --log-backtrace-at=foo.go:1 -e select 1
+	// 1 row
+	// 1
+	// 1
+	// sql --log-dir= -e select 1
+	// 1 row
+	// 1
+	// 1
+	// sql --logtostderr=true -e select 1
+	// 1 row
+	// 1
+	// 1
+	// sql --verbosity=0 -e select 1
+	// 1 row
+	// 1
+	// 1
+	// sql --vmodule=foo=1 -e select 1
+	// 1 row
+	// 1
+	// 1
 }
 
 func Example_cput() {
 	c := newCLITest()
 	defer c.stop()
 
-	c.Run("kv put a 1 b 2 c 3 d 4")
-	c.Run("kv scan")
-	c.Run("kv cput e 5")
-	c.Run("kv cput b 3 2")
-	c.Run("kv scan")
+	c.Run("debug kv put a 1 b 2 c 3 d 4")
+	c.Run("debug kv scan")
+	c.Run("debug kv cput e 5")
+	c.Run("debug kv cput b 3 2")
+	c.Run("debug kv scan")
 
 	// Output:
-	// kv put a 1 b 2 c 3 d 4
-	// kv scan
+	// debug kv put a 1 b 2 c 3 d 4
+	// debug kv scan
 	// "a"	"1"
 	// "b"	"2"
 	// "c"	"3"
 	// "d"	"4"
 	// 4 result(s)
-	// kv cput e 5
-	// kv cput b 3 2
-	// kv scan
+	// debug kv cput e 5
+	// debug kv cput b 3 2
+	// debug kv scan
 	// "a"	"1"
 	// "b"	"3"
 	// "c"	"3"
@@ -450,30 +448,30 @@ func Example_max_results() {
 	c := newCLITest()
 	defer c.stop()
 
-	c.Run("kv put a 1 b 2 c 3 d 4")
-	c.Run("kv scan --max-results=3")
-	c.Run("kv revscan --max-results=2")
-	c.Run("range split c")
-	c.Run("range split d")
-	c.Run("range ls --max-results=2")
+	c.Run("debug kv put a 1 b 2 c 3 d 4")
+	c.Run("debug kv scan --max-results=3")
+	c.Run("debug kv revscan --max-results=2")
+	c.Run("debug range split c")
+	c.Run("debug range split d")
+	c.Run("debug range ls --max-results=2")
 
 	// Output:
-	// kv put a 1 b 2 c 3 d 4
-	// kv scan --max-results=3
+	// debug kv put a 1 b 2 c 3 d 4
+	// debug kv scan --max-results=3
 	// "a"	"1"
 	// "b"	"2"
 	// "c"	"3"
 	// 3 result(s)
-	// kv revscan --max-results=2
+	// debug kv revscan --max-results=2
 	// "d"	"4"
 	// "c"	"3"
 	// 2 result(s)
-	// range split c
-	// range split d
-	// range ls --max-results=2
+	// debug range split c
+	// debug range split d
+	// debug range ls --max-results=2
 	// /Min-"c" [1]
 	// 	0: node-id=1 store-id=1
-	// "c"-"d" [5]
+	// "c"-"d" [6]
 	// 	0: node-id=1 store-id=1
 	// 2 result(s)
 }
@@ -482,55 +480,87 @@ func Example_zone() {
 	c := newCLITest()
 	defer c.stop()
 
-	zone100 := `replicas:
-- attrs: [us-east-1a,ssd]
-- attrs: [us-east-1b,ssd]
-- attrs: [us-west-1b,ssd]
-range_min_bytes: 8388608
-range_max_bytes: 67108864
-`
+	const zone1 = `replicas:
+- attrs: [us-east-1a,ssd]`
+	const zone2 = `range_max_bytes: 134217728`
+
 	c.Run("zone ls")
 	// Call RunWithArgs to bypass the "split-by-whitespace" arg builder.
-	c.RunWithArgs([]string{"zone", "set", "100", zone100})
+	c.RunWithArgs([]string{"zone", "set", "system", zone1})
 	c.Run("zone ls")
-	c.Run("zone get 100")
-	c.Run("zone rm 100")
+	c.Run("zone get system.nonexistent")
+	c.Run("zone get system.lease")
+	c.RunWithArgs([]string{"zone", "set", "system", zone2})
+	c.Run("zone get system")
+	c.Run("zone rm system")
 	c.Run("zone ls")
+	c.Run("zone rm .default")
+	c.RunWithArgs([]string{"zone", "set", ".default", zone2})
+	c.Run("zone get system")
 
 	// Output:
 	// zone ls
-	// zone set 100 replicas:
+	// .default
+	// zone set system replicas:
 	// - attrs: [us-east-1a,ssd]
-	// - attrs: [us-east-1b,ssd]
-	// - attrs: [us-west-1b,ssd]
-	// range_min_bytes: 8388608
-	// range_max_bytes: 67108864
-	//
-	// OK
-	// zone ls
-	// Object 100:
+	// INSERT 1
 	// replicas:
 	// - attrs: [us-east-1a, ssd]
-	// - attrs: [us-east-1b, ssd]
-	// - attrs: [us-west-1b, ssd]
-	// range_min_bytes: 8388608
+	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
 	// gc:
-	//   ttlseconds: 0
-	//
-	// zone get 100
+	//   ttlseconds: 86400
+	// zone ls
+	// .default
+	// system
+	// zone get system.nonexistent
+	// system.nonexistent not found
+	// zone get system.lease
+	// system
 	// replicas:
 	// - attrs: [us-east-1a, ssd]
-	// - attrs: [us-east-1b, ssd]
-	// - attrs: [us-west-1b, ssd]
-	// range_min_bytes: 8388608
+	// range_min_bytes: 1048576
 	// range_max_bytes: 67108864
 	// gc:
-	//   ttlseconds: 0
-	//
-	// zone rm 100
-	// OK
+	//   ttlseconds: 86400
+	// zone set system range_max_bytes: 134217728
+	// UPDATE 1
+	// replicas:
+	// - attrs: [us-east-1a, ssd]
+	// range_min_bytes: 1048576
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 86400
+	// zone get system
+	// system
+	// replicas:
+	// - attrs: [us-east-1a, ssd]
+	// range_min_bytes: 1048576
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 86400
+	// zone rm system
+	// DELETE 1
 	// zone ls
+	// .default
+	// zone rm .default
+	// unable to remove .default
+	// zone set .default range_max_bytes: 134217728
+	// UPDATE 1
+	// replicas:
+	// - attrs: []
+	// range_min_bytes: 1048576
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 86400
+	// zone get system
+	// .default
+	// replicas:
+	// - attrs: []
+	// range_min_bytes: 1048576
+	// range_max_bytes: 134217728
+	// gc:
+	//   ttlseconds: 86400
 }
 
 func Example_sql() {
@@ -538,33 +568,34 @@ func Example_sql() {
 	defer c.stop()
 
 	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int); insert into t.f values (42, 69)"})
-	c.RunWithArgs([]string{"sql", "-e", "select 3", "select * from t.f"})
-	c.RunWithArgs([]string{"sql", "-e", "begin", "select 3", "commit"})
+	c.RunWithArgs([]string{"sql", "-e", "select 3", "-e", "select * from t.f"})
+	c.RunWithArgs([]string{"sql", "-e", "begin", "-e", "select 3", "-e", "commit"})
 	c.RunWithArgs([]string{"sql", "-e", "select * from t.f"})
-	c.RunWithArgs([]string{"sql", "-e", "show databases"})
+	c.RunWithArgs([]string{"sql", "--execute=show databases"})
 	c.RunWithArgs([]string{"sql", "-e", "explain select 3"})
+	c.RunWithArgs([]string{"sql", "-e", "select 1; select 2"})
 
 	// Output:
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
-	// OK
-	// sql -e select 3 select * from t.f
+	// INSERT 1
+	// sql -e select 3 -e select * from t.f
 	// 1 row
 	// 3
 	// 3
 	// 1 row
 	// x	y
 	// 42	69
-	// sql -e begin select 3 commit
-	// OK
+	// sql -e begin -e select 3 -e commit
+	// BEGIN
 	// 1 row
 	// 3
 	// 3
-	// OK
+	// COMMIT
 	// sql -e select * from t.f
 	// 1 row
 	// x	y
 	// 42	69
-	// sql -e show databases
+	// sql --execute=show databases
 	// 2 rows
 	// Database
 	// system
@@ -573,6 +604,13 @@ func Example_sql() {
 	// 1 row
 	// Level	Type	Description
 	// 0	empty	-
+	// sql -e select 1; select 2
+	// 1 row
+	// 1
+	// 1
+	// 1 row
+	// 2
+	// 2
 }
 
 func Example_sql_escape() {
@@ -591,21 +629,21 @@ func Example_sql_escape() {
 
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
-	// OK
+	// CREATE TABLE
 	// sql -e insert into t.t values (e'foo', 'printable ASCII')
-	// OK
+	// INSERT 1
 	// sql -e insert into t.t values (e'foo\x0a', 'non-printable ASCII')
-	// OK
+	// INSERT 1
 	// sql -e insert into t.t values ('κόσμε', 'printable UTF8')
-	// OK
+	// INSERT 1
 	// sql -e insert into t.t values (e'\xc3\xb1', 'printable UTF8 using escapes')
-	// OK
+	// INSERT 1
 	// sql -e insert into t.t values (e'\x01', 'non-printable UTF8 string')
-	// OK
+	// INSERT 1
 	// sql -e insert into t.t values (e'\xdc\x88\x38\x35', 'UTF8 string with RTL char')
-	// OK
+	// INSERT 1
 	// sql -e insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
-	// OK
+	// INSERT 1
 	// sql -e select * from t.t
 	// 7 rows
 	// s	d
@@ -637,7 +675,7 @@ func Example_user() {
 	// +----------+
 	// +----------+
 	// user set foo --password=bar
-	// OK
+	// INSERT 1
 	// user ls
 	// +----------+
 	// | username |
@@ -645,7 +683,7 @@ func Example_user() {
 	// | foo      |
 	// +----------+
 	// user rm foo
-	// OK
+	// DELETE 1
 	// user ls
 	// +----------+
 	// | username |
@@ -656,7 +694,7 @@ func Example_user() {
 // TestFlagUsage is a basic test to make sure the fragile
 // help template does not break.
 func TestFlagUsage(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	// Override os.Stdout with our own.
 	old := os.Stdout
@@ -706,12 +744,8 @@ Available Commands:
   exterminate destroy all data held by the node
   quit        drain and shutdown node
 
-  log         make log files human-readable
-
   sql         open a sql shell
-  kv          get, put, conditional put, increment, delete, scan, and reverse scan key/value pairs
   user        get, set, list and remove users
-  range       list, split and merge ranges
   zone        get, set, list and remove zones
   node        list nodes and show their status
 
@@ -720,13 +754,13 @@ Available Commands:
   debug       debugging commands
 
 Flags:
-      --alsologtostderr         log to standard error as well as files
-      --color                   colorize standard error output according to severity (default "auto")
-      --log-backtrace-at        when logging hits line file:N, emit a stack trace (default :0)
-      --log-dir                 if non-empty, write log files in this directory
-      --logtostderr             log to standard error instead of files (default true)
-      --verbosity               log level for V logs
-      --vmodule                 comma-separated list of pattern=N settings for file-filtered logging
+      --alsologtostderr value[=INFO]   logs at or above this threshold go to stderr (default NONE)
+      --log-backtrace-at value         when logging hits line file:N, emit a stack trace (default :0)
+      --log-dir value                  if non-empty, write log files in this directory
+      --logtostderr                    log to standard error instead of files
+      --no-color value                 disable standard error log colorization
+      --verbosity value                log level for V logs
+      --vmodule value                  comma-separated list of pattern=N settings for file-filtered logging
 
 Use "cockroach [command] --help" for more information about a command.
 `
@@ -760,9 +794,9 @@ func Example_node() {
 }
 
 func TestNodeStatus(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
-	start := time.Now()
+	start := timeutil.Now()
 	c := newCLITest()
 	defer c.stop()
 
@@ -832,9 +866,15 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 		t.Errorf("node address (%s) != expected (%s)", a, e)
 	}
 
+	// Verify Build Tag.
+	if a, e := fields[2], util.GetBuildInfo().Tag; a != e {
+		t.Errorf("build tag (%s) != expected (%s)", a, e)
+	}
+
 	// Verify that updated_at and started_at are reasonably recent.
-	checkTimeElapsed(t, fields[2], 5*time.Second, start)
-	checkTimeElapsed(t, fields[3], 5*time.Second, start)
+	// CircleCI can be very slow. This was flaky at 5s.
+	checkTimeElapsed(t, fields[3], 15*time.Second, start)
+	checkTimeElapsed(t, fields[4], 15*time.Second, start)
 
 	// Verify all byte/range metrics.
 	testcases := []struct {
@@ -842,14 +882,14 @@ func checkNodeStatus(t *testing.T, c cliTest, output string, start time.Time) {
 		idx    int
 		maxval int64
 	}{
-		{"live_bytes", 4, 20000},
-		{"key_bytes", 5, 20000},
-		{"value_bytes", 6, 20000},
-		{"intent_bytes", 7, 20000},
-		{"system_bytes", 8, 20000},
-		{"leader_ranges", 9, 3},
-		{"repl_ranges", 10, 3},
-		{"avail_ranges", 11, 3},
+		{"live_bytes", 5, 30000},
+		{"key_bytes", 6, 30000},
+		{"value_bytes", 7, 30000},
+		{"intent_bytes", 8, 30000},
+		{"system_bytes", 9, 30000},
+		{"leader_ranges", 10, 3},
+		{"repl_ranges", 11, 3},
+		{"avail_ranges", 12, 3},
 	}
 	for _, tc := range testcases {
 		val, err := strconv.ParseInt(fields[tc.idx], 10, 64)
@@ -916,7 +956,7 @@ func extractFields(line string) ([]string, error) {
 }
 
 func TestGenMan(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	// Generate man pages in a temp directory.
 	manpath, err := ioutil.TempDir("", "TestGenMan")
@@ -949,7 +989,7 @@ func TestGenMan(t *testing.T) {
 }
 
 func TestGenAutocomplete(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	// Get a unique path to which we can write our autocomplete files.
 	acdir, err := ioutil.TempDir("", "TestGenAutoComplete")

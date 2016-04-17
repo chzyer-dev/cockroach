@@ -14,8 +14,6 @@
 //
 // Author: Matt Jibson (mjibson@cockroachlabs.com)
 
-// +build acceptance
-
 package acceptance
 
 import (
@@ -23,11 +21,9 @@ import (
 	"testing"
 )
 
-// TestJava connects to a cluster with Java.
-func TestJava(t *testing.T) {
-	t.Skip("https://github.com/cockroachdb/cockroach/issues/3826")
-	testDockerSuccess(t, "java", []string{"/bin/sh", "-c", strings.Replace(java, "%v", "3", 1)})
-	testDockerFail(t, "java", []string{"/bin/sh", "-c", strings.Replace(java, "%v", `"a"`, 1)})
+func TestDockerJava(t *testing.T) {
+	testDockerSuccess(t, "java", []string{"/bin/sh", "-c", strings.Replace(java, "%v", "Int(2, 3)", 1)})
+	testDockerFail(t, "java", []string{"/bin/sh", "-c", strings.Replace(java, "%v", `String(2, "a")`, 1)})
 }
 
 const java = `
@@ -48,9 +44,41 @@ public class main {
 		DB_URL += "&sslfactory=org.postgresql.ssl.jdbc4.LibPQFactory";
 		Connection conn = DriverManager.getConnection(DB_URL);
 
-		PreparedStatement stmt = conn.prepareStatement("SELECT 1, 2 > ?, ?::int, ?::string, ?::string, ?::string, ?::string, ?::string");
+		PreparedStatement stmt = conn.prepareStatement("CREATE DATABASE test");
+		int res = stmt.executeUpdate();
+		if (res != 0) {
+		    throw new Exception("unexpected: CREATE DATABASE reports " + res + " rows changed, expecting 0");
+		}
+
+		stmt = conn.prepareStatement("CREATE TABLE test.f (x INT)");
+		res = stmt.executeUpdate();
+		if (res != 0) {
+		    throw new Exception("unexpected: CREATE TABLE reports " + res + " rows changed, expecting 0");
+		}
+
+		stmt = conn.prepareStatement("INSERT INTO test.f VALUES (42)");
+		res = stmt.executeUpdate();
+		if (res != 1) {
+		    throw new Exception("unexpected: INSERT reports " + res + " rows changed, expecting 1");
+		}
+
+		stmt = conn.prepareStatement("SELECT * FROM test.f");
+		ResultSet rs = stmt.executeQuery();
+		rs.next();
+		int a = rs.getInt(1);
+		if (a != 42) {
+		    throw new Exception("unexpected: SELECT can't find inserted value: read " + a + ", expecting 42");
+		}
+
+		stmt = conn.prepareStatement("DROP TABLE test.f");
+		res = stmt.executeUpdate();
+		if (res != 0) {
+		    throw new Exception("unexpected: DROP TABLE reports " + res + " rows changed, expecting 0");
+		}
+
+		stmt = conn.prepareStatement("SELECT 1, 2 > ?, ?::int, ?::string, ?::string, ?::string, ?::string, ?::string");
 		stmt.setInt(1, 3);
-		stmt.setInt(2, %v);
+		stmt.set%v;
 
 		stmt.setBoolean(3, true);
 		stmt.setLong(4, -4L);
@@ -58,9 +86,9 @@ public class main {
 		stmt.setDouble(6, -6.21d);
 		stmt.setShort(7, (short)7);
 
-		ResultSet rs = stmt.executeQuery();
+		rs = stmt.executeQuery();
 		rs.next();
-		int a = rs.getInt(1);
+		a = rs.getInt(1);
 		boolean b = rs.getBoolean(2);
 		int c = rs.getInt(3);
 		String d = rs.getString(4);
@@ -75,9 +103,9 @@ public class main {
 }
 EOF
 # See: https://basildoncoder.com/blog/postgresql-jdbc-client-certificates.html
-openssl pkcs8 -topk8 -inform PEM -outform DER -in /certs/node.client.key -out key.pk8 -nocrypt
+openssl pkcs8 -topk8 -inform PEM -outform DER -in /certs/node.key -out key.pk8 -nocrypt
 
-export PATH=$PATH:/usr/lib/jvm/java-1.7-openjdk/bin
+export PATH=$PATH:/usr/lib/jvm/java-1.8-openjdk/bin
 javac main.java
 java -cp /postgres.jar:. main
 `

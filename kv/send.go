@@ -20,18 +20,17 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	netrpc "net/rpc"
-	"os"
 	"time"
+
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/envutil"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
-	"github.com/cockroachdb/cockroach/util/tracing"
-	"github.com/gogo/protobuf/proto"
-	"github.com/opentracing/opentracing-go"
 )
 
 // orderingPolicy is an enum for ordering strategies when there
@@ -40,7 +39,7 @@ type orderingPolicy int
 
 const (
 	// orderStable uses endpoints in the order provided.
-	orderStable = iota
+	orderStable orderingPolicy = iota
 	// orderRandom randomly orders available endpoints.
 	orderRandom
 )
@@ -49,6 +48,7 @@ const (
 // more replicas, depending on error conditions and how many successful
 // responses are required.
 type SendOptions struct {
+	context.Context // must not be nil
 	// Ordering indicates how the available endpoints are ordered when
 	// deciding which to send to (if there are more than one).
 	Ordering orderingPolicy
@@ -58,8 +58,13 @@ type SendOptions struct {
 	// Timeout is the maximum duration of an RPC before failure.
 	// 0 for no timeout.
 	Timeout time.Duration
-	// If not nil, information about the request is added to this trace.
-	Trace opentracing.Span
+}
+
+func (so SendOptions) contextWithTimeout() (context.Context, func()) {
+	if so.Timeout != 0 {
+		return context.WithTimeout(so.Context, so.Timeout)
+	}
+	return so.Context, func() {}
 }
 
 // An rpcError indicates a failure to send the RPC. rpcErrors are
@@ -81,9 +86,10 @@ func newRPCError(err error) rpcError {
 func (r rpcError) CanRetry() bool { return true }
 
 type batchClient struct {
-	*rpc.Client
-	replica *ReplicaInfo
-	args    roachpb.BatchRequest
+	remoteAddr string
+	conn       *grpc.ClientConn
+	client     roachpb.InternalClient
+	args       roachpb.BatchRequest
 }
 
 func shuffleClients(clients []batchClient) {
@@ -93,21 +99,17 @@ func shuffleClients(clients []batchClient) {
 	}
 }
 
+type batchCall struct {
+	reply *roachpb.BatchResponse
+	err   error
+}
+
 // Send sends one or more RPCs to clients specified by the slice of
 // replicas. On success, Send returns the first successful reply. Otherwise,
 // Send returns an error if and as soon as the number of failed RPCs exceeds
 // the available endpoints less the number of required replies.
-//
-// TODO(pmattis): Get rid of the getArgs function which requires the caller to
-// maintain a map from address to replica. Instead, pass in the list of
-// replicas instead of a list of addresses and use that to populate the
-// requests.
 func send(opts SendOptions, replicas ReplicaSlice,
-	args roachpb.BatchRequest, context *rpc.Context) (proto.Message, error) {
-	sp := opts.Trace
-	if sp == nil {
-		sp = tracing.NoopSpan()
-	}
+	args roachpb.BatchRequest, rpcContext *rpc.Context) (*roachpb.BatchResponse, error) {
 
 	if len(replicas) < 1 {
 		return nil, roachpb.NewSendError(
@@ -115,15 +117,28 @@ func send(opts SendOptions, replicas ReplicaSlice,
 				len(replicas), 1), false)
 	}
 
-	done := make(chan *netrpc.Call, len(replicas))
+	done := make(chan batchCall, len(replicas))
 
 	clients := make([]batchClient, 0, len(replicas))
-	for i, replica := range replicas {
+	for _, replica := range replicas {
+		conn, err := rpcContext.GRPCDial(replica.NodeDesc.Address.String())
+		if err != nil {
+			return nil, err
+		}
+		argsCopy := args
+		argsCopy.Replica = replica.ReplicaDescriptor
 		clients = append(clients, batchClient{
-			Client:  rpc.NewClient(&replica.NodeDesc.Address, context),
-			replica: &replicas[i],
-			args:    args,
+			remoteAddr: replica.NodeDesc.Address.String(),
+			conn:       conn,
+			client:     roachpb.NewInternalClient(conn),
+			args:       argsCopy,
 		})
+	}
+
+	// Put known-unhealthy clients last.
+	nHealthy, err := splitHealthy(clients)
+	if err != nil {
+		return nil, err
 	}
 
 	var orderedClients []batchClient
@@ -132,16 +147,6 @@ func send(opts SendOptions, replicas ReplicaSlice,
 		orderedClients = clients
 	case orderRandom:
 		// Randomly permute order, but keep known-unhealthy clients last.
-		var nHealthy int
-		for i, client := range clients {
-			select {
-			case <-client.Healthy():
-				clients[i], clients[nHealthy] = clients[nHealthy], clients[i]
-				nHealthy++
-			default:
-			}
-		}
-
 		shuffleClients(clients[:nHealthy])
 		shuffleClients(clients[nHealthy:])
 
@@ -153,7 +158,7 @@ func send(opts SendOptions, replicas ReplicaSlice,
 	// node will be able to order the healthy replicas based on latency.
 
 	// Send the first request.
-	sendOneFn(&orderedClients[0], opts.Timeout, context, sp, done)
+	sendOneFn(opts, rpcContext, orderedClients[0], done)
 	orderedClients = orderedClients[1:]
 
 	var errors, retryableErrors int
@@ -168,31 +173,19 @@ func send(opts SendOptions, replicas ReplicaSlice,
 			sendNextTimer.Read = true
 			// On successive RPC timeouts, send to additional replicas if available.
 			if len(orderedClients) > 0 {
-				sp.LogEvent("timeout, trying next peer")
-				sendOneFn(&orderedClients[0], opts.Timeout, context, sp, done)
+				log.Trace(opts.Context, "timeout, trying next peer")
+				sendOneFn(opts, rpcContext, orderedClients[0], done)
 				orderedClients = orderedClients[1:]
 			}
 
 		case call := <-done:
-			if call.Error == nil {
-				// Verify response data integrity if this is a proto response.
-				if req, reqOk := call.Args.(roachpb.Request); reqOk {
-					if resp, respOk := call.Reply.(roachpb.Response); respOk {
-						if err := resp.Verify(req); err != nil {
-							call.Error = err
-						}
-					} else {
-						call.Error = util.Errorf("response to proto request must be a proto")
-					}
-				}
-			}
-			err := call.Error
+			err := call.err
 			if err == nil {
 				if log.V(2) {
-					log.Infof("successful reply: %+v", call.Reply)
+					log.Infof("successful reply: %+v", call.reply)
 				}
 
-				return call.Reply.(proto.Message), nil
+				return call.reply, nil
 			}
 
 			// Error handling.
@@ -203,7 +196,7 @@ func send(opts SendOptions, replicas ReplicaSlice,
 			errors++
 
 			// Since we have a reconnecting client here, disconnect errors are retryable.
-			disconnected := err == netrpc.ErrShutdown || err == io.ErrUnexpectedEOF
+			disconnected := err == io.ErrUnexpectedEOF
 			if retryErr, ok := err.(retry.Retryable); disconnected || (ok && retryErr.CanRetry()) {
 				retryableErrors++
 			}
@@ -215,20 +208,38 @@ func send(opts SendOptions, replicas ReplicaSlice,
 			}
 			// Send to additional replicas if available.
 			if len(orderedClients) > 0 {
-				sp.LogEvent("error, trying next peer")
-				sendOneFn(&orderedClients[0], opts.Timeout, context, sp, done)
+				log.Trace(opts.Context, "error, trying next peer")
+				sendOneFn(opts, rpcContext, orderedClients[0], done)
 				orderedClients = orderedClients[1:]
 			}
 		}
 	}
 }
 
+// splitHealthy splits the provided client slice into healthy clients and
+// unhealthy clients, based on their connection state. Healthy clients will
+// be rearranged first in the slice, and unhealthy clients will be rearranged
+// last. Within these two groups, the rearrangement will be stable. The function
+// will then return the number of healthy clients.
+func splitHealthy(clients []batchClient) (int, error) {
+	var nHealthy int
+	for i, client := range clients {
+		clientState, err := client.conn.State()
+		if err != nil {
+			// This should not currently happen with the default grpc.Picker.
+			return 0, err
+		}
+		if clientState == grpc.Ready {
+			clients[i], clients[nHealthy] = clients[nHealthy], clients[i]
+			nHealthy++
+		}
+	}
+	return nHealthy, nil
+}
+
 // Allow local calls to be dispatched directly to the local server without
 // sending an RPC.
-//
-// TODO(pmattis): We should either always enable local calls or remove this
-// support. Revisit once the current performance work has completed.
-var enableLocalCalls = os.Getenv("ENABLE_LOCAL_CALLS") == "1"
+var enableLocalCalls = envutil.EnvOrDefaultBool("enable_local_calls", true)
 
 // sendOneFn is overwritten in tests to mock sendOne.
 var sendOneFn = sendOne
@@ -239,51 +250,40 @@ var sendOneFn = sendOne
 //
 // Do not call directly, but instead use sendOneFn. Tests mock out this method
 // via sendOneFn in order to test various error cases.
-func sendOne(client *batchClient, timeout time.Duration,
-	context *rpc.Context, trace opentracing.Span, done chan *netrpc.Call) {
-
-	const method = "Node.Batch"
-
-	addr := client.RemoteAddr()
-	args := &client.args
-	args.Replica = client.replica.ReplicaDescriptor
-
+func sendOne(opts SendOptions, rpcContext *rpc.Context, client batchClient, done chan batchCall) {
+	addr := client.remoteAddr
 	if log.V(2) {
-		log.Infof("sending request to %s: %+v", addr, args)
-	}
-	trace.LogEvent(fmt.Sprintf("sending to %s", addr))
-
-	if enableLocalCalls && context.LocalServer != nil && addr.String() == context.LocalAddr {
-		if context.LocalServer.LocalCall(method, args, done) {
-			return
-		}
+		log.Infof("sending request to %s: %+v", addr, client.args)
 	}
 
-	reply := &roachpb.BatchResponse{}
+	if localServer := rpcContext.GetLocalInternalServerForAddr(addr); enableLocalCalls && localServer != nil {
+		ctx, cancel := opts.contextWithTimeout()
+		defer cancel()
 
-	// Don't bother firing off a goroutine in the common case where a client
-	// is already healthy.
-	select {
-	case <-client.Healthy():
-		client.Go(method, args, reply, done)
+		reply, err := localServer.Batch(ctx, &client.args)
+		done <- batchCall{reply: reply, err: err}
 		return
-	default:
 	}
 
 	go func() {
-		var timeoutChan <-chan time.Time
-		if timeout != 0 {
-			timeoutChan = time.After(timeout)
+		ctx, cancel := opts.contextWithTimeout()
+		defer cancel()
+
+		c := client.conn
+		for state, err := c.State(); state != grpc.Ready; state, err = c.WaitForStateChange(ctx, state) {
+			if err != nil {
+				done <- batchCall{err: newRPCError(
+					util.Errorf("rpc to %s failed: %s", addr, err))}
+				return
+			}
+			if state == grpc.Shutdown {
+				done <- batchCall{err: newRPCError(
+					util.Errorf("rpc to %s failed as client connection was closed", addr))}
+				return
+			}
 		}
-		select {
-		case <-client.Healthy():
-			client.Go(method, args, reply, done)
-		case <-client.Closed:
-			done <- &netrpc.Call{Error: newRPCError(
-				util.Errorf("rpc to %s failed as client connection was closed", method))}
-		case <-timeoutChan:
-			done <- &netrpc.Call{Error: newRPCError(
-				util.Errorf("rpc to %s: client not ready after %s", method, timeout))}
-		}
+
+		reply, err := client.client.Batch(ctx, &client.args)
+		done <- batchCall{reply: reply, err: err}
 	}()
 }

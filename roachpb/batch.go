@@ -22,6 +22,27 @@ import (
 	"strings"
 )
 
+// SetActiveTimestamp sets the correct timestamp at which the request is to be
+// carried out. For transactional requests, ba.Timestamp must be zero initially
+// and it will be set to txn.OrigTimestamp. For non-transactional requests, if
+// no timestamp is specified, nowFn is used to create and set one.
+func (ba *BatchRequest) SetActiveTimestamp(nowFn func() Timestamp) error {
+	if ba.Txn == nil {
+		// When not transactional, allow empty timestamp and  use nowFn instead.
+		if ba.Timestamp.Equal(ZeroTimestamp) {
+			ba.Timestamp.Forward(nowFn())
+		}
+	} else if !ba.Timestamp.Equal(ZeroTimestamp) {
+		return errors.New("transactional request must not set batch timestamp")
+	} else {
+		// Always use the original timestamp for reads and writes, even
+		// though some intents may be written at higher timestamps in the
+		// event of a WriteTooOldError.
+		ba.Timestamp = ba.Txn.OrigTimestamp
+	}
+	return nil
+}
+
 // IsAdmin returns true iff the BatchRequest contains an admin request.
 func (ba *BatchRequest) IsAdmin() bool {
 	return ba.flags()&isAdmin != 0
@@ -54,11 +75,6 @@ func (ba *BatchRequest) IsTransactionWrite() bool {
 	return (ba.flags() & isTxnWrite) != 0
 }
 
-// IsRange returns true iff the BatchRequest contains a range request.
-func (ba *BatchRequest) IsRange() bool {
-	return (ba.flags() & isRange) != 0
-}
-
 // GetArg returns a request of the given type if one is contained in the
 // Batch. The request returned is the first of its kind, with the exception
 // of EndTransaction, where it examines the very last request only.
@@ -89,43 +105,16 @@ func (br *BatchResponse) String() string {
 	return strings.Join(str, ", ")
 }
 
-// First returns the first response of the given type, if possible.
-func (br *BatchResponse) First() Response {
-	if len(br.Responses) > 0 {
-		return br.Responses[0].GetInner()
-	}
-	return nil
-}
-
-// Header returns a pointer to the header.
-func (br *BatchResponse) Header() *BatchResponse_Header {
-	return &br.BatchResponse_Header
-}
-
-// GetIntentSpans returns a slice of key pairs corresponding to transactional
-// writes contained in the batch.
-func (ba *BatchRequest) GetIntentSpans() []Span {
-	var intents []Span
+// IntentSpanIterate calls the passed method with the key ranges of the
+// transactional writes contained in the batch.
+func (ba *BatchRequest) IntentSpanIterate(fn func(key, endKey Key)) {
 	for _, arg := range ba.Requests {
 		req := arg.GetInner()
 		if !IsTransactionWrite(req) {
 			continue
 		}
 		h := req.Header()
-		intents = append(intents, Span{Key: h.Key, EndKey: h.EndKey})
-	}
-	return intents
-}
-
-// ResetAll resets all the contained requests to their original state.
-func (br *BatchResponse) ResetAll() {
-	if br == nil {
-		return
-	}
-	for _, rsp := range br.Responses {
-		// TODO(tschottdorf) `rsp.Reset()` isn't enough because rsp
-		// isn't a pointer.
-		rsp.GetInner().Reset()
+		fn(h.Key, h.EndKey)
 	}
 }
 
@@ -141,10 +130,10 @@ func (br *BatchResponse) Combine(otherBatch *BatchResponse) error {
 	for i, l := 0, len(br.Responses); i < l; i++ {
 		valLeft := br.Responses[i].GetInner()
 		valRight := otherBatch.Responses[i].GetInner()
-		args, lOK := valLeft.(Combinable)
-		reply, rOK := valRight.(Combinable)
+		cValLeft, lOK := valLeft.(combinable)
+		cValRight, rOK := valRight.(combinable)
 		if lOK && rOK {
-			if err := args.Combine(reply.(Response)); err != nil {
+			if err := cValLeft.combine(cValRight); err != nil {
 				return err
 			}
 			continue
@@ -156,8 +145,8 @@ func (br *BatchResponse) Combine(otherBatch *BatchResponse) error {
 			br.Responses[i] = otherBatch.Responses[i]
 		}
 	}
-	br.Timestamp.Forward(otherBatch.Timestamp)
 	br.Txn.Update(otherBatch.Txn)
+	br.CollectedSpans = append(br.CollectedSpans, otherBatch.CollectedSpans...)
 	return nil
 }
 
@@ -165,9 +154,7 @@ func (br *BatchResponse) Combine(otherBatch *BatchResponse) error {
 func (ba *BatchRequest) Add(requests ...Request) {
 	for _, args := range requests {
 		union := RequestUnion{}
-		if !union.SetValue(args) {
-			panic(fmt.Sprintf("unable to add %T to batch request", args))
-		}
+		union.MustSetInner(args)
 		ba.Requests = append(ba.Requests, union)
 	}
 }
@@ -175,10 +162,7 @@ func (ba *BatchRequest) Add(requests ...Request) {
 // Add adds a response to the batch response.
 func (br *BatchResponse) Add(reply Response) {
 	union := ResponseUnion{}
-	if !union.SetValue(reply) {
-		// TODO(tschottdorf) evaluate whether this should return an error.
-		panic(fmt.Sprintf("unable to add %T to batch response", reply))
-	}
+	union.MustSetInner(reply)
 	br.Responses = append(br.Responses, union)
 }
 
@@ -191,13 +175,12 @@ func (ba *BatchRequest) Methods() []Method {
 	return res
 }
 
-// CreateReply implements the Request interface. It's slightly different from
-// the other implementations: It creates replies for each of the contained
-// requests, wrapped in a BatchResponse.
+// CreateReply creates replies for each of the contained requests, wrapped in a
+// BatchResponse.
 func (ba *BatchRequest) CreateReply() *BatchResponse {
 	br := &BatchResponse{}
 	for _, union := range ba.Requests {
-		br.Add(union.GetInner().CreateReply())
+		br.Add(union.GetInner().createReply())
 	}
 	return br
 }
@@ -266,7 +249,15 @@ func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion {
 // See #2198.
 func (ba BatchRequest) String() string {
 	var str []string
-	for _, arg := range ba.Requests {
+	for count, arg := range ba.Requests {
+		// Limit the strings to provide just a summary. Without this limit
+		// a log message with a BatchRequest can be very long.
+		if count >= 20 && count < len(ba.Requests)-5 {
+			if count == 20 {
+				str = append(str, fmt.Sprintf("... %d skipped ...", len(ba.Requests)-25))
+			}
+			continue
+		}
 		req := arg.GetInner()
 		h := req.Header()
 		str = append(str, fmt.Sprintf("%s [%s,%s)", req.Method(), h.Key, h.EndKey))
@@ -294,20 +285,4 @@ func (ba *BatchRequest) SetNewRequest() {
 		return
 	}
 	ba.Txn.Sequence++
-}
-
-// GoError returns the non-nil error from the proto.Error union.
-func (br *BatchResponse) GoError() error {
-	return br.Error.GoError()
-}
-
-// SetGoError converts the specified type into either one of the proto-
-// defined error types or into an Error for all other Go errors.
-func (br *BatchResponse) SetGoError(err error) {
-	if err == nil {
-		br.Error = nil
-		return
-	}
-	br.Error = &Error{}
-	br.Error.setGoError(err)
 }

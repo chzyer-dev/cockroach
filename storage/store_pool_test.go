@@ -24,7 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
@@ -33,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 var uniqueStore = []*roachpb.StoreDescriptor{
@@ -56,8 +56,8 @@ func createTestStorePool(timeUntilStoreDead time.Duration) (*stop.Stopper, *goss
 	stopper := stop.NewStopper()
 	mc := hlc.NewManualClock(0)
 	clock := hlc.NewClock(mc.UnixNano)
-	rpcContext := rpc.NewContext(&base.Context{}, clock, stopper)
-	g := gossip.New(rpcContext, gossip.TestBootstrap, stopper)
+	rpcContext := rpc.NewContext(nil, clock, stopper)
+	g := gossip.New(rpcContext, nil, stopper)
 	// Have to call g.SetNodeID before call g.AddInfo
 	g.SetNodeID(roachpb.NodeID(1))
 	storePool := NewStorePool(g, clock, timeUntilStoreDead, stopper)
@@ -67,7 +67,7 @@ func createTestStorePool(timeUntilStoreDead time.Duration) (*stop.Stopper, *goss
 // TestStorePoolGossipUpdate ensures that the gossip callback in StorePool
 // correctly updates a store's details.
 func TestStorePoolGossipUpdate(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp := createTestStorePool(TestTimeUntilStoreDead)
 	defer stopper.Stop()
 	sg := gossiputil.NewStoreGossiper(g)
@@ -92,9 +92,9 @@ func TestStorePoolGossipUpdate(t *testing.T) {
 
 // waitUntilDead will block until the specified store is marked as dead.
 func waitUntilDead(t *testing.T, mc *hlc.ManualClock, sp *StorePool, storeID roachpb.StoreID) {
-	lastTime := time.Now()
-	util.SucceedsWithin(t, 10*TestTimeUntilStoreDead, func() error {
-		curTime := time.Now()
+	lastTime := timeutil.Now()
+	util.SucceedsSoon(t, func() error {
+		curTime := timeutil.Now()
 		mc.Increment(curTime.UnixNano() - lastTime.UnixNano())
 		lastTime = curTime
 
@@ -116,7 +116,7 @@ func waitUntilDead(t *testing.T, mc *hlc.ManualClock, sp *StorePool, storeID roa
 // TestStorePoolDies ensures that a store is marked as dead after it
 // times out and that it will be revived after a new update is received.
 func TestStorePoolDies(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, mc, sp := createTestStorePool(TestTimeUntilStoreDead)
 	defer stopper.Stop()
 	sg := gossiputil.NewStoreGossiper(g)
@@ -199,9 +199,13 @@ func TestStorePoolDies(t *testing.T) {
 }
 
 // verifyStoreList ensures that the returned list of stores is correct.
-func verifyStoreList(sp *StorePool, requiredAttrs []string, expected []int) error {
+func verifyStoreList(sp *StorePool, requiredAttrs []string, expected []int, expectedAliveStoreCount int) error {
 	var actual []int
-	sl := sp.getStoreList(roachpb.Attributes{Attrs: requiredAttrs}, false)
+	sl, aliveStoreCount := sp.getStoreList(roachpb.Attributes{Attrs: requiredAttrs}, false)
+	if aliveStoreCount != expectedAliveStoreCount {
+		return fmt.Errorf("expected AliveStoreCount %d does not match actual %d", expectedAliveStoreCount,
+			aliveStoreCount)
+	}
 	for _, store := range sl.stores {
 		actual = append(actual, int(store.StoreID))
 	}
@@ -216,14 +220,14 @@ func verifyStoreList(sp *StorePool, requiredAttrs []string, expected []int) erro
 // TestStorePoolGetStoreList ensures that the store list returns only stores
 // that are alive and match the attribute criteria.
 func TestStorePoolGetStoreList(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// We're going to manually mark stores dead in this test.
 	stopper, g, _, sp := createTestStorePool(TestTimeUntilStoreDeadOff)
 	defer stopper.Stop()
 	sg := gossiputil.NewStoreGossiper(g)
 	required := []string{"ssd", "dc"}
 	// Nothing yet.
-	if sl := sp.getStoreList(roachpb.Attributes{Attrs: required}, false); len(sl.stores) != 0 {
+	if sl, _ := sp.getStoreList(roachpb.Attributes{Attrs: required}, false); len(sl.stores) != 0 {
 		t.Errorf("expected no stores, instead %+v", sl.stores)
 	}
 
@@ -266,7 +270,7 @@ func TestStorePoolGetStoreList(t *testing.T) {
 		int(matchingStore.StoreID),
 		int(supersetStore.StoreID),
 		int(deadStore.StoreID),
-	}); err != nil {
+	}, 5); err != nil {
 		t.Error(err)
 	}
 
@@ -278,29 +282,31 @@ func TestStorePoolGetStoreList(t *testing.T) {
 	if err := verifyStoreList(sp, required, []int{
 		int(matchingStore.StoreID),
 		int(supersetStore.StoreID),
-	}); err != nil {
+	}, 4); err != nil {
 		t.Error(err)
 	}
 }
 
 func TestStorePoolGetStoreDetails(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, sp := createTestStorePool(TestTimeUntilStoreDeadOff)
 	defer stopper.Stop()
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(uniqueStore, t)
 
-	if detail := sp.getStoreDetail(roachpb.StoreID(1)); detail.dead {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if detail := sp.getStoreDetailLocked(roachpb.StoreID(1)); detail.dead {
 		t.Errorf("Present storeDetail came back as dead, expected it to be alive. %+v", detail)
 	}
 
-	if detail := sp.getStoreDetail(roachpb.StoreID(2)); detail.dead {
+	if detail := sp.getStoreDetailLocked(roachpb.StoreID(2)); detail.dead {
 		t.Errorf("Absent storeDetail came back as dead, expected it to be alive. %+v", detail)
 	}
 }
 
 func TestStorePoolFindDeadReplicas(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, mc, sp := createTestStorePool(TestTimeUntilStoreDead)
 	defer stopper.Stop()
 	sg := gossiputil.NewStoreGossiper(g)
@@ -371,5 +377,26 @@ func TestStorePoolFindDeadReplicas(t *testing.T) {
 	deadReplicas = sp.deadReplicas(replicas)
 	if a, e := deadReplicas, replicas[3:]; !reflect.DeepEqual(a, e) {
 		t.Fatalf("findDeadReplicas did not return expected values; got \n%v, expected \n%v", a, e)
+	}
+}
+
+// TestStorePoolDefaultState verifies that the default state of a
+// store is neither alive nor dead. This is a regression test for a
+// bug in which a call to deadReplicas involving an unknown store
+// would have the side effect of marking that store as alive and
+// eligible for return by getStoreList. It is therefore significant
+// that the two methods are tested in the same test, and in this
+// order.
+func TestStorePoolDefaultState(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	stopper, _, _, sp := createTestStorePool(TestTimeUntilStoreDeadOff)
+	defer stopper.Stop()
+
+	if dead := sp.deadReplicas([]roachpb.ReplicaDescriptor{{StoreID: 1}}); len(dead) > 0 {
+		t.Errorf("expected 0 dead replicas; got %v", dead)
+	}
+
+	if sl, c := sp.getStoreList(roachpb.Attributes{}, true); len(sl.stores) > 0 || c != 0 {
+		t.Errorf("expected 0 live stores; got list %v and total count %d", sl, c)
 	}
 }

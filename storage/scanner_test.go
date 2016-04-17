@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // Test implementation of a range set backed by btree.BTree.
@@ -184,7 +185,7 @@ func (tq *testQueue) isDone() bool {
 // TestScannerAddToQueues verifies that ranges are added to and
 // removed from multiple queues.
 func TestScannerAddToQueues(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	const count = 3
 	ranges := newTestRangeSet(count, t)
 	q1, q2 := &testQueue{}, &testQueue{}
@@ -199,26 +200,27 @@ func TestScannerAddToQueues(t *testing.T) {
 
 	// Start queue and verify that all ranges are added to both queues.
 	s.Start(clock, stopper)
-	if err := util.IsTrueWithin(func() bool {
-		return q1.count() == count && q2.count() == count
-	}, 50*time.Millisecond); err != nil {
-		t.Error(err)
-	}
+	util.SucceedsSoon(t, func() error {
+		if q1.count() != count || q2.count() != count {
+			return util.Errorf("q1 or q2 count != %d; got %d, %d", count, q1.count(), q2.count())
+		}
+		return nil
+	})
 
 	// Remove first range and verify it does not exist in either range.
 	rng := ranges.remove(0, t)
-	if err := util.IsTrueWithin(func() bool {
+	util.SucceedsSoon(t, func() error {
 		// This is intentionally inside the loop, otherwise this test races as
 		// our removal of the range may be processed before a stray re-queue.
 		// Removing on each attempt makes sure we clean this up as we retry.
 		s.RemoveReplica(rng)
 		c1 := q1.count()
 		c2 := q2.count()
-		log.Infof("q1: %d, q2: %d, wanted: %d", c1, c2, count-1)
-		return c1 == count-1 && c2 == count-1
-	}, time.Second); err != nil {
-		t.Error(err)
-	}
+		if c1 != count-1 || c2 != count-1 {
+			return util.Errorf("q1 or q2 count != %d; got %d, %d", count-1, c1, c2)
+		}
+		return nil
+	})
 
 	// Stop scanner and verify both queues are stopped.
 	stopper.Stop()
@@ -230,7 +232,7 @@ func TestScannerAddToQueues(t *testing.T) {
 // TestScannerTiming verifies that ranges are scanned, regardless
 // of how many, to match scanInterval.
 func TestScannerTiming(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	const count = 3
 	const runTime = 100 * time.Millisecond
 	const maxError = 7500 * time.Microsecond
@@ -239,7 +241,7 @@ func TestScannerTiming(t *testing.T) {
 		25 * time.Millisecond,
 	}
 	for i, duration := range durations {
-		util.SucceedsWithin(t, 10*time.Second, func() error {
+		util.SucceedsSoon(t, func() error {
 			ranges := newTestRangeSet(count, t)
 			q := &testQueue{}
 			s := newReplicaScanner(duration, 0, ranges)
@@ -264,7 +266,7 @@ func TestScannerTiming(t *testing.T) {
 
 // TestScannerPaceInterval tests that paceInterval returns the correct interval.
 func TestScannerPaceInterval(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	const count = 3
 	durations := []time.Duration{
 		30 * time.Millisecond,
@@ -280,7 +282,7 @@ func TestScannerPaceInterval(t *testing.T) {
 		}
 	}
 	for _, duration := range durations {
-		startTime := time.Now()
+		startTime := timeutil.Now()
 		ranges := newTestRangeSet(count, t)
 		s := newReplicaScanner(duration, 0, ranges)
 		interval := s.paceInterval(startTime, startTime)
@@ -300,18 +302,18 @@ func TestScannerPaceInterval(t *testing.T) {
 
 // TestScannerEmptyRangeSet verifies that an empty range set doesn't busy loop.
 func TestScannerEmptyRangeSet(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	ranges := newTestRangeSet(0, t)
 	q := &testQueue{}
-	s := newReplicaScanner(1*time.Millisecond, 0, ranges)
+	s := newReplicaScanner(time.Hour, 0, ranges)
 	s.AddQueues(q)
 	mc := hlc.NewManualClock(0)
 	clock := hlc.NewClock(mc.UnixNano)
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	s.Start(clock, stopper)
-	time.Sleep(3 * time.Millisecond)
-	if count := s.Count(); count > 3 {
-		t.Errorf("expected three loops; got %d", count)
+	time.Sleep(time.Millisecond) // give it some time to (not) busy loop
+	if count := s.Count(); count > 1 {
+		t.Errorf("expected at most one loop, but got %d", count)
 	}
 }

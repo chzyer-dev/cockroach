@@ -14,8 +14,6 @@
 //
 // Author: Peter Mattis (peter@cockroachlabs.com)
 
-// +build acceptance
-
 package acceptance
 
 import (
@@ -23,62 +21,73 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/acceptance/cluster"
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // TestSingleKey stresses the transaction retry machinery by starting
 // up an N node cluster and running N workers that are all
 // incrementing the value associated with a single key.
 func TestSingleKey(t *testing.T) {
-	c := StartCluster(t)
-	defer c.AssertAndStop(t)
+	runTestOnConfigs(t, testSingleKeyInner)
+}
+
+func testSingleKeyInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConfig) {
 	num := c.NumNodes()
 
 	// Initialize the value for our test key to zero.
 	const key = "test-key"
-	db, initDBStopper := makeClient(t, c.ConnString(0))
+	initDB, initDBStopper := c.NewClient(t, 0)
 	defer initDBStopper.Stop()
-	if err := db.Put(key, 0); err != nil {
+	if err := initDB.Put(key, 0); err != nil {
 		t.Fatal(err)
 	}
 
 	type result struct {
 		err        error
-		count      int
 		maxLatency time.Duration
 	}
 
 	resultCh := make(chan result, num)
-	deadline := time.Now().Add(*flagDuration)
+	deadline := timeutil.Now().Add(cfg.Duration)
 	var expected int64
 
 	// Start up num workers each reading and writing the same
 	// key. Each worker is configured to talk to a different node in the
 	// cluster.
 	for i := 0; i < num; i++ {
-		db, dbStopper := makeClient(t, c.ConnString(i))
+		db, dbStopper := c.NewClient(t, i)
 		defer dbStopper.Stop()
 		go func() {
 			var r result
-			for time.Now().Before(deadline) {
-				start := time.Now()
+			for timeutil.Now().Before(deadline) {
+				start := timeutil.Now()
 				pErr := db.Txn(func(txn *client.Txn) *roachpb.Error {
+					minExp := atomic.LoadInt64(&expected)
 					r, pErr := txn.Get(key)
 					if pErr != nil {
 						return pErr
 					}
 					b := txn.NewBatch()
-					b.Put(key, r.ValueInt()+1)
-					return txn.CommitInBatch(b)
+					v := r.ValueInt()
+					b.Put(key, v+1)
+					pErr = txn.CommitInBatch(b)
+					// Atomic updates after the fact mean that we should read
+					// exp or larger (since concurrent writers might have
+					// committed but not yet performed their atomic update).
+					if pErr == nil && v < minExp {
+						return roachpb.NewErrorf("unexpected read: %d, expected >= %d", v, minExp)
+					}
+					return pErr
 				})
 				if pErr != nil {
 					resultCh <- result{err: pErr.GoError()}
 					return
 				}
 				atomic.AddInt64(&expected, 1)
-				r.count++
 				latency := time.Since(start)
 				if r.maxLatency < latency {
 					r.maxLatency = latency
@@ -107,7 +116,7 @@ func TestSingleKey(t *testing.T) {
 	}
 
 	// Verify the resulting value stored at the key is what we expect.
-	r, err := db.Get(key)
+	r, err := initDB.Get(key)
 	if err != nil {
 		t.Fatal(err)
 	}

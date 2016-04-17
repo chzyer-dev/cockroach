@@ -16,8 +16,18 @@
 
 package log
 
-import "github.com/cockroachdb/cockroach/util/log/logflags"
+import (
+	"flag"
+
+	"github.com/cockroachdb/cockroach/util/log/logflags"
+)
 
 func init() {
-	logflags.InitFlags(&logging.mu, &logging.toStderr, &logging.alsoToStderr, logDir, &logging.color, &logging.verbosity, &logging.vmodule, &logging.traceLocation)
+	logflags.InitFlags(&logging.mu, &logging.toStderr,
+		newStringValue(&logDir, &logDirSet), &logging.nocolor, &logging.verbosity,
+		&logging.vmodule, &logging.traceLocation)
+	// We define this flag here because stderrThreshold has the type Severity
+	// which we can't pass to logflags without creating an import cycle.
+	flag.Var(&logging.stderrThreshold,
+		logflags.AlsoLogToStderrName, "logs at or above this threshold go to stderr")
 }

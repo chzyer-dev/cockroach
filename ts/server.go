@@ -59,16 +59,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // for one or more metrics over a specific time span. Query requests have a
 // significant body and thus are POST requests.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	request := &TimeSeriesQueryRequest{}
+	request := TimeSeriesQueryRequest{}
 
 	// Unmarshal query request.
 	reqBody, err := ioutil.ReadAll(r.Body)
-	defer r.Body.Close()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := util.UnmarshalRequest(r, reqBody, request, util.AllEncodings); err != nil {
+	if err := util.UnmarshalRequest(r, reqBody, &request, util.AllEncodings); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -78,8 +77,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, _ httproute
 		return
 	}
 
-	response := &TimeSeriesQueryResponse{
-		Results: make([]*TimeSeriesQueryResponse_Result, 0, len(request.Queries)),
+	response := TimeSeriesQueryResponse{
+		Results: make([]TimeSeriesQueryResponse_Result, 0, len(request.Queries)),
 	}
 	for _, q := range request.Queries {
 		datapoints, sources, err := s.db.Query(q, Resolution10s, request.StartNanos, request.EndNanos)
@@ -87,16 +86,23 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request, _ httproute
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		response.Results = append(response.Results, &TimeSeriesQueryResponse_Result{
-			Name:       q.Name,
-			Sources:    sources,
+		result := TimeSeriesQueryResponse_Result{
+			Query:      q,
 			Datapoints: datapoints,
-			Aggregator: q.Aggregator,
-		})
+		}
+		// TODO(tamird): Remove this (and all other) explicit setting of defaults.
+		// It is currently required because the client side doesn't know about
+		// proto defaults.
+		result.SourceAggregator = q.GetSourceAggregator().Enum()
+		result.Downsampler = q.GetDownsampler().Enum()
+		result.Derivative = q.GetDerivative().Enum()
+
+		result.Sources = sources
+		response.Results = append(response.Results, result)
 	}
 
 	// Marshal and return response.
-	b, contentType, err := util.MarshalResponse(r, response, util.AllEncodings)
+	b, contentType, err := util.MarshalResponse(r, &response, util.AllEncodings)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

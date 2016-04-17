@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/tracing"
 )
 
 func adminMergeArgs(key roachpb.Key) roachpb.AdminMergeRequest {
@@ -63,9 +64,9 @@ func createSplitRanges(store *storage.Store) (*roachpb.RangeDescriptor, *roachpb
 // TestStoreRangeMergeTwoEmptyRanges tries to merge two empty ranges
 // together.
 func TestStoreRangeMergeTwoEmptyRanges(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	defer config.TestingDisableTableSplits()()
-	store, stopper := createTestStore(t)
+	store, stopper, _ := createTestStore(t)
 	defer stopper.Stop()
 
 	if _, _, err := createSplitRanges(store); err != nil {
@@ -91,13 +92,13 @@ func TestStoreRangeMergeTwoEmptyRanges(t *testing.T) {
 // TestStoreRangeMergeMetadataCleanup tests that all metadata of a
 // subsumed range is cleaned up on merge.
 func TestStoreRangeMergeMetadataCleanup(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	defer config.TestingDisableTableSplits()()
-	store, stopper := createTestStore(t)
+	store, stopper, _ := createTestStore(t)
 	defer stopper.Stop()
 
 	scan := func(f func(roachpb.KeyValue) (bool, error)) {
-		if _, err := engine.MVCCIterate(store.Engine(), roachpb.KeyMin, roachpb.KeyMax, roachpb.ZeroTimestamp, true, nil, false, f); err != nil {
+		if _, err := engine.MVCCIterate(context.Background(), store.Engine(), roachpb.KeyMin, roachpb.KeyMax, roachpb.ZeroTimestamp, true, nil, false, f); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -169,9 +170,9 @@ func TestStoreRangeMergeMetadataCleanup(t *testing.T) {
 // TestStoreRangeMergeWithData attempts to merge two collocate ranges
 // each containing data.
 func TestStoreRangeMergeWithData(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	defer config.TestingDisableTableSplits()()
-	store, stopper := createTestStore(t)
+	store, stopper, _ := createTestStore(t)
 	defer stopper.Stop()
 
 	content := roachpb.Key("testing!")
@@ -221,7 +222,7 @@ func TestStoreRangeMergeWithData(t *testing.T) {
 
 	// Verify no intents remains on range descriptor keys.
 	for _, key := range []roachpb.Key{keys.RangeDescriptorKey(aDesc.StartKey), keys.RangeDescriptorKey(bDesc.StartKey)} {
-		if _, _, err := engine.MVCCGet(store.Engine(), key, store.Clock().Now(), true, nil); err != nil {
+		if _, _, err := engine.MVCCGet(context.Background(), store.Engine(), key, store.Clock().Now(), true, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -296,9 +297,9 @@ func TestStoreRangeMergeWithData(t *testing.T) {
 // TestStoreRangeMergeLastRange verifies that merging the last range
 // fails.
 func TestStoreRangeMergeLastRange(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	defer config.TestingDisableTableSplits()()
-	store, stopper := createTestStore(t)
+	store, stopper, _ := createTestStore(t)
 	defer stopper.Stop()
 
 	// Merge last range.
@@ -311,7 +312,7 @@ func TestStoreRangeMergeLastRange(t *testing.T) {
 // TestStoreRangeMergeNonCollocated attempts to merge two ranges
 // that are not on the same stores.
 func TestStoreRangeMergeNonCollocated(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	mtc := startMultiTestContext(t, 4)
 	defer mtc.Stop()
 
@@ -355,5 +356,103 @@ func TestStoreRangeMergeNonCollocated(t *testing.T) {
 	argsMerge := adminMergeArgs(roachpb.Key(rangeADesc.StartKey))
 	if _, pErr := rangeA.AdminMerge(context.Background(), argsMerge, rangeADesc); !testutils.IsPError(pErr, "ranges not collocated") {
 		t.Fatalf("did not got expected error; got %s", pErr)
+	}
+}
+
+// TestStoreRangeMergeStats starts by splitting a range, then writing random data
+// to both sides of the split. It then merges the ranges and verifies the merged
+// range has stats consistent with recomputations.
+func TestStoreRangeMergeStats(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer config.TestingDisableTableSplits()()
+	store, stopper, manual := createTestStore(t)
+	defer stopper.Stop()
+
+	// Split the range.
+	aDesc, bDesc, err := createSplitRanges(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write some values left and right of the proposed split key.
+	writeRandomDataToRange(t, store, aDesc.RangeID, []byte("aaa"))
+	writeRandomDataToRange(t, store, bDesc.RangeID, []byte("ccc"))
+
+	// Get the range stats for both ranges now that we have data.
+	var msA, msB engine.MVCCStats
+	snap := store.Engine().NewSnapshot()
+	defer snap.Close()
+	if err := engine.MVCCGetRangeStats(context.Background(), snap, aDesc.RangeID, &msA); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.MVCCGetRangeStats(context.Background(), snap, bDesc.RangeID, &msB); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stats should agree with recomputation.
+	if err := verifyRecomputedStats(snap, aDesc, msA, manual.UnixNano()); err != nil {
+		t.Fatalf("failed to verify range A's stats before split: %v", err)
+	}
+	if err := verifyRecomputedStats(snap, bDesc, msB, manual.UnixNano()); err != nil {
+		t.Fatalf("failed to verify range B's stats before split: %v", err)
+	}
+
+	manual.Increment(100)
+
+	// Merge the b range back into the a range.
+	args := adminMergeArgs(roachpb.KeyMin)
+	if _, err := client.SendWrapped(rg1(store), nil, &args); err != nil {
+		t.Fatal(err)
+	}
+	rngMerged := store.LookupReplica(aDesc.StartKey, nil)
+
+	// Get the range stats for the merged range and verify.
+	snap = store.Engine().NewSnapshot()
+	defer snap.Close()
+	var msMerged engine.MVCCStats
+	if err := engine.MVCCGetRangeStats(context.Background(), snap, rngMerged.RangeID, &msMerged); err != nil {
+		t.Fatal(err)
+	}
+
+	// Merged stats should agree with recomputation.
+	if err := verifyRecomputedStats(snap, rngMerged.Desc(), msMerged, manual.UnixNano()); err != nil {
+		t.Errorf("failed to verify range's stats after merge: %v", err)
+	}
+}
+
+func BenchmarkStoreRangeMerge(b *testing.B) {
+	defer tracing.Disable()()
+	defer config.TestingDisableTableSplits()()
+	store, stopper, _ := createTestStore(b)
+	defer stopper.Stop()
+
+	// Perform initial split of ranges.
+	sArgs := adminSplitArgs(roachpb.KeyMin, []byte("b"))
+	if _, err := client.SendWrapped(rg1(store), nil, &sArgs); err != nil {
+		b.Fatal(err)
+	}
+
+	// Write some values left and right of the proposed split key.
+	aDesc := store.LookupReplica([]byte("a"), nil).Desc()
+	bDesc := store.LookupReplica([]byte("c"), nil).Desc()
+	writeRandomDataToRange(b, store, aDesc.RangeID, []byte("aaa"))
+	writeRandomDataToRange(b, store, bDesc.RangeID, []byte("ccc"))
+
+	// Create args to merge the b range back into the a range.
+	mArgs := adminMergeArgs(roachpb.KeyMin)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Merge the ranges.
+		b.StartTimer()
+		if _, err := client.SendWrapped(rg1(store), nil, &mArgs); err != nil {
+			b.Fatal(err)
+		}
+
+		// Split the range.
+		b.StopTimer()
+		if _, err := client.SendWrapped(rg1(store), nil, &sArgs); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

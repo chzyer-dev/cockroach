@@ -21,75 +21,39 @@ import (
 	"testing"
 )
 
-type testError struct{}
-
-func (t *testError) Error() string              { return "test" }
-func (t *testError) message(pErr *Error) string { return "test" }
-func (t *testError) CanRetry() bool             { return true }
-func (t *testError) ErrorIndex() (int32, bool)  { return 99, true }
-func (t *testError) SetErrorIndex(_ int32)      { panic("unsupported") }
-
-// TestSetGoError verifies that a test error that
-// implements retryable or indexed is converted properly into a generic error.
-func TestSetGoErrorGeneric(t *testing.T) {
-	br := &BatchResponse{}
-	br.SetGoError(&testError{})
-	err := br.GoError()
-	if err.Error() != "test" {
-		t.Fatalf("unexpected error: %s", err)
-	}
-	if !br.Error.Retryable {
-		t.Error("expected generic error to be retryable")
-	}
-}
-
-// TestResponseHeaderNilError verifies that a nil error can be set
-// and retrieved from a response header.
-func TestSetGoErrorNil(t *testing.T) {
-	br := &BatchResponse{}
-	br.SetGoError(nil)
-	if err := br.GoError(); err != nil {
-		t.Errorf("expected nil error; got %s", err)
-	}
-}
-
 // TestCombinable tests the correct behaviour of some types that implement
-// the Combinable interface, notably {Scan,DeleteRange}Response and
+// the combinable interface, notably {Scan,DeleteRange}Response and
 // ResponseHeader.
 func TestCombinable(t *testing.T) {
-	// Test that GetResponse doesn't have anything to do with Combinable.
-	if _, ok := interface{}(&GetResponse{}).(Combinable); ok {
-		t.Fatalf("GetResponse implements Combinable, so presumably all Response types will")
+	// Test that GetResponse doesn't have anything to do with combinable.
+	if _, ok := interface{}(&GetResponse{}).(combinable); ok {
+		t.Fatalf("GetResponse implements combinable, so presumably all Response types will")
 	}
 	// Test that {Scan,DeleteRange}Response properly implement it.
 	sr1 := &ScanResponse{
-		ResponseHeader: ResponseHeader{Timestamp: MinTimestamp},
 		Rows: []KeyValue{
 			{Key: Key("A"), Value: MakeValueFromString("V")},
 		},
 	}
 
-	if _, ok := interface{}(sr1).(Combinable); !ok {
-		t.Fatalf("ScanResponse does not implement Combinable")
+	if _, ok := interface{}(sr1).(combinable); !ok {
+		t.Fatalf("ScanResponse does not implement combinable")
 	}
 
 	sr2 := &ScanResponse{
-		ResponseHeader: ResponseHeader{Timestamp: MinTimestamp},
 		Rows: []KeyValue{
 			{Key: Key("B"), Value: MakeValueFromString("W")},
 		},
 	}
-	sr2.Timestamp = MaxTimestamp
 
 	wantedSR := &ScanResponse{
-		ResponseHeader: ResponseHeader{Timestamp: MaxTimestamp},
-		Rows:           append(append([]KeyValue(nil), sr1.Rows...), sr2.Rows...),
+		Rows: append(append([]KeyValue(nil), sr1.Rows...), sr2.Rows...),
 	}
 
-	if err := sr1.Combine(sr2); err != nil {
+	if err := sr1.combine(sr2); err != nil {
 		t.Fatal(err)
 	}
-	if err := sr1.Combine(&ScanResponse{}); err != nil {
+	if err := sr1.combine(&ScanResponse{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -98,28 +62,24 @@ func TestCombinable(t *testing.T) {
 	}
 
 	dr1 := &DeleteRangeResponse{
-		ResponseHeader: ResponseHeader{Timestamp: Timestamp{Logical: 100}},
-		NumDeleted:     5,
+		Keys: []Key{[]byte("1")},
 	}
-	if _, ok := interface{}(dr1).(Combinable); !ok {
-		t.Fatalf("DeleteRangeResponse does not implement Combinable")
+	if _, ok := interface{}(dr1).(combinable); !ok {
+		t.Fatalf("DeleteRangeResponse does not implement combinable")
 	}
 	dr2 := &DeleteRangeResponse{
-		ResponseHeader: ResponseHeader{Timestamp: Timestamp{Logical: 1}},
-		NumDeleted:     12,
+		Keys: []Key{[]byte("2")},
 	}
 	dr3 := &DeleteRangeResponse{
-		ResponseHeader: ResponseHeader{Timestamp: Timestamp{Logical: 111}},
-		NumDeleted:     3,
+		Keys: nil,
 	}
 	wantedDR := &DeleteRangeResponse{
-		ResponseHeader: ResponseHeader{Timestamp: Timestamp{Logical: 111}},
-		NumDeleted:     20,
+		Keys: []Key{[]byte("1"), []byte("2")},
 	}
-	if err := dr2.Combine(dr3); err != nil {
+	if err := dr2.combine(dr3); err != nil {
 		t.Fatal(err)
 	}
-	if err := dr1.Combine(dr2); err != nil {
+	if err := dr1.combine(dr2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -128,12 +88,22 @@ func TestCombinable(t *testing.T) {
 	}
 }
 
-func TestSetGoErrorCopy(t *testing.T) {
-	br := &BatchResponse{}
-	oErr := &Error{Message: "test123"}
-	br.Error = oErr
-	br.SetGoError(&testError{})
-	if oErr.Message != "test123" {
-		t.Fatalf("SetGoError did not create a new error")
+// TestMustSetInner makes sure that calls to MustSetInner correctly reset the
+// union before repopulating to avoid having more than one value set.
+func TestMustSetInner(t *testing.T) {
+	req := RequestUnion{}
+	res := ResponseUnion{}
+
+	// GetRequest is checked first in the generated code for SetValue.
+	req.MustSetInner(&GetRequest{})
+	res.MustSetInner(&GetResponse{})
+	req.MustSetInner(&EndTransactionRequest{})
+	res.MustSetInner(&EndTransactionResponse{})
+
+	if m := req.GetInner().Method(); m != EndTransaction {
+		t.Fatalf("unexpected request: %s in %+v", m, req)
+	}
+	if _, isET := res.GetValue().(*EndTransactionResponse); !isET {
+		t.Fatalf("unexpected response union: %+v", res)
 	}
 }

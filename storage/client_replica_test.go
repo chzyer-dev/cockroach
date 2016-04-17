@@ -24,12 +24,15 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
@@ -40,7 +43,7 @@ import (
 // clocks when executing a command, even if the leader's clock is far
 // in the future.
 func TestRangeCommandClockUpdate(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	const numNodes = 3
 	var manuals []*hlc.ManualClock
@@ -67,10 +70,10 @@ func TestRangeCommandClockUpdate(t *testing.T) {
 	}
 
 	// Wait for that command to execute on all the followers.
-	util.SucceedsWithin(t, 5*time.Second, func() error {
+	util.SucceedsSoon(t, func() error {
 		values := []int64{}
 		for _, eng := range mtc.engines {
-			val, _, err := engine.MVCCGet(eng, roachpb.Key("a"), clocks[0].Now(), true, nil)
+			val, _, err := engine.MVCCGet(context.Background(), eng, roachpb.Key("a"), clocks[0].Now(), true, nil)
 			if err != nil {
 				return err
 			}
@@ -96,7 +99,7 @@ func TestRangeCommandClockUpdate(t *testing.T) {
 // TestRejectFutureCommand verifies that leaders reject commands that
 // would cause a large time jump.
 func TestRejectFutureCommand(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	const maxOffset = 100 * time.Millisecond
 	manual := hlc.NewManualClock(0)
@@ -147,7 +150,7 @@ func TestRejectFutureCommand(t *testing.T) {
 	if now := clock.Now(); now.WallTime != int64(190*time.Millisecond) {
 		t.Errorf("expected clock to advance to 190ms; got %s", now)
 	}
-	val, _, err := engine.MVCCGet(mtc.engines[0], roachpb.Key("a"), clock.Now(), true, nil)
+	val, _, err := engine.MVCCGet(context.Background(), mtc.engines[0], roachpb.Key("a"), clock.Now(), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,38 +185,37 @@ func TestRejectFutureCommand(t *testing.T) {
 // 6) When the Writer attempts to commit its txn, the txn will be restarted
 //    again at a new epoch timestamp T+200, which will finally succeed.
 func TestTxnPutOutOfOrder(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	key := "key"
 	// Set up a filter to so that the get operation at Step 3 will return an error.
 	var numGets int32
-	storage.TestingCommandFilter = func(_ roachpb.StoreID, args roachpb.Request, h roachpb.Header) error {
-		if _, ok := args.(*roachpb.GetRequest); ok &&
-			args.Header().Key.Equal(roachpb.Key(key)) &&
-			h.Txn == nil {
-			// The Reader executes two get operations, each of which triggers two get requests
-			// (the first request fails and triggers txn push, and then the second request
-			// succeeds). Returns an error for the fourth get request to avoid timestamp cache
-			// update after the third get operation pushes the txn timestamp.
-			if atomic.AddInt32(&numGets, 1) == 4 {
-				return util.Errorf("Test")
-			}
-		}
-		return nil
-	}
-	defer func() {
-		storage.TestingCommandFilter = nil
-	}()
 
 	manualClock := hlc.NewManualClock(0)
 	clock := hlc.NewClock(manualClock.UnixNano)
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
+	ctx := storage.TestStoreContext()
+	ctx.TestingKnobs.TestingCommandFilter =
+		func(filterArgs storageutils.FilterArgs) *roachpb.Error {
+			if _, ok := filterArgs.Req.(*roachpb.GetRequest); ok &&
+				filterArgs.Req.Header().Key.Equal(roachpb.Key(key)) &&
+				filterArgs.Hdr.Txn == nil {
+				// The Reader executes two get operations, each of which triggers two get requests
+				// (the first request fails and triggers txn push, and then the second request
+				// succeeds). Returns an error for the fourth get request to avoid timestamp cache
+				// update after the third get operation pushes the txn timestamp.
+				if atomic.AddInt32(&numGets, 1) == 4 {
+					return roachpb.NewErrorWithTxn(util.Errorf("Test"), filterArgs.Hdr.Txn)
+				}
+			}
+			return nil
+		}
 	store := createTestStoreWithEngine(t,
 		engine.NewInMem(roachpb.Attributes{}, 10<<20, stopper),
 		clock,
 		true,
-		nil,
+		&ctx,
 		stopper)
 
 	// Put an initial value.
@@ -322,9 +324,9 @@ func TestTxnPutOutOfOrder(t *testing.T) {
 // TestRangeLookupUseReverse tests whether the results and the results count
 // are correct when scanning in reverse order.
 func TestRangeLookupUseReverse(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	defer config.TestingDisableTableSplits()()
-	store, stopper := createTestStore(t)
+	store, stopper, _ := createTestStore(t)
 	defer stopper.Stop()
 
 	// Init test ranges:
@@ -350,7 +352,7 @@ func TestRangeLookupUseReverse(t *testing.T) {
 			EndKey: keys.RangeMetaKey(roachpb.RKeyMax),
 		},
 	}
-	util.SucceedsWithin(t, time.Second, func() error {
+	util.SucceedsSoon(t, func() error {
 		_, pErr := client.SendWrapped(rg1(store), nil, &scanArgs)
 		return pErr.GoError()
 	})
@@ -368,8 +370,9 @@ func TestRangeLookupUseReverse(t *testing.T) {
 
 	// Test cases.
 	testCases := []struct {
-		request  *roachpb.RangeLookupRequest
-		expected []roachpb.RangeDescriptor
+		request     *roachpb.RangeLookupRequest
+		expected    []roachpb.RangeDescriptor
+		expectedPre []roachpb.RangeDescriptor
 	}{
 		// Test key in the middle of the range.
 		{
@@ -377,6 +380,8 @@ func TestRangeLookupUseReverse(t *testing.T) {
 			// ["e","g") and ["c","e").
 			expected: []roachpb.RangeDescriptor{
 				{StartKey: roachpb.RKey("e"), EndKey: roachpb.RKey("g")},
+			},
+			expectedPre: []roachpb.RangeDescriptor{
 				{StartKey: roachpb.RKey("c"), EndKey: roachpb.RKey("e")},
 			},
 		},
@@ -386,6 +391,8 @@ func TestRangeLookupUseReverse(t *testing.T) {
 			// ["e","g"), ["c","e") and ["a","c").
 			expected: []roachpb.RangeDescriptor{
 				{StartKey: roachpb.RKey("e"), EndKey: roachpb.RKey("g")},
+			},
+			expectedPre: []roachpb.RangeDescriptor{
 				{StartKey: roachpb.RKey("c"), EndKey: roachpb.RKey("e")},
 				{StartKey: roachpb.RKey("a"), EndKey: roachpb.RKey("c")},
 			},
@@ -395,6 +402,8 @@ func TestRangeLookupUseReverse(t *testing.T) {
 			// ["c","e") and ["a","c").
 			expected: []roachpb.RangeDescriptor{
 				{StartKey: roachpb.RKey("c"), EndKey: roachpb.RKey("e")},
+			},
+			expectedPre: []roachpb.RangeDescriptor{
 				{StartKey: roachpb.RKey("a"), EndKey: roachpb.RKey("c")},
 			},
 		},
@@ -404,6 +413,8 @@ func TestRangeLookupUseReverse(t *testing.T) {
 			// ["e","g") and ["g","\xff\xff")
 			expected: []roachpb.RangeDescriptor{
 				{StartKey: roachpb.RKey("g"), EndKey: roachpb.RKey("\xff\xff")},
+			},
+			expectedPre: []roachpb.RangeDescriptor{
 				{StartKey: roachpb.RKey("e"), EndKey: roachpb.RKey("g")},
 			},
 		},
@@ -417,23 +428,30 @@ func TestRangeLookupUseReverse(t *testing.T) {
 		},
 	}
 
-	for _, test := range testCases {
+	for testIdx, test := range testCases {
 		resp, pErr := client.SendWrappedWith(rg1(store), nil, roachpb.Header{
 			ReadConsistency: roachpb.INCONSISTENT,
 		}, test.request)
 		if pErr != nil {
-			t.Fatalf("RangeLookup error: %s", pErr)
+			t.Fatalf("%d: RangeLookup error: %s", testIdx, pErr)
 		}
 
 		rlReply := resp.(*roachpb.RangeLookupResponse)
 		// Checks the results count.
-		if int32(len(rlReply.Ranges)) != test.request.MaxRanges {
-			t.Fatalf("returned results count, expected %d,but got %d", test.request.MaxRanges, len(rlReply.Ranges))
+		if int32(len(rlReply.Ranges))+int32(len(rlReply.PrefetchedRanges)) != test.request.MaxRanges {
+			t.Fatalf("%d: returned results count, expected %d,but got %d", testIdx, test.request.MaxRanges, len(rlReply.Ranges))
 		}
 		// Checks the range descriptors.
-		for i, rng := range test.expected {
-			if !(rng.StartKey.Equal(rlReply.Ranges[i].StartKey) && rng.EndKey.Equal(rlReply.Ranges[i].EndKey)) {
-				t.Fatalf("returned range is not correct, expected %v ,but got %v", rng, rlReply.Ranges[i])
+		for _, rngSlice := range []struct {
+			expect, reply []roachpb.RangeDescriptor
+		}{
+			{test.expected, rlReply.Ranges},
+			{test.expectedPre, rlReply.PrefetchedRanges},
+		} {
+			for i, rng := range rngSlice.expect {
+				if !(rng.StartKey.Equal(rngSlice.reply[i].StartKey) && rng.EndKey.Equal(rngSlice.reply[i].EndKey)) {
+					t.Fatalf("%d: returned range is not correct, expected %v ,but got %v", testIdx, rng, rngSlice.reply[i])
+				}
 			}
 		}
 	}

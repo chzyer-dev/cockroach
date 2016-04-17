@@ -40,7 +40,7 @@ SELECT * FROM t
 user root
 
 # This insert forces TransactionA's timestamp ahead, so that we have
-# OrigTimestamp < InsertTS < Timestamp < MaxTimestamp
+# OrigTimestamp < InsertTS < Timestamp < ObservedTimestamp
 statement ok
 INSERT INTO t VALUES (2)
 

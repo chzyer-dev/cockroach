@@ -14,8 +14,6 @@
 //
 // Author: Peter Mattis (peter@cockroachlabs.com)
 
-// +build acceptance
-
 package acceptance
 
 import (
@@ -24,29 +22,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/acceptance/cluster"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/randutil"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // TestPut starts up an N node cluster and runs N workers that write
 // to independent keys.
 func TestPut(t *testing.T) {
-	c := StartCluster(t)
-	defer c.AssertAndStop(t)
+	runTestOnConfigs(t, testPutInner)
+}
 
-	db, dbStopper := makeClient(t, c.ConnString(0))
+func testPutInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConfig) {
+	db, dbStopper := c.NewClient(t, 0)
 	defer dbStopper.Stop()
 
 	errs := make(chan error, c.NumNodes())
-	start := time.Now()
-	deadline := start.Add(*flagDuration)
+	start := timeutil.Now()
+	deadline := start.Add(cfg.Duration)
 	var count int64
 	for i := 0; i < c.NumNodes(); i++ {
 		go func() {
 			r, _ := randutil.NewPseudoRand()
 			value := randutil.RandBytes(r, 8192)
 
-			for time.Now().Before(deadline) {
+			for timeutil.Now().Before(deadline) {
 				k := atomic.AddInt64(&count, 1)
 				v := value[:r.Intn(len(value))]
 				if pErr := db.Put(fmt.Sprintf("%08d", k), v); pErr != nil {
@@ -71,9 +72,10 @@ func TestPut(t *testing.T) {
 		case <-time.After(1 * time.Second):
 			// Periodically print out progress so that we know the test is still
 			// running.
-			count := atomic.LoadInt64(&count)
-			log.Infof("%d (%d/s)", count, count-baseCount)
+			loadedCount := atomic.LoadInt64(&count)
+			log.Infof("%d (%d/s)", loadedCount, loadedCount-baseCount)
 			c.Assert(t)
+			cluster.Consistent(t, c)
 		}
 	}
 

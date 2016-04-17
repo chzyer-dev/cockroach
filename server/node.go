@@ -17,13 +17,18 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/opentracing/opentracing-go"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+
+	basictracer "github.com/opentracing/basictracer-go"
+	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/client"
@@ -32,7 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server/status"
 	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/storage"
@@ -41,7 +46,9 @@ import (
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/metric"
+	"github.com/cockroachdb/cockroach/util/retry"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 	"github.com/cockroachdb/cockroach/util/tracing"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
@@ -65,6 +72,35 @@ var errNeedsBootstrap = errors.New("node has no initialized stores and no instru
 // progress in this state.
 var errCannotJoinSelf = errors.New("an uninitialized node cannot specify its own address to join a cluster")
 
+type nodeMetrics struct {
+	registry *metric.Registry
+	latency  metric.Histograms
+	success  metric.Rates
+	err      metric.Rates
+}
+
+func makeNodeMetrics() nodeMetrics {
+	reg := metric.NewRegistry()
+	return nodeMetrics{
+		registry: reg,
+		latency:  reg.Latency("latency"),
+		success:  reg.Rates("success"),
+		err:      reg.Rates("error"),
+	}
+}
+
+// callComplete records very high-level metrics about the number of completed
+// calls and their latency. Currently, this only records statistics at the batch
+// level; stats on specific lower-level kv operations are not recorded.
+func (nm nodeMetrics) callComplete(d time.Duration, pErr *roachpb.Error) {
+	if pErr != nil && pErr.TransactionRestart == roachpb.TransactionRestart_NONE {
+		nm.err.Add(1)
+	} else {
+		nm.success.Add(1)
+	}
+	nm.latency.RecordValue(d.Nanoseconds())
+}
+
 // A Node manages a map of stores (by store ID) for which it serves
 // traffic. A node is the top-level data structure. There is one node
 // instance per process. A node accepts incoming RPCs and services
@@ -75,14 +111,16 @@ var errCannotJoinSelf = errors.New("an uninitialized node cannot specify its own
 // IDs for bootstrapping the node itself or new stores as they're added
 // on subsequent instantiations.
 type Node struct {
-	stopper    *stop.Stopper
-	ClusterID  uuid.UUID              // UUID for Cockroach cluster
-	Descriptor roachpb.NodeDescriptor // Node ID, network/physical topology
-	ctx        storage.StoreContext   // Context to use and pass to stores
-	stores     *storage.Stores        // Access to node-local stores
-	feed       status.NodeEventFeed   // Feed publisher for local events
-	status     *status.NodeStatusMonitor
-	startedAt  int64
+	stopper     *stop.Stopper
+	ClusterID   uuid.UUID              // UUID for Cockroach cluster
+	Descriptor  roachpb.NodeDescriptor // Node ID, network/physical topology
+	ctx         storage.StoreContext   // Context to use and pass to stores
+	stores      *storage.Stores        // Access to node-local stores
+	metrics     nodeMetrics
+	recorder    *status.MetricsRecorder
+	startedAt   int64
+	initialBoot bool // True if this is the first time this node has started.
+	txnMetrics  *kv.TxnMetrics
 }
 
 // allocateNodeID increments the node id generator key to allocate
@@ -119,20 +157,21 @@ func GetBootstrapSchema() sql.MetadataSchema {
 // engines and cluster ID. The first bootstrapped store contains a
 // single range spanning all keys. Initial range lookup metadata is
 // populated for the range. Returns the cluster ID.
-func bootstrapCluster(engines []engine.Engine) (uuid.UUID, error) {
+func bootstrapCluster(engines []engine.Engine, txnMetrics *kv.TxnMetrics) (uuid.UUID, error) {
 	clusterID := uuid.MakeV4()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 
 	ctx := storage.StoreContext{}
 	ctx.ScanInterval = 10 * time.Minute
+	ctx.ConsistencyCheckInterval = 10 * time.Minute
 	ctx.Clock = hlc.NewClock(hlc.UnixNano)
 	ctx.Tracer = tracing.NewTracer()
 	// Create a KV DB with a local sender.
 	stores := storage.NewStores(ctx.Clock)
-	sender := kv.NewTxnCoordSender(stores, ctx.Clock, false, ctx.Tracer, stopper)
+	sender := kv.NewTxnCoordSender(stores, ctx.Clock, false, ctx.Tracer, stopper, txnMetrics)
 	ctx.DB = client.NewDB(sender)
-	ctx.Transport = storage.NewLocalRPCTransport(stopper)
+	ctx.Transport = storage.NewDummyRaftTransport()
 	for i, eng := range engines {
 		sIdent := roachpb.StoreIdent{
 			ClusterID: clusterID,
@@ -184,18 +223,26 @@ func bootstrapCluster(engines []engine.Engine) (uuid.UUID, error) {
 }
 
 // NewNode returns a new instance of Node.
-func NewNode(ctx storage.StoreContext, registry *metric.Registry, stopper *stop.Stopper, subRegistries []status.NodeSubregistry) *Node {
-	return &Node{
-		ctx:     ctx,
-		stopper: stopper,
-		status:  status.NewNodeStatusMonitor(registry, subRegistries),
-		stores:  storage.NewStores(ctx.Clock),
+func NewNode(ctx storage.StoreContext, recorder *status.MetricsRecorder, stopper *stop.Stopper, txnMetrics *kv.TxnMetrics) *Node {
+	n := &Node{
+		ctx:        ctx,
+		stopper:    stopper,
+		recorder:   recorder,
+		metrics:    makeNodeMetrics(),
+		stores:     storage.NewStores(ctx.Clock),
+		txnMetrics: txnMetrics,
 	}
+	n.recorder.AddNodeRegistry("exec.%s", n.metrics.registry)
+	return n
 }
 
-// context returns a context encapsulating the NodeID.
-func (n *Node) context() context.Context {
-	return log.Add(context.Background(), log.NodeID, n.Descriptor.NodeID)
+// context returns a context encapsulating the NodeID, derived from the
+// supplied context (which is not allowed to be nil).
+func (n *Node) context(ctx context.Context) context.Context {
+	if ctx == nil {
+		panic("ctx cannot be nil")
+	}
+	return log.Add(ctx, log.NodeID, n.Descriptor.NodeID)
 }
 
 // initDescriptor initializes the node descriptor with the server
@@ -247,18 +294,16 @@ func (n *Node) initNodeID(id roachpb.NodeID) {
 // start starts the node by registering the storage instance for the
 // RPC service "Node" and initializing stores for each specified
 // engine. Launches periodic store gossiping in a goroutine.
-func (n *Node) start(rpcServer *rpc.Server, addr net.Addr, engines []engine.Engine, attrs roachpb.Attributes) error {
+func (n *Node) start(addr net.Addr, engines []engine.Engine, attrs roachpb.Attributes) error {
 	n.initDescriptor(addr, attrs)
-
-	// Start status monitor.
-	n.status.StartMonitorFeed(n.ctx.EventFeed)
 
 	// Initialize stores, including bootstrapping new ones.
 	if err := n.initStores(engines, n.stopper); err != nil {
 		if err == errNeedsBootstrap {
+			n.initialBoot = true
 			// This node has no initialized stores and no way to connect to
 			// an existing cluster, so we bootstrap it.
-			clusterID, err := bootstrapCluster(engines)
+			clusterID, err := bootstrapCluster(engines, n.txnMetrics)
 			if err != nil {
 				return err
 			}
@@ -281,23 +326,16 @@ func (n *Node) start(rpcServer *rpc.Server, addr net.Addr, engines []engine.Engi
 
 	n.startedAt = n.ctx.Clock.Now().WallTime
 
-	// Initialize publisher for Node Events. This requires the NodeID, which is
-	// initialized by initStores(); because of this, some Store initialization
-	// events will precede the StartNodeEvent on the feed.
-	n.feed = status.NewNodeEventFeed(n.Descriptor.NodeID, n.ctx.EventFeed)
-	n.feed.StartNode(n.Descriptor, n.startedAt)
+	// Initialize the recorder with the NodeID, which is initialized by initStores().
+	n.recorder.NodeStarted(n.Descriptor, n.startedAt)
 
-	n.startPublishStatuses(n.stopper)
+	n.startComputePeriodicMetrics(n.stopper)
 	n.startGossip(n.stopper)
 
-	// Register the RPC methods we support last as doing so allows RPCs to be
-	// received which may access state initialized above without locks.
-	const method = "Node.Batch"
-	if err := rpcServer.Register(method, n.executeCmd, &roachpb.BatchRequest{}); err != nil {
-		log.Fatalf("unable to register node service with RPC server: %s", err)
-	}
+	// Record node started event.
+	n.recordJoinEvent()
 
-	log.Infoc(n.context(), "Started node with %v engine(s) and attributes %v", engines, attrs.Attrs)
+	log.Infoc(n.context(context.TODO()), "Started node with %v engine(s) and attributes %v", engines, attrs.Attrs)
 	return nil
 }
 
@@ -333,7 +371,7 @@ func (n *Node) initStores(engines []engine.Engine, stopper *stop.Stopper) error 
 			return util.Errorf("could not query store capacity: %s", err)
 		}
 		log.Infof("initialized store %s: %+v", s, capacity)
-		n.stores.AddStore(s)
+		n.addStore(s)
 	}
 
 	// If there are no initialized stores and no gossip resolvers,
@@ -371,6 +409,7 @@ func (n *Node) initStores(engines []engine.Engine, stopper *stop.Stopper) error 
 	// supplying 0 to initNodeID.
 	if n.Descriptor.NodeID == 0 {
 		n.initNodeID(0)
+		n.initialBoot = true
 	}
 
 	// Bootstrap any uninitialized stores asynchronously.
@@ -381,6 +420,11 @@ func (n *Node) initStores(engines []engine.Engine, stopper *stop.Stopper) error 
 	}
 
 	return nil
+}
+
+func (n *Node) addStore(store *storage.Store) {
+	n.stores.AddStore(store)
+	n.recorder.AddStore(store)
 }
 
 // validateStores iterates over all stores, verifying they agree on
@@ -428,12 +472,17 @@ func (n *Node) bootstrapStores(bootstraps []*storage.Store, stopper *stop.Stoppe
 		if err := s.Start(stopper); err != nil {
 			log.Fatal(err)
 		}
-		n.stores.AddStore(s)
+		n.addStore(s)
 		sIdent.StoreID++
 		log.Infof("bootstrapped store %s", s)
 		// Done regularly in Node.startGossip, but this cuts down the time
 		// until this store is used for range allocations.
 		s.GossipStore()
+	}
+	// write a new status summary after all stores have been bootstrapped; this
+	// helps the UI remain responsive when new nodes are added.
+	if err := n.writeSummaries(); err != nil {
+		log.Warningf("error writing node summary after store bootstrap: %s", err)
 	}
 }
 
@@ -500,9 +549,10 @@ func (n *Node) gossipStores() {
 	}
 }
 
-// startPublishStatuses starts a loop which periodically instructs each store to
-// publish its current status to the event feed.
-func (n *Node) startPublishStatuses(stopper *stop.Stopper) {
+// startComputePeriodidMetrics starts a loop which periodically instructs each
+// store to compute the value of metrics which cannot be incrementally
+// maintained.
+func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper) {
 	stopper.RunWorker(func() {
 		// Publish status at the same frequency as metrics are collected.
 		ticker := time.NewTicker(publishStatusInterval)
@@ -510,7 +560,7 @@ func (n *Node) startPublishStatuses(stopper *stop.Stopper) {
 		for {
 			select {
 			case <-ticker.C:
-				err := n.publishStoreStatuses()
+				err := n.computePeriodicMetrics()
 				if err != nil {
 					log.Error(err)
 				}
@@ -521,37 +571,170 @@ func (n *Node) startPublishStatuses(stopper *stop.Stopper) {
 	})
 }
 
-// publishStoreStatuses calls publishStatus on each store on the node.
-func (n *Node) publishStoreStatuses() error {
+// computePeriodicMetrics instructs each store to compute the value of
+// complicated metrics.
+func (n *Node) computePeriodicMetrics() error {
 	return n.stores.VisitStores(func(store *storage.Store) error {
-		return store.PublishStatus()
+		return store.ComputeMetrics()
 	})
 }
 
-// executeCmd interprets the given message as a *roachpb.BatchRequest and sends it
-// via the local sender.
-func (n *Node) executeCmd(argsI proto.Message) (proto.Message, error) {
-	ba := argsI.(*roachpb.BatchRequest)
+// startWriteSummaries begins periodically persisting status summaries for the
+// node and its stores.
+func (n *Node) startWriteSummaries(frequency time.Duration) {
+	// Immediately record summaries once on server startup.
+	n.stopper.RunWorker(func() {
+		// Write a status summary immediately; this helps the UI remain
+		// responsive when new nodes are added.
+		if err := n.writeSummaries(); err != nil {
+			log.Warningf("error recording initial status summaries: %s", err)
+		}
+		ticker := time.NewTicker(frequency)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := n.writeSummaries(); err != nil {
+					log.Warningf("error recording status summaries: %s", err)
+				}
+			case <-n.stopper.ShouldStop():
+				return
+			}
+		}
+	})
+}
+
+// writeSummaries retrieves status summaries from the supplied
+// NodeStatusRecorder and persists them to the cockroach data store.
+func (n *Node) writeSummaries() error {
+	var err error
+	n.stopper.RunTask(func() {
+		nodeStatus := n.recorder.GetStatusSummary()
+		if nodeStatus != nil {
+			key := keys.NodeStatusKey(int32(nodeStatus.Desc.NodeID))
+			// We use PutInline to store only a single version of the node
+			// status. There's not much point in keeping the historical
+			// versions as we keep all of the constituent data as
+			// timeseries. Further, due to the size of the build info in the
+			// node status, writing one of these every 10s will generate
+			// more versions than will easily fit into a range over the
+			// course of a day.
+			if pErr := n.ctx.DB.PutInline(key, nodeStatus); pErr != nil {
+				err = pErr.GoError()
+				return
+			}
+			if log.V(1) {
+				statusJSON, err := json.Marshal(nodeStatus)
+				if err != nil {
+					log.Errorf("error marshaling nodeStatus to json: %s", err)
+				}
+				log.Infof("node %d status: %s", nodeStatus.Desc.NodeID, statusJSON)
+			}
+		}
+	})
+	return err
+}
+
+// recordJoinEvent begins an asynchronous task which attempts to log a "node
+// join" or "node restart" event. This query will retry until it succeeds or the
+// server stops.
+func (n *Node) recordJoinEvent() {
+	if !n.ctx.LogRangeEvents {
+		return
+	}
+
+	logEventType := sql.EventLogNodeRestart
+	if n.initialBoot {
+		logEventType = sql.EventLogNodeJoin
+	}
+
+	n.stopper.RunWorker(func() {
+		for r := retry.Start(retry.Options{Closer: n.stopper.ShouldStop()}); r.Next(); {
+			if err := n.ctx.DB.Txn(func(txn *client.Txn) *roachpb.Error {
+				return sql.MakeEventLogger(n.ctx.SQLExecutor.LeaseManager).InsertEventRecord(txn,
+					logEventType,
+					int32(n.Descriptor.NodeID),
+					int32(n.Descriptor.NodeID),
+					struct {
+						Descriptor roachpb.NodeDescriptor
+						ClusterID  uuid.UUID
+						StartedAt  int64
+					}{n.Descriptor, n.ClusterID, n.startedAt},
+				)
+			}); err != nil {
+				log.Warningc(n.context(context.TODO()), "unable to log %s event for node %d: %s", logEventType, n.Descriptor.NodeID, err)
+			} else {
+				return
+			}
+		}
+	})
+}
+
+// Batch implements the roachpb.KVServer interface.
+func (n *Node) Batch(ctx context.Context, args *roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
+	// TODO(marc): this code is duplicated in kv/db.go, which should be fixed.
+	// Also, grpc's authentication model (which gives credential access in the
+	// request handler) doesn't really fit with the current design of the
+	// security package (which assumes that TLS state is only given at connection
+	// time) - that should be fixed.
+	if peer, ok := peer.FromContext(ctx); ok {
+		if tlsInfo, ok := peer.AuthInfo.(credentials.TLSInfo); ok {
+			certUser, err := security.GetCertificateUser(&tlsInfo.State)
+			if err != nil {
+				return nil, err
+			}
+			if certUser != security.NodeUser {
+				return nil, util.Errorf("user %s is not allowed", certUser)
+			}
+		}
+	}
+
 	var br *roachpb.BatchResponse
+	opName := "node " + strconv.Itoa(int(n.Descriptor.NodeID)) // could save allocs here
+
+	fail := func(err error) {
+		br = &roachpb.BatchResponse{}
+		br.Error = roachpb.NewError(err)
+	}
 
 	f := func() {
-		// TODO(tschottdorf) get a hold of the client's ID, add it to the
-		// context before dispatching, and create an ID for tracing the request.
-		sp := n.ctx.Tracer.StartSpan("node")
+		sp, err := tracing.JoinOrNew(n.ctx.Tracer, args.Trace, opName)
+		if err != nil {
+			fail(err)
+			return
+		}
+		// If this is a snowball span, it gets special treatment: It skips the
+		// regular tracing machinery, and we instead send the collected spans
+		// back with the response. This is more expensive, but then again,
+		// those are individual requests traced by users, so they can be.
+		if sp.BaggageItem(tracing.Snowball) != "" {
+			sp.LogEvent("delegating to snowball tracing")
+			sp.Finish()
+			if sp, err = tracing.JoinOrNewSnowball(opName, args.Trace, func(rawSpan basictracer.RawSpan) {
+				encSp, err := tracing.EncodeRawSpan(&rawSpan, nil)
+				if err != nil {
+					log.Warning(err)
+				}
+				br.CollectedSpans = append(br.CollectedSpans, encSp)
+			}); err != nil {
+				fail(err)
+				return
+			}
+		}
 		defer sp.Finish()
-		ctx, _ := opentracing.ContextWithSpan((*Node)(n).context(), sp)
+		traceCtx := opentracing.ContextWithSpan(n.context(ctx), sp)
 
-		tStart := time.Now()
+		tStart := timeutil.Now()
 		var pErr *roachpb.Error
-		br, pErr = n.stores.Send(ctx, *ba)
+		br, pErr = n.stores.Send(traceCtx, *args)
 		if pErr != nil {
 			br = &roachpb.BatchResponse{}
-			sp.LogEvent(fmt.Sprintf("error: %T", pErr.GetDetail()))
+			log.Trace(traceCtx, fmt.Sprintf("error: %T", pErr.GetDetail()))
 		}
 		if br.Error != nil {
 			panic(roachpb.ErrorUnexpectedlySet(n.stores, br))
 		}
-		n.feed.CallComplete(*ba, time.Now().Sub(tStart), pErr)
+		n.metrics.callComplete(timeutil.Now().Sub(tStart), pErr)
 		br.Error = pErr
 	}
 

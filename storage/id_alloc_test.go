@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
@@ -37,7 +39,7 @@ import (
 // channel, which is queried at the end to ensure that all IDs
 // from 2 to 101 are present.
 func TestIDAllocator(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
 	allocd := make(chan int, 100)
@@ -84,12 +86,12 @@ func TestIDAllocator(t *testing.T) {
 // the id allocator makes a double-alloc to make up the difference
 // and push the id allocation into positive integers.
 func TestIDAllocatorNegativeValue(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
 
 	// Increment our key to a negative value.
-	newValue, err := engine.MVCCIncrement(store.Engine(), nil, keys.RangeIDGenerator, store.ctx.Clock.Now(), nil, -1024)
+	newValue, err := engine.MVCCIncrement(context.Background(), store.Engine(), nil, keys.RangeIDGenerator, store.ctx.Clock.Now(), nil, -1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +113,7 @@ func TestIDAllocatorNegativeValue(t *testing.T) {
 
 // TestNewIDAllocatorInvalidArgs checks validation logic of newIDAllocator.
 func TestNewIDAllocatorInvalidArgs(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	args := [][]uint32{
 		{0, 10}, // minID <= 0
 		{2, 0},  // blockSize < 1
@@ -130,7 +132,7 @@ func TestNewIDAllocatorInvalidArgs(t *testing.T) {
 // 4) Make IDAllocator valid again, the blocked allocations return correct ID.
 // 5) Check if the following allocations return correctly.
 func TestAllocateErrorAndRecovery(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
 	allocd := make(chan int, 10)
@@ -218,7 +220,7 @@ func TestAllocateErrorAndRecovery(t *testing.T) {
 }
 
 func TestAllocateWithStopper(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	store, _, stopper := createTestStore(t)
 	idAlloc, err := newIDAllocator(keys.RangeIDGenerator, store.ctx.DB, 2, 10, stopper)
 	if err != nil {

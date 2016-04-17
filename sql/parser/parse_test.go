@@ -42,6 +42,7 @@ func TestParse(t *testing.T) {
 		{`BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE, PRIORITY HIGH`},
 		{`COMMIT TRANSACTION`},
 		{`ROLLBACK TRANSACTION`},
+		{"SAVEPOINT foo"},
 
 		{`CREATE DATABASE a`},
 		{`CREATE DATABASE IF NOT EXISTS a`},
@@ -60,6 +61,10 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b INT, c INT)`},
 		{`CREATE TABLE a (b CHAR)`},
 		{`CREATE TABLE a (b CHAR(3))`},
+		{`CREATE TABLE a (b VARCHAR)`},
+		{`CREATE TABLE a (b VARCHAR(3))`},
+		{`CREATE TABLE a (b STRING)`},
+		{`CREATE TABLE a (b STRING(3))`},
 		{`CREATE TABLE a (b FLOAT)`},
 		{`CREATE TABLE a (b INT NULL)`},
 		{`CREATE TABLE a (b INT NOT NULL)`},
@@ -68,6 +73,8 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b INT NULL PRIMARY KEY)`},
 		{`CREATE TABLE a (b INT DEFAULT 1)`},
 		{`CREATE TABLE a (b INT DEFAULT now())`},
+		{`CREATE TABLE a (a INT CHECK (a > 0))`},
+		{`CREATE TABLE a (a INT DEFAULT 1 CHECK (a > 0))`},
 		// "0" lost quotes previously.
 		{`CREATE TABLE a (b INT, c TEXT, PRIMARY KEY (b, c, "0"))`},
 		{`CREATE TABLE a (b INT, c TEXT, INDEX (b, c))`},
@@ -84,6 +91,9 @@ func TestParse(t *testing.T) {
 		{`DELETE FROM a`},
 		{`DELETE FROM a.b`},
 		{`DELETE FROM a WHERE a = b`},
+		{`DELETE FROM a WHERE a = b RETURNING a, b`},
+		{`DELETE FROM a WHERE a = b RETURNING 1, 2`},
+		{`DELETE FROM a WHERE a = b RETURNING a + b`},
 
 		{`DROP DATABASE a`},
 		{`DROP DATABASE IF EXISTS a`},
@@ -93,6 +103,10 @@ func TestParse(t *testing.T) {
 		{`DROP TABLE IF EXISTS a`},
 		{`DROP INDEX a.b@c`},
 		{`DROP INDEX IF EXISTS a.b@c`},
+		{`DROP INDEX a.b@c, d@f`},
+		{`DROP INDEX IF EXISTS a.b@c, d@f`},
+		{`DROP INDEX a.b@c CASCADE`},
+		{`DROP INDEX IF EXISTS a.b@c RESTRICT`},
 
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN (DEBUG) SELECT 1`},
@@ -108,8 +122,8 @@ func TestParse(t *testing.T) {
 		{`SHOW TABLES FROM a.b.c`},
 		{`SHOW COLUMNS FROM a`},
 		{`SHOW COLUMNS FROM a.b.c`},
-		{`SHOW INDEX FROM a`},
-		{`SHOW INDEX FROM a.b.c`},
+		{`SHOW INDEXES FROM a`},
+		{`SHOW INDEXES FROM a.b.c`},
 		{`SHOW TABLES FROM a; SHOW COLUMNS FROM b`},
 
 		// Tables are the default, but can also be specified with
@@ -153,6 +167,9 @@ func TestParse(t *testing.T) {
 		{`INSERT INTO a(a, a.b) VALUES (1, 2)`},
 		{`INSERT INTO a SELECT b, c FROM d`},
 		{`INSERT INTO a DEFAULT VALUES`},
+		{`INSERT INTO a VALUES (1) RETURNING a, b`},
+		{`INSERT INTO a VALUES (1, 2) RETURNING 1, 2`},
+		{`INSERT INTO a VALUES (1, 2) RETURNING a + b, c`},
 
 		{`SELECT 1 + 1`},
 		{`SELECT - - 5`},
@@ -176,7 +193,6 @@ func TestParse(t *testing.T) {
 		{`SELECT (ROW())`},
 		{`SELECT (TABLE a)`},
 
-		{`SELECT FROM t`},
 		{`SELECT 1 FROM t`},
 		{`SELECT 1, 2 FROM t`},
 		{`SELECT * FROM t`},
@@ -196,6 +212,8 @@ func TestParse(t *testing.T) {
 		{`SELECT a.b[1 + 1:4][3] FROM t`},
 		{`SELECT 'a' FROM t`},
 		{`SELECT 'a' FROM t@bar`},
+		{`SELECT 'a' FROM t@{NO_INDEX_JOIN}`},
+		{`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN}`},
 
 		{`SELECT 'a' AS "12345"`},
 		{`SELECT 'a' AS clnm`},
@@ -216,113 +234,113 @@ func TestParse(t *testing.T) {
 
 		{`SELECT "FROM" FROM t`},
 		{`SELECT CAST(1 AS TEXT)`},
-		{`SELECT FROM t AS bar`},
-		{`SELECT FROM t AS bar (bar1)`},
-		{`SELECT FROM t AS bar (bar1, bar2, bar3)`},
-		{`SELECT FROM (SELECT 1 FROM t)`},
-		{`SELECT FROM (SELECT 1 FROM t) AS bar`},
-		{`SELECT FROM (SELECT 1 FROM t) AS bar (bar1)`},
-		{`SELECT FROM (SELECT 1 FROM t) AS bar (bar1, bar2, bar3)`},
-		{`SELECT FROM t1, t2`},
-		{`SELECT FROM t AS t1`},
-		{`SELECT FROM t AS t1 (c1)`},
-		{`SELECT FROM t AS t1 (c1, c2, c3, c4)`},
-		{`SELECT FROM s.t`},
+		{`SELECT a FROM t AS bar`},
+		{`SELECT a FROM t AS bar (bar1)`},
+		{`SELECT a FROM t AS bar (bar1, bar2, bar3)`},
+		{`SELECT a FROM (SELECT 1 FROM t)`},
+		{`SELECT a FROM (SELECT 1 FROM t) AS bar`},
+		{`SELECT a FROM (SELECT 1 FROM t) AS bar (bar1)`},
+		{`SELECT a FROM (SELECT 1 FROM t) AS bar (bar1, bar2, bar3)`},
+		{`SELECT a FROM t1, t2`},
+		{`SELECT a FROM t AS t1`},
+		{`SELECT a FROM t AS t1 (c1)`},
+		{`SELECT a FROM t AS t1 (c1, c2, c3, c4)`},
+		{`SELECT a FROM s.t`},
 
 		{`SELECT COUNT(DISTINCT a) FROM t`},
 		{`SELECT COUNT(ALL a) FROM t`},
 
-		{`SELECT FROM t WHERE b = - 2`},
-		{`SELECT FROM t WHERE a = b`},
-		{`SELECT FROM t WHERE a = b AND a = c`},
-		{`SELECT FROM t WHERE a = b OR a = c`},
-		{`SELECT FROM t WHERE NOT a = b`},
-		{`SELECT FROM t WHERE EXISTS (SELECT 1 FROM t)`},
-		{`SELECT FROM t WHERE NOT (a = b)`},
-		{`SELECT FROM t WHERE NOT true`},
-		{`SELECT FROM t WHERE NOT false`},
-		{`SELECT FROM t WHERE a IN (b)`},
-		{`SELECT FROM t WHERE a IN (b, c)`},
-		{`SELECT FROM t WHERE a IN (SELECT FROM t)`},
-		{`SELECT FROM t WHERE a NOT IN (b, c)`},
-		{`SELECT FROM t WHERE a LIKE b`},
-		{`SELECT FROM t WHERE a NOT LIKE b`},
-		{`SELECT FROM t WHERE a SIMILAR TO b`},
-		{`SELECT FROM t WHERE a NOT SIMILAR TO b`},
-		{`SELECT FROM t WHERE a BETWEEN b AND c`},
-		{`SELECT FROM t WHERE a NOT BETWEEN b AND c`},
-		{`SELECT FROM t WHERE a IS NULL`},
-		{`SELECT FROM t WHERE a IS NOT NULL`},
-		{`SELECT FROM t WHERE a IS true`},
-		{`SELECT FROM t WHERE a IS NOT true`},
-		{`SELECT FROM t WHERE a IS false`},
-		{`SELECT FROM t WHERE a IS NOT false`},
-		{`SELECT FROM t WHERE a IS OF (INT)`},
-		{`SELECT FROM t WHERE a IS NOT OF (FLOAT, STRING)`},
-		{`SELECT FROM t WHERE a IS DISTINCT FROM b`},
-		{`SELECT FROM t WHERE a IS NOT DISTINCT FROM b`},
-		{`SELECT FROM t WHERE a < b`},
-		{`SELECT FROM t WHERE a <= b`},
-		{`SELECT FROM t WHERE a >= b`},
-		{`SELECT FROM t WHERE a != b`},
-		{`SELECT FROM t WHERE a = (SELECT a FROM t)`},
-		{`SELECT FROM t WHERE a = (b)`},
-		{`SELECT FROM t WHERE a = b & c`},
-		{`SELECT FROM t WHERE a = b | c`},
-		{`SELECT FROM t WHERE a = b ^ c`},
-		{`SELECT FROM t WHERE a = b + c`},
-		{`SELECT FROM t WHERE a = b - c`},
-		{`SELECT FROM t WHERE a = b * c`},
-		{`SELECT FROM t WHERE a = b / c`},
-		{`SELECT FROM t WHERE a = b % c`},
-		{`SELECT FROM t WHERE a = b || c`},
-		{`SELECT FROM t WHERE a = + b`},
-		{`SELECT FROM t WHERE a = - b`},
-		{`SELECT FROM t WHERE a = ~ b`},
-		{`SELECT FROM t WHERE CASE WHEN a = b THEN c END`},
-		{`SELECT FROM t WHERE CASE WHEN a = b THEN c ELSE d END`},
-		{`SELECT FROM t WHERE CASE WHEN a = b THEN c WHEN b = d THEN d ELSE d END`},
-		{`SELECT FROM t WHERE CASE aa WHEN a = b THEN c END`},
-		{`SELECT FROM t WHERE a = B()`},
-		{`SELECT FROM t WHERE a = B(c)`},
-		{`SELECT FROM t WHERE a = B(c, d)`},
-		{`SELECT FROM t WHERE a = COUNT(*)`},
-		{`SELECT FROM t WHERE a = IF(b, c, d)`},
-		{`SELECT FROM t WHERE a = IFNULL(b, c)`},
-		{`SELECT FROM t WHERE a = NULLIF(b, c)`},
-		{`SELECT FROM t WHERE a = COALESCE(a, b, c, d, e)`},
+		{`SELECT a FROM t WHERE b = - 2`},
+		{`SELECT a FROM t WHERE a = b`},
+		{`SELECT a FROM t WHERE a = b AND a = c`},
+		{`SELECT a FROM t WHERE a = b OR a = c`},
+		{`SELECT a FROM t WHERE NOT a = b`},
+		{`SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t)`},
+		{`SELECT a FROM t WHERE NOT (a = b)`},
+		{`SELECT a FROM t WHERE NOT true`},
+		{`SELECT a FROM t WHERE NOT false`},
+		{`SELECT a FROM t WHERE a IN (b)`},
+		{`SELECT a FROM t WHERE a IN (b, c)`},
+		{`SELECT a FROM t WHERE a IN (SELECT a FROM t)`},
+		{`SELECT a FROM t WHERE a NOT IN (b, c)`},
+		{`SELECT a FROM t WHERE a LIKE b`},
+		{`SELECT a FROM t WHERE a NOT LIKE b`},
+		{`SELECT a FROM t WHERE a SIMILAR TO b`},
+		{`SELECT a FROM t WHERE a NOT SIMILAR TO b`},
+		{`SELECT a FROM t WHERE a BETWEEN b AND c`},
+		{`SELECT a FROM t WHERE a NOT BETWEEN b AND c`},
+		{`SELECT a FROM t WHERE a IS NULL`},
+		{`SELECT a FROM t WHERE a IS NOT NULL`},
+		{`SELECT a FROM t WHERE a IS true`},
+		{`SELECT a FROM t WHERE a IS NOT true`},
+		{`SELECT a FROM t WHERE a IS false`},
+		{`SELECT a FROM t WHERE a IS NOT false`},
+		{`SELECT a FROM t WHERE a IS OF (INT)`},
+		{`SELECT a FROM t WHERE a IS NOT OF (FLOAT, STRING)`},
+		{`SELECT a FROM t WHERE a IS DISTINCT FROM b`},
+		{`SELECT a FROM t WHERE a IS NOT DISTINCT FROM b`},
+		{`SELECT a FROM t WHERE a < b`},
+		{`SELECT a FROM t WHERE a <= b`},
+		{`SELECT a FROM t WHERE a >= b`},
+		{`SELECT a FROM t WHERE a != b`},
+		{`SELECT a FROM t WHERE a = (SELECT a FROM t)`},
+		{`SELECT a FROM t WHERE a = (b)`},
+		{`SELECT a FROM t WHERE a = b & c`},
+		{`SELECT a FROM t WHERE a = b | c`},
+		{`SELECT a FROM t WHERE a = b ^ c`},
+		{`SELECT a FROM t WHERE a = b + c`},
+		{`SELECT a FROM t WHERE a = b - c`},
+		{`SELECT a FROM t WHERE a = b * c`},
+		{`SELECT a FROM t WHERE a = b / c`},
+		{`SELECT a FROM t WHERE a = b % c`},
+		{`SELECT a FROM t WHERE a = b || c`},
+		{`SELECT a FROM t WHERE a = + b`},
+		{`SELECT a FROM t WHERE a = - b`},
+		{`SELECT a FROM t WHERE a = ~ b`},
+		{`SELECT a FROM t WHERE CASE WHEN a = b THEN c END`},
+		{`SELECT a FROM t WHERE CASE WHEN a = b THEN c ELSE d END`},
+		{`SELECT a FROM t WHERE CASE WHEN a = b THEN c WHEN b = d THEN d ELSE d END`},
+		{`SELECT a FROM t WHERE CASE aa WHEN a = b THEN c END`},
+		{`SELECT a FROM t WHERE a = B()`},
+		{`SELECT a FROM t WHERE a = B(c)`},
+		{`SELECT a FROM t WHERE a = B(c, d)`},
+		{`SELECT a FROM t WHERE a = COUNT(*)`},
+		{`SELECT a FROM t WHERE a = IF(b, c, d)`},
+		{`SELECT a FROM t WHERE a = IFNULL(b, c)`},
+		{`SELECT a FROM t WHERE a = NULLIF(b, c)`},
+		{`SELECT a FROM t WHERE a = COALESCE(a, b, c, d, e)`},
 		{`SELECT (a.b) FROM t WHERE (b.c) = 2`},
 
-		{`SELECT FROM t ORDER BY a`},
-		{`SELECT FROM t ORDER BY a ASC`},
-		{`SELECT FROM t ORDER BY a DESC`},
+		{`SELECT a FROM t ORDER BY a`},
+		{`SELECT a FROM t ORDER BY a ASC`},
+		{`SELECT a FROM t ORDER BY a DESC`},
 
 		{`SELECT 1 FROM t GROUP BY a`},
 		{`SELECT 1 FROM t GROUP BY a, b`},
 
-		{`SELECT FROM t HAVING a = b`},
+		{`SELECT a FROM t HAVING a = b`},
 
-		{`SELECT FROM t UNION SELECT 1 FROM t`},
-		{`SELECT FROM t UNION SELECT 1 FROM t UNION SELECT 1 FROM t`},
-		{`SELECT FROM t UNION ALL SELECT 1 FROM t`},
-		{`SELECT FROM t EXCEPT SELECT 1 FROM t`},
-		{`SELECT FROM t EXCEPT ALL SELECT 1 FROM t`},
-		{`SELECT FROM t INTERSECT SELECT 1 FROM t`},
-		{`SELECT FROM t INTERSECT ALL SELECT 1 FROM t`},
+		{`SELECT a FROM t UNION SELECT 1 FROM t`},
+		{`SELECT a FROM t UNION SELECT 1 FROM t UNION SELECT 1 FROM t`},
+		{`SELECT a FROM t UNION ALL SELECT 1 FROM t`},
+		{`SELECT a FROM t EXCEPT SELECT 1 FROM t`},
+		{`SELECT a FROM t EXCEPT ALL SELECT 1 FROM t`},
+		{`SELECT a FROM t INTERSECT SELECT 1 FROM t`},
+		{`SELECT a FROM t INTERSECT ALL SELECT 1 FROM t`},
 
-		{`SELECT FROM t1 JOIN t2 ON a = b`},
-		{`SELECT FROM t1 JOIN t2 USING (a)`},
-		{`SELECT FROM t1 LEFT JOIN t2 ON a = b`},
-		{`SELECT FROM t1 RIGHT JOIN t2 ON a = b`},
-		{`SELECT FROM t1 INNER JOIN t2 ON a = b`},
-		{`SELECT FROM t1 CROSS JOIN t2`},
-		{`SELECT FROM t1 NATURAL JOIN t2`},
-		{`SELECT FROM t1 INNER JOIN t2 USING (a)`},
-		{`SELECT FROM t1 FULL JOIN t2 USING (a)`},
+		{`SELECT a FROM t1 JOIN t2 ON a = b`},
+		{`SELECT a FROM t1 JOIN t2 USING (a)`},
+		{`SELECT a FROM t1 LEFT JOIN t2 ON a = b`},
+		{`SELECT a FROM t1 RIGHT JOIN t2 ON a = b`},
+		{`SELECT a FROM t1 INNER JOIN t2 ON a = b`},
+		{`SELECT a FROM t1 CROSS JOIN t2`},
+		{`SELECT a FROM t1 NATURAL JOIN t2`},
+		{`SELECT a FROM t1 INNER JOIN t2 USING (a)`},
+		{`SELECT a FROM t1 FULL JOIN t2 USING (a)`},
 
-		{`SELECT FROM t LIMIT a`},
-		{`SELECT FROM t OFFSET b`},
-		{`SELECT FROM t LIMIT a OFFSET b`},
+		{`SELECT a FROM t LIMIT a`},
+		{`SELECT a FROM t OFFSET b`},
+		{`SELECT a FROM t LIMIT a OFFSET b`},
 		{`SELECT DISTINCT * FROM t`},
 		{`SELECT DISTINCT a, b FROM t`},
 		{`SET a = 3`},
@@ -336,6 +354,8 @@ func TestParse(t *testing.T) {
 		{`SET TRANSACTION PRIORITY NORMAL`},
 		{`SET TRANSACTION PRIORITY HIGH`},
 		{`SET TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY HIGH`},
+		{`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE`},
+		{`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SNAPSHOT`},
 		{`SET TIME ZONE 'pst8pdt'`},
 		{`SET TIME ZONE 'Europe/Rome'`},
 		{`SET TIME ZONE -7`},
@@ -354,6 +374,7 @@ func TestParse(t *testing.T) {
 
 		{`TRUNCATE TABLE a`},
 		{`TRUNCATE TABLE a, b.c`},
+		{`TRUNCATE TABLE a CASCADE`},
 
 		{`UPDATE a SET b = 3`},
 		{`UPDATE a.b SET b = 3`},
@@ -363,14 +384,18 @@ func TestParse(t *testing.T) {
 		{`UPDATE a SET (b, c) = (3, DEFAULT)`},
 		{`UPDATE a SET (b, c) = (SELECT 3, 4)`},
 		{`UPDATE a SET b = 3 WHERE a = b`},
+		{`UPDATE a SET b = 3 WHERE a = b RETURNING a`},
+		{`UPDATE a SET b = 3 WHERE a = b RETURNING 1, 2`},
+		{`UPDATE a SET b = 3 WHERE a = b RETURNING a, a + b`},
+
 		{`UPDATE T AS "0" SET K = ''`},                 // "0" lost its quotes
 		{`SELECT * FROM "0" JOIN "0" USING (id, "0")`}, // last "0" lost its quotes.
 
 		{`ALTER DATABASE a RENAME TO b`},
 		{`ALTER TABLE a RENAME TO b`},
 		{`ALTER TABLE IF EXISTS a RENAME TO b`},
-		{`ALTER INDEX a RENAME TO b`},
-		{`ALTER INDEX IF EXISTS a RENAME TO b`},
+		{`ALTER INDEX a@b RENAME TO b`},
+		{`ALTER INDEX IF EXISTS a@b RENAME TO b`},
 		{`ALTER TABLE a RENAME COLUMN c1 TO c2`},
 		{`ALTER TABLE IF EXISTS a RENAME COLUMN c1 TO c2`},
 
@@ -391,6 +416,16 @@ func TestParse(t *testing.T) {
 		{`ALTER TABLE a DROP COLUMN IF EXISTS b, DROP CONSTRAINT a_idx`},
 		{`ALTER TABLE IF EXISTS a DROP COLUMN b, DROP CONSTRAINT a_idx`},
 		{`ALTER TABLE IF EXISTS a DROP COLUMN IF EXISTS b, DROP CONSTRAINT a_idx`},
+		{`ALTER TABLE a DROP COLUMN b CASCADE`},
+		{`ALTER TABLE a DROP COLUMN b RESTRICT`},
+		{`ALTER TABLE a DROP CONSTRAINT b CASCADE`},
+		{`ALTER TABLE a DROP CONSTRAINT IF EXISTS b RESTRICT`},
+
+		{`ALTER TABLE a ALTER COLUMN b SET DEFAULT 42`},
+		{`ALTER TABLE a ALTER COLUMN b SET DEFAULT NULL`},
+		{`ALTER TABLE a ALTER COLUMN b DROP DEFAULT`},
+		{`ALTER TABLE a ALTER COLUMN b DROP NOT NULL`},
+		{`ALTER TABLE a ALTER b DROP NOT NULL`},
 	}
 	for _, d := range testData {
 		stmts, err := parseTraditional(d.sql)
@@ -422,11 +457,16 @@ func TestParse2(t *testing.T) {
 		{`SELECT DECIMAL 'foo'`, `SELECT CAST('foo' AS DECIMAL)`},
 		{`SELECT DATE 'foo'`, `SELECT CAST('foo' AS DATE)`},
 		{`SELECT TIMESTAMP 'foo'`, `SELECT CAST('foo' AS TIMESTAMP)`},
+		{`SELECT TIMESTAMPTZ 'foo'`, `SELECT CAST('foo' AS TIMESTAMPTZ)`},
 		{`SELECT INTERVAL 'foo'`, `SELECT CAST('foo' AS INTERVAL)`},
 		{`SELECT CHAR 'foo'`, `SELECT CAST('foo' AS CHAR)`},
 
-		{`SELECT FROM t WHERE a IS UNKNOWN`, `SELECT FROM t WHERE a IS NULL`},
-		{`SELECT FROM t WHERE a IS NOT UNKNOWN`, `SELECT FROM t WHERE a IS NOT NULL`},
+		{`SELECT 'a' FROM t@{FORCE_INDEX=bar}`, `SELECT 'a' FROM t@bar`},
+		{`SELECT 'a' FROM t@{NO_INDEX_JOIN,FORCE_INDEX=bar}`,
+			`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN}`},
+
+		{`SELECT a FROM t WHERE a IS UNKNOWN`, `SELECT a FROM t WHERE a IS NULL`},
+		{`SELECT a FROM t WHERE a IS NOT UNKNOWN`, `SELECT a FROM t WHERE a IS NOT NULL`},
 
 		// Escaped string literals are not always escaped the same because
 		// '''' and e'\'' scan to the same token. It's more convenient to
@@ -456,16 +496,36 @@ func TestParse2(t *testing.T) {
 		{`SELECT 1 FROM t t1 (c1, c2)`,
 			`SELECT 1 FROM t AS t1 (c1, c2)`},
 		// Alternate not-equal operator.
-		{`SELECT FROM t WHERE a <> b`,
-			`SELECT FROM t WHERE a != b`},
+		{`SELECT a FROM t WHERE a <> b`,
+			`SELECT a FROM t WHERE a != b`},
 		// OUTER is syntactic sugar.
-		{`SELECT FROM t1 LEFT OUTER JOIN t2 ON a = b`,
-			`SELECT FROM t1 LEFT JOIN t2 ON a = b`},
-		{`SELECT FROM t1 RIGHT OUTER JOIN t2 ON a = b`,
-			`SELECT FROM t1 RIGHT JOIN t2 ON a = b`},
+		{`SELECT a FROM t1 LEFT OUTER JOIN t2 ON a = b`,
+			`SELECT a FROM t1 LEFT JOIN t2 ON a = b`},
+		{`SELECT a FROM t1 RIGHT OUTER JOIN t2 ON a = b`,
+			`SELECT a FROM t1 RIGHT JOIN t2 ON a = b`},
+		// Some functions are nearly keywords.
+		{`SELECT CURRENT_TIMESTAMP`,
+			`SELECT "CURRENT_TIMESTAMP"()`},
+		{`SELECT CURRENT_DATE`,
+			`SELECT "CURRENT_DATE"()`},
+		{`SELECT POSITION(a IN b)`,
+			`SELECT STRPOS(b, a)`},
+		{`SELECT TRIM(BOTH a FROM b)`,
+			`SELECT BTRIM(b, a)`},
+		{`SELECT TRIM(LEADING a FROM b)`,
+			`SELECT LTRIM(b, a)`},
+		{`SELECT TRIM(TRAILING a FROM b)`,
+			`SELECT RTRIM(b, a)`},
+		{`SELECT TRIM(a, b)`,
+			`SELECT BTRIM(a, b)`},
+		// Offset has an optional ROW/ROWS keyword.
+		{`SELECT a FROM t1 OFFSET a ROW`,
+			`SELECT a FROM t1 OFFSET a`},
+		{`SELECT a FROM t1 OFFSET a ROWS`,
+			`SELECT a FROM t1 OFFSET a`},
 		// We allow OFFSET before LIMIT, but always output LIMIT first.
-		{`SELECT FROM t OFFSET a LIMIT b`,
-			`SELECT FROM t LIMIT b OFFSET a`},
+		{`SELECT a FROM t OFFSET a LIMIT b`,
+			`SELECT a FROM t LIMIT b OFFSET a`},
 		// Shorthand type cast.
 		{`SELECT '1'::INT`,
 			`SELECT CAST('1' AS INT)`},
@@ -485,12 +545,12 @@ func TestParse2(t *testing.T) {
 			`SELECT + y[ARRAY[]]`},
 		{`SELECT(0)FROM y[array[]]`,
 			`SELECT (0) FROM y[ARRAY[]]`},
-		{`SELECT FROM t UNION DISTINCT SELECT 1 FROM t`,
-			`SELECT FROM t UNION SELECT 1 FROM t`},
-		{`SELECT FROM t EXCEPT DISTINCT SELECT 1 FROM t`,
-			`SELECT FROM t EXCEPT SELECT 1 FROM t`},
-		{`SELECT FROM t INTERSECT DISTINCT SELECT 1 FROM t`,
-			`SELECT FROM t INTERSECT SELECT 1 FROM t`},
+		{`SELECT a FROM t UNION DISTINCT SELECT 1 FROM t`,
+			`SELECT a FROM t UNION SELECT 1 FROM t`},
+		{`SELECT a FROM t EXCEPT DISTINCT SELECT 1 FROM t`,
+			`SELECT a FROM t EXCEPT SELECT 1 FROM t`},
+		{`SELECT a FROM t INTERSECT DISTINCT SELECT 1 FROM t`,
+			`SELECT a FROM t INTERSECT SELECT 1 FROM t`},
 		{`SET TIME ZONE pst8pdt`,
 			`SET TIME ZONE 'pst8pdt'`},
 		{`SET TIME ZONE "Europe/Rome"`,
@@ -536,6 +596,10 @@ func TestParse2(t *testing.T) {
 			`SELECT RTRIM('xyxtrimyyx')`},
 		{`SELECT TRIM(trailing 'xyxtrimyyx')`,
 			`SELECT RTRIM('xyxtrimyyx')`},
+		{`SHOW INDEX FROM t`,
+			`SHOW INDEXES FROM t`},
+		{`SHOW KEYS FROM t`,
+			`SHOW INDEXES FROM t`},
 		{`BEGIN`,
 			`BEGIN TRANSACTION`},
 		{`START TRANSACTION`,
@@ -548,15 +612,24 @@ func TestParse2(t *testing.T) {
 			`BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY LOW`},
 		{`SET TRANSACTION PRIORITY NORMAL, ISOLATION LEVEL SERIALIZABLE`,
 			`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, PRIORITY NORMAL`},
+		{"RELEASE foo", "RELEASE SAVEPOINT foo"},
+		{"RELEASE SAVEPOINT foo", "RELEASE SAVEPOINT foo"},
+		{"ROLLBACK", "ROLLBACK TRANSACTION"},
+		{"ROLLBACK TRANSACTION", "ROLLBACK TRANSACTION"},
+		{"ROLLBACK TO foo", "ROLLBACK TRANSACTION TO SAVEPOINT foo"},
+		{"ROLLBACK TO SAVEPOINT foo", "ROLLBACK TRANSACTION TO SAVEPOINT foo"},
+		{"ROLLBACK TRANSACTION TO foo", "ROLLBACK TRANSACTION TO SAVEPOINT foo"},
+		{"ROLLBACK TRANSACTION TO SAVEPOINT foo", "ROLLBACK TRANSACTION TO SAVEPOINT foo"},
 	}
 	for _, d := range testData {
 		stmts, err := parseTraditional(d.sql)
 		if err != nil {
-			t.Fatalf("%s: expected success, but found %s", d.sql, err)
+			t.Errorf("%s: expected success, but found %s", d.sql, err)
+			continue
 		}
 		s := stmts.String()
 		if d.expected != s {
-			t.Errorf("expected %s, but found %s", d.expected, s)
+			t.Errorf("%s: expected %s, but found (%d statements): %q", d.sql, d.expected, len(stmts), s)
 		}
 		if _, err := parseTraditional(s); err != nil {
 			t.Errorf("expected string found, but not parsable: %s:\n%s", err, s)
@@ -646,6 +719,12 @@ CREATE DATABASE a b c
 CREATE INDEX ON a (b) STORING ()
                                ^
 `},
+		{`SELECT FROM t`,
+			`syntax error at or near "FROM"
+SELECT FROM t
+       ^
+`},
+
 		{"SELECT 1e-\n-1",
 			`invalid floating point literal
 SELECT 1e-
@@ -682,6 +761,78 @@ CREATE TABLE a (b INT DEFAULT (SELECT 1))
 			`syntax error at or near ","
 SELECT POSITION('high', 'a')
                       ^
+`,
+		},
+		{
+			`SELECT a FROM foo@{FORCE_INDEX}`,
+			`syntax error at or near "}"
+SELECT a FROM foo@{FORCE_INDEX}
+                              ^
+`,
+		},
+		{
+			`SELECT a FROM foo@{FORCE_INDEX=}`,
+			`syntax error at or near "}"
+SELECT a FROM foo@{FORCE_INDEX=}
+                               ^
+`,
+		},
+		{
+			`SELECT a FROM foo@{FORCE_INDEX=bar,FORCE_INDEX=baz}`,
+			`FORCE_INDEX specified multiple times at or near "baz"
+SELECT a FROM foo@{FORCE_INDEX=bar,FORCE_INDEX=baz}
+                                               ^
+`,
+		},
+		{
+			`SELECT a FROM foo@{FORCE_INDEX=bar,NO_INDEX_JOIN,FORCE_INDEX=baz}`,
+			`FORCE_INDEX specified multiple times at or near "baz"
+SELECT a FROM foo@{FORCE_INDEX=bar,NO_INDEX_JOIN,FORCE_INDEX=baz}
+                                                             ^
+`,
+		},
+		{
+			`SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}`,
+			`NO_INDEX_JOIN specified multiple times at or near "NO_INDEX_JOIN"
+SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}
+                                 ^
+`,
+		},
+		{
+			`SELECT a FROM foo@{NO_INDEX_JOIN,FORCE_INDEX=baz,NO_INDEX_JOIN}`,
+			`NO_INDEX_JOIN specified multiple times at or near "NO_INDEX_JOIN"
+SELECT a FROM foo@{NO_INDEX_JOIN,FORCE_INDEX=baz,NO_INDEX_JOIN}
+                                                 ^
+`,
+		},
+		{
+			`INSERT INTO a@b VALUES (1, 2)`,
+			`syntax error at or near "@"
+INSERT INTO a@b VALUES (1, 2)
+             ^
+`,
+		},
+		{
+			`ALTER INDEX a RENAME TO b`,
+			`syntax error at or near "RENAME"
+ALTER INDEX a RENAME TO b
+              ^
+`,
+		},
+		{
+
+			`ALTER INDEX a IF EXISTS RENAME TO b`,
+			`syntax error at or near "IF"
+ALTER INDEX a IF EXISTS RENAME TO b
+              ^
+`,
+		},
+		{
+
+			`DROP INDEX a`,
+			`syntax error at or near "EOF"
+DROP INDEX a
+            ^
 `,
 		},
 	}
@@ -732,7 +883,7 @@ func TestParsePrecedence(t *testing.T) {
 	//   9: AND
 	//  10: OR
 
-	unary := func(op UnaryOp, expr Expr) Expr {
+	unary := func(op UnaryOperator, expr Expr) Expr {
 		return &UnaryExpr{Operator: op, Expr: expr}
 	}
 	binary := func(op BinaryOp, left, right Expr) Expr {

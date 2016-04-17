@@ -26,11 +26,11 @@ ORG_ROOT             := $(REPO_ROOT)/..
 GITHUB_ROOT          := $(ORG_ROOT)/..
 BOWER_COMPONENTS     := bower_components
 NODE_MODULES         := node_modules
+TYPINGS              := typings
 TS_ROOT              := ts
 STYL_ROOT            := styl
 TEST_ROOT            := ts/test
 GENERATED_ROOT       := generated
-GENERATED_PROTO_ROOT := ts/generated/protos
 
 # Ensure we only have one entry in GOPATH
 GOPATH := $(GITHUB_ROOT)/../..
@@ -48,41 +48,36 @@ CSS_DEBUG_TARGET        := build/app_debug.css
 REMOTE_DEPS             := npm.installed bower.installed typings.installed
 INDEX                   := index.html
 GOBINDATA_FONTS         := ./fonts/*
+GOBINDATA_ASSETS        := ./assets/*
 GOBINDATA_DEPS          := $(TYPESCRIPT_TARGET) $(CSS_TARGET)
 GOBINDATA_DEBUG_DEPS    := $(TYPESCRIPT_TARGET) $(CSS_DEBUG_TARGET)
 GOBINDATA_SOURCES       := $(BOWER_COMPONENTS)/d3/d3.min.js \
-                           $(BOWER_COMPONENTS)/lodash/lodash.min.js \
+                           $(NODE_MODULES)/lodash/lodash.min.js \
                            $(BOWER_COMPONENTS)/mithriljs/mithril.js \
                            $(BOWER_COMPONENTS)/nvd3/build/nv.d3.min.css \
                            $(BOWER_COMPONENTS)/nvd3/build/nv.d3.min.js \
                            $(BOWER_COMPONENTS)/moment/min/moment.min.js \
                            $(BOWER_COMPONENTS)/moment-timezone/builds/moment-timezone-with-data.min.js \
                            $(GOBINDATA_FONTS) \
+                           $(GOBINDATA_ASSETS) \
                            favicon.ico \
                            apple-touch-icon.png
 GOBINDATA_DEBUG_SOURCES := $(BOWER_COMPONENTS)/d3/d3.js \
-                           $(BOWER_COMPONENTS)/lodash/lodash.js \
+                           $(NODE_MODULES)/lodash/lodash.js \
                            $(BOWER_COMPONENTS)/mithriljs/mithril.js \
                            $(BOWER_COMPONENTS)/nvd3/build/nv.d3.css \
                            $(BOWER_COMPONENTS)/nvd3/build/nv.d3.js \
                            $(BOWER_COMPONENTS)/moment/moment.js \
                            $(BOWER_COMPONENTS)/moment-timezone/builds/moment-timezone-with-data.js \
                            $(GOBINDATA_FONTS) \
+                           $(GOBINDATA_ASSETS) \
                            favicon.ico \
                            apple-touch-icon.png
 GOBINDATA_TARGET        := ./embedded.go
 GOBINDATA_DEBUG_TARGET  := ./embedded_debug.go
 
-# Generated proto files
-# TODO: generate all automatically
-
-PROTO_FILE        := ../sql/driver/wire.proto
-GOGOPROTO_FOLDER  := $(GOPATH)/src/github.com/gogo/protobuf
-GOGOPROTO         := $(GOGOPROTO_FOLDER)/gogoproto/gogo.proto
-PROTO_JSON_TARGET := $(GENERATED_ROOT)/wireproto.json
-
 .PHONY: all
-all: lint $(GOBINDATA_TARGET) $(TEST_TARGET) $(PROTO_JSON_TARGET)
+all: lint $(GOBINDATA_TARGET) $(TEST_TARGET)
 	rm -f $(GOBINDATA_DEBUG_TARGET)
 
 .PHONY: lint
@@ -91,24 +86,28 @@ lint: npm.installed
 	tslint -c $(TS_ROOT)/tslint.json $(shell find $(TS_ROOT) -name '*.ts')
 
 .PHONY: debug
-debug: $(GOBINDATA_DEBUG_TARGET) $(TEST_TARGET) $(PROTO_JSON_TARGET)
+debug: $(GOBINDATA_DEBUG_TARGET) $(TEST_TARGET)
 	rm -f $(GOBINDATA_TARGET)
 
+.PHONY: next
+next: $(CSS_TARGET)
+	make -C next
+
 bower.installed: bower.json npm.installed
+	rm -rf $(BOWER_COMPONENTS)/
 	bower install --config.interactive=false --allow-root
 	touch $@
 
 npm.installed: npm-shrinkwrap.json
+	# TODO(tamird): DRY this with `clean`?
+	rm -rf $(BOWER_COMPONENTS)/ $(NODE_MODULES)/ $(TYPINGS)/
 	npm install --progress=false
 	touch $@
 
 typings.installed: typings.json npm.installed
+	rm -rf $(TYPINGS)/
 	typings install
 	touch $@
-
-$(PROTO_JSON_TARGET): $(PROTO_FILE) $(GOGOPROTO)
-	mkdir -p $(GENERATED_ROOT)
-	pbjs $(PROTO_FILE) --path $(PROTO_DEPS_FOLDER) > $@
 
 $(TYPESCRIPT_TARGET): $(shell find $(TS_ROOT)) $(REMOTE_DEPS)
 	tsc -p $(TS_ROOT)
@@ -149,4 +148,4 @@ watch: debug
 .PHONY: clean
 clean:
 	rm -f $(REMOTE_DEPS) $(INDEX)
-	rm -rf $(NODE_MODULES) $(BOWER_COMPONENTS) build generated typings
+	rm -rf $(BOWER_COMPONENTS) $(NODE_MODULES) $(TYPINGS) build generated

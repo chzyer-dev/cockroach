@@ -26,7 +26,7 @@ import (
 )
 
 func TestMakeTableDescColumns(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		sqlType  string
@@ -54,8 +54,8 @@ func TestMakeTableDescColumns(t *testing.T) {
 			true,
 		},
 		{
-			"DECIMAL(5,6)",
-			ColumnType{Kind: ColumnType_DECIMAL, Precision: 5, Width: 6},
+			"DECIMAL(6,5)",
+			ColumnType{Kind: ColumnType_DECIMAL, Precision: 6, Width: 5},
 			true,
 		},
 		{
@@ -129,7 +129,7 @@ func TestMakeTableDescColumns(t *testing.T) {
 }
 
 func TestMakeTableDescIndexes(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		sql     string
@@ -225,7 +225,7 @@ func TestMakeTableDescIndexes(t *testing.T) {
 }
 
 func TestPrimaryKeyUnspecified(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stmt, err := parser.ParseOneTraditional(
 		"CREATE TABLE foo.test (a INT, b INT, CONSTRAINT c UNIQUE (b))")
 	if err != nil {

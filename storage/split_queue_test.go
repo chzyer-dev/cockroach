@@ -31,7 +31,7 @@ import (
 // TestSplitQueueShouldQueue verifies shouldQueue method correctly
 // combines splits in zone configs with the size of the range.
 func TestSplitQueueShouldQueue(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
@@ -73,9 +73,9 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 
 	splitQ := newSplitQueue(nil, tc.gossip)
 
-	cfg := tc.gossip.GetSystemConfig()
-	if cfg == nil {
-		t.Fatal("nil config")
+	cfg, ok := tc.gossip.GetSystemConfig()
+	if !ok {
+		t.Fatal("config not set")
 	}
 
 	for i, test := range testCases {

@@ -1,4 +1,3 @@
-// Copyright 2015 The Cockroach Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,10 +18,17 @@
 
 %{
 package parser
-import "github.com/cockroachdb/cockroach/sql/privilege"
+
+import (
+	"errors"
+
+	"github.com/cockroachdb/cockroach/sql/privilege"
+)
+
+var errUnimplemented = errors.New("unimplemented")
 
 func unimplemented() {
-  panic("TODO(pmattis): unimplemented")
+	panic(errUnimplemented)
 }
 %}
 
@@ -73,6 +79,12 @@ func (u *sqlSymUnion) qname() *QualifiedName {
 func (u *sqlSymUnion) qnames() QualifiedNames {
     return u.val.(QualifiedNames)
 }
+func (u *sqlSymUnion) tableWithIdx() *TableNameWithIndex {
+    return u.val.(*TableNameWithIndex)
+}
+func (u *sqlSymUnion) tableWithIdxList() TableNameWithIndexList {
+    return u.val.(TableNameWithIndexList)
+}
 func (u *sqlSymUnion) indirectElem() IndirectionElem {
     if indirectElem, ok := u.val.(IndirectionElem); ok {
         return indirectElem
@@ -82,6 +94,9 @@ func (u *sqlSymUnion) indirectElem() IndirectionElem {
 func (u *sqlSymUnion) indirect() Indirection {
     return u.val.(Indirection)
 }
+func (u *sqlSymUnion) indexHints() *IndexHints {
+    return u.val.(*IndexHints)
+}
 func (u *sqlSymUnion) stmt() Statement {
     if stmt, ok := u.val.(Statement); ok {
         return stmt
@@ -90,6 +105,12 @@ func (u *sqlSymUnion) stmt() Statement {
 }
 func (u *sqlSymUnion) stmts() []Statement {
     return u.val.([]Statement)
+}
+func (u *sqlSymUnion) slct() *Select {
+    if selectStmt, ok := u.val.(*Select); ok {
+        return selectStmt
+    }
+    return nil
 }
 func (u *sqlSymUnion) selectStmt() SelectStatement {
     if selectStmt, ok := u.val.(SelectStatement); ok {
@@ -147,6 +168,9 @@ func (u *sqlSymUnion) selExpr() SelectExpr {
 }
 func (u *sqlSymUnion) selExprs() SelectExprs {
     return u.val.(SelectExprs)
+}
+func (u *sqlSymUnion) retExprs() ReturningExprs {
+    return ReturningExprs(u.val.(SelectExprs))
 }
 func (u *sqlSymUnion) aliasClause() AliasClause {
     return u.val.(AliasClause)
@@ -229,6 +253,10 @@ func (u *sqlSymUnion) idxElem() IndexElem {
 func (u *sqlSymUnion) idxElems() IndexElemList {
     return u.val.(IndexElemList)
 }
+func (u *sqlSymUnion) dropBehavior() DropBehavior {
+    return u.val.(DropBehavior)
+}
+
 %}
 
 %union {
@@ -255,19 +283,22 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 %type <Statement> grant_stmt
 %type <Statement> insert_stmt
 %type <Statement> preparable_stmt
+%type <Statement> release_stmt
 %type <Statement> rename_stmt
 %type <Statement> revoke_stmt
-%type <SelectStatement> select_stmt
+%type <*Select> select_stmt
+%type <Statement> savepoint_stmt
 %type <Statement> set_stmt
 %type <Statement> show_stmt
 %type <Statement> transaction_stmt
 %type <Statement> truncate_stmt
 %type <Statement> update_stmt
 
-%type <SelectStatement> select_no_parens select_with_parens select_clause
-%type <SelectStatement> simple_select values_clause
+%type <*Select> select_no_parens
+%type <SelectStatement> select_clause select_with_parens simple_select values_clause
 
-%type <empty> alter_column_default alter_using
+%type <empty> alter_using
+%type <Expr> alter_column_default
 %type <Direction> opt_asc_desc
 
 %type <AlterTableCmd> alter_table_cmd
@@ -275,12 +306,13 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 
 %type <empty> opt_collate_clause
 
-%type <empty> opt_drop_behavior
+%type <DropBehavior> opt_drop_behavior
 
 %type <IsolationLevel> transaction_iso_level
 %type <UserPriority>  transaction_user_priority
 
-%type <str>   name opt_name
+%type <str>   name opt_name opt_to_savepoint
+%type <str>   savepoint_name
 
 // %type <empty> subquery_op
 %type <*QualifiedName> func_name
@@ -289,6 +321,9 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 %type <*QualifiedName> qualified_name
 %type <*QualifiedName> indirect_name_or_glob
 %type <*QualifiedName> insert_target
+
+%type <*TableNameWithIndex> table_name_with_index
+%type <TableNameWithIndexList> table_name_with_index_list
 
 // %type <empty> math_op
 
@@ -312,7 +347,7 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 %type <QualifiedNames> any_name_list
 %type <Exprs> expr_list
 %type <Indirection> attrs
-%type <SelectExprs> target_list opt_target_list
+%type <SelectExprs> target_list
 %type <UpdateExprs> set_clause_list
 %type <*UpdateExpr> set_clause multiple_set_clause
 %type <Indirection> indirection
@@ -320,7 +355,7 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 %type <GroupBy> group_clause
 %type <*Limit> select_limit
 %type <QualifiedNames> relation_expr_list
-%type <SelectExprs> returning_clause
+%type <ReturningExprs> returning_clause
 
 %type <bool> all_or_distinct
 %type <empty> join_outer
@@ -358,6 +393,9 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 %type <IndirectionElem> glob_indirection
 %type <IndirectionElem> name_indirection
 %type <IndirectionElem> indirection_elem
+%type <*IndexHints> opt_index_hints
+%type <*IndexHints> index_hints_param
+%type <*IndexHints> index_hints_param_list
 %type <Expr>  a_expr b_expr c_expr a_expr_const
 %type <Expr>  substr_from substr_for
 %type <Expr>  in_expr
@@ -462,7 +500,7 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 %token <str>   BLOB BOOL BOOLEAN BOTH BY BYTEA BYTES
 
 %token <str>   CASCADE CASE CAST CHAR
-%token <str>   CHARACTER CHECK
+%token <str>   CHARACTER CHARACTERISTICS CHECK
 %token <str>   COALESCE COLLATE COLLATION COLUMN COLUMNS COMMIT
 %token <str>   COMMITTED CONCAT CONFLICT CONSTRAINT
 %token <str>   COVERING CREATE
@@ -478,20 +516,20 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 %token <str>   EXISTS EXPLAIN EXTRACT
 
 %token <str>   FALSE FETCH FILTER FIRST FLOAT FOLLOWING FOR
-%token <str>   FOREIGN FROM FULL
+%token <str>   FORCE_INDEX FOREIGN FROM FULL
 
 %token <str>   GRANT GRANTS GREATEST GROUP GROUPING
 
 %token <str>   HAVING HIGH HOUR
 
 %token <str>   IF IFNULL IN
-%token <str>   INDEX INITIALLY
+%token <str>   INDEX INDEXES INITIALLY
 %token <str>   INNER INSERT INT INT64 INTEGER
 %token <str>   INTERSECT INTERVAL INTO IS ISOLATION
 
 %token <str>   JOIN
 
-%token <str>   KEY
+%token <str>   KEY KEYS
 
 %token <str>   LATERAL
 %token <str>   LEADING LEAST LEFT LEVEL LIKE LIMIT LOCAL
@@ -499,7 +537,7 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 
 %token <str>   MATCH MINUTE MONTH
 
-%token <str>   NAME NAMES NATURAL NEXT NO NORMAL
+%token <str>   NAME NAMES NATURAL NEXT NO NO_INDEX_JOIN NORMAL
 %token <str>   NOT NOTHING NULL NULLIF
 %token <str>   NULLS NUMERIC
 
@@ -511,17 +549,17 @@ func (u *sqlSymUnion) idxElems() IndexElemList {
 
 %token <str>   RANGE READ REAL RECURSIVE REF REFERENCES
 %token <str>   RENAME REPEATABLE
-%token <str>   RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLLUP
+%token <str>   RELEASE RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLLUP
 %token <str>   ROW ROWS RSHIFT
 
-%token <str>   SEARCH SECOND SELECT
+%token <str>   SAVEPOINT SEARCH SECOND SELECT
 %token <str>   SERIALIZABLE SESSION SESSION_USER SET SHOW
 %token <str>   SIMILAR SIMPLE SMALLINT SNAPSHOT SOME SQL
 %token <str>   START STRICT STRING STORING SUBSTRING
 %token <str>   SYMMETRIC
 
 %token <str>   TABLE TABLES TEXT THEN
-%token <str>   TIME TIMESTAMP TO TRAILING TRANSACTION TREAT TRIM TRUE
+%token <str>   TIME TIMESTAMP TIMESTAMPTZ TO TRAILING TRANSACTION TREAT TRIM TRUE
 %token <str>   TRUNCATE TYPE
 
 %token <str>   UNBOUNDED UNCOMMITTED UNION UNIQUE UNKNOWN
@@ -640,13 +678,15 @@ stmt:
 | insert_stmt
 | rename_stmt
 | revoke_stmt
+| savepoint_stmt
 | select_stmt
   {
-    $$.val = $1.selectStmt()
+    $$.val = $1.slct()
   }
 | set_stmt
 | show_stmt
 | transaction_stmt
+| release_stmt
 | truncate_stmt
 | update_stmt
 | /* EMPTY */
@@ -696,9 +736,15 @@ alter_table_cmd:
     $$.val = &AlterTableAddColumn{columnKeyword: true, IfNotExists: true, ColumnDef: $6.colDef()}
   }
   // ALTER TABLE <name> ALTER [COLUMN] <colname> {SET DEFAULT <expr>|DROP DEFAULT}
-| ALTER opt_column name alter_column_default { unimplemented() }
+| ALTER opt_column name alter_column_default
+  {
+    $$.val = &AlterTableSetDefault{columnKeyword: $2.bool(), Column: $3, Default: $4.expr()}
+  }
   // ALTER TABLE <name> ALTER [COLUMN] <colname> DROP NOT NULL
-| ALTER opt_column name DROP NOT NULL { unimplemented() }
+| ALTER opt_column name DROP NOT NULL
+  {
+    $$.val = &AlterTableDropNotNull{columnKeyword: $2.bool(), Column: $3}
+  }
   // ALTER TABLE <name> ALTER [COLUMN] <colname> SET NOT NULL
 | ALTER opt_column name SET NOT NULL { unimplemented() }
   // ALTER TABLE <name> DROP [COLUMN] IF EXISTS <colname> [RESTRICT|CASCADE]
@@ -709,7 +755,12 @@ alter_table_cmd:
   // ALTER TABLE <name> DROP [COLUMN] <colname> [RESTRICT|CASCADE]
 | DROP opt_column name opt_drop_behavior
   {
-    $$.val = &AlterTableDropColumn{columnKeyword: $2.bool(), IfExists: false, Column: $3}
+    $$.val = &AlterTableDropColumn{
+      columnKeyword: $2.bool(),
+      IfExists: false,
+      Column: $3,
+      DropBehavior: $4.dropBehavior(),
+    }
   }
   // ALTER TABLE <name> ALTER [COLUMN] <colname> [SET DATA] TYPE <typename>
   //     [ USING <expression> ]
@@ -726,22 +777,45 @@ alter_table_cmd:
   // ALTER TABLE <name> DROP CONSTRAINT IF EXISTS <name> [RESTRICT|CASCADE]
 | DROP CONSTRAINT IF EXISTS name opt_drop_behavior
   {
-    $$.val = &AlterTableDropConstraint{IfExists: true, Constraint: $5}
+    $$.val = &AlterTableDropConstraint{
+      IfExists: true,
+      Constraint: $5,
+      DropBehavior: $6.dropBehavior(),
+    }
   }
   // ALTER TABLE <name> DROP CONSTRAINT <name> [RESTRICT|CASCADE]
 | DROP CONSTRAINT name opt_drop_behavior
   {
-    $$.val = &AlterTableDropConstraint{IfExists: false, Constraint: $3}
+    $$.val = &AlterTableDropConstraint{
+      IfExists: false,
+      Constraint: $3,
+      DropBehavior: $4.dropBehavior(),
+    }
   }
 
 alter_column_default:
-  SET DEFAULT a_expr { unimplemented() }
-| DROP DEFAULT { unimplemented() }
+  SET DEFAULT a_expr
+  {
+    $$.val = $3.expr()
+  }
+| DROP DEFAULT
+  {
+    $$.val = nil
+  }
 
 opt_drop_behavior:
-  CASCADE { unimplemented() }
-| RESTRICT { unimplemented() }
-| /* EMPTY */ {}
+  CASCADE
+  {
+    $$.val = DropCascade
+  }
+| RESTRICT
+  {
+    $$.val = DropRestrict
+  }
+| /* EMPTY */
+  {
+    $$.val = DropDefault
+  }
 
 opt_collate_clause:
   COLLATE any_name { unimplemented() }
@@ -759,9 +833,9 @@ create_stmt:
 
 // DELETE FROM query
 delete_stmt:
-  opt_with_clause DELETE FROM relation_expr_opt_alias where_clause
+  opt_with_clause DELETE FROM relation_expr_opt_alias where_clause returning_clause
   {
-    $$.val = &Delete{Table: $4.tblExpr(), Where: newWhere(astWhere, $5.expr())}
+    $$.val = &Delete{Table: $4.tblExpr(), Where: newWhere(astWhere, $5.expr()), Returning: $6.retExprs()}
   }
 
 // DROP itemtype [ IF EXISTS ] itemname [, itemname ...] [ RESTRICT | CASCADE ]
@@ -774,13 +848,21 @@ drop_stmt:
   {
     $$.val = &DropDatabase{Name: Name($5), IfExists: true}
   }
-| DROP INDEX qualified_name_list opt_drop_behavior
+| DROP INDEX table_name_with_index_list opt_drop_behavior
   {
-    $$.val = &DropIndex{Names: $3.qnames(), IfExists: false}
+    $$.val = &DropIndex{
+      IndexList: $3.tableWithIdxList(),
+      IfExists: false,
+      DropBehavior: $4.dropBehavior(),
+    }
   }
-| DROP INDEX IF EXISTS qualified_name_list opt_drop_behavior
+| DROP INDEX IF EXISTS table_name_with_index_list opt_drop_behavior
   {
-    $$.val = &DropIndex{Names: $5.qnames(), IfExists: true}
+    $$.val = &DropIndex{
+      IndexList: $5.tableWithIdxList(),
+      IfExists: true,
+      DropBehavior: $6.dropBehavior(),
+    }
   }
 | DROP TABLE any_name_list
   {
@@ -835,7 +917,7 @@ explain_stmt:
 explainable_stmt:
   select_stmt
   {
-    $$.val = $1.selectStmt()
+    $$.val = $1.slct()
   }
 | insert_stmt
 | update_stmt
@@ -954,6 +1036,10 @@ set_stmt:
 | SET LOCAL set_rest
   {
     $$.val = $3.stmt()
+  }
+| SET SESSION CHARACTERISTICS AS TRANSACTION transaction_iso_level
+  {
+    $$.val = &SetDefaultIsolation{Isolation: $6.isoLevel()}
   }
 | SET SESSION set_rest
   {
@@ -1174,6 +1260,14 @@ show_stmt:
   {
     $$.val = &ShowIndex{Table: $4.qname()}
   }
+| SHOW INDEXES FROM var_name
+  {
+    $$.val = &ShowIndex{Table: $4.qname()}
+  }
+| SHOW KEYS FROM var_name
+  {
+    $$.val = &ShowIndex{Table: $4.qname()}
+  }
 | SHOW TABLES opt_from_var_name_clause
   {
     $$.val = &ShowTables{Name: $3.qname()}
@@ -1318,7 +1412,10 @@ col_qualification_elem:
   {
     $$.val = PrimaryKeyConstraint{}
   }
-| CHECK '(' a_expr ')' { unimplemented() }
+| CHECK '(' a_expr ')'
+  {
+    $$.val = &ColumnCheckConstraint{Expr: $3.expr()}
+  }
 | DEFAULT b_expr
   {
     if ContainsVars($2.expr()) {
@@ -1471,7 +1568,7 @@ numeric_only:
 truncate_stmt:
   TRUNCATE opt_table relation_expr_list opt_drop_behavior
   {
-    $$.val = &Truncate{Tables: $3.qnames()}
+    $$.val = &Truncate{Tables: $3.qnames(), DropBehavior: $4.dropBehavior()}
   }
 
 // CREATE INDEX
@@ -1561,13 +1658,13 @@ rename_stmt:
   {
     $$.val = &RenameTable{Name: $5.qname(), NewName: $8.qname(), IfExists: true}
   }
-| ALTER INDEX qualified_name RENAME TO name
+| ALTER INDEX table_name_with_index RENAME TO name
   {
-    $$.val = &RenameIndex{Name: $3.qname(), NewName: Name($6), IfExists: false}
+    $$.val = &RenameIndex{Index: $3.tableWithIdx(), NewName: Name($6), IfExists: false}
   }
-| ALTER INDEX IF EXISTS qualified_name RENAME TO name
+| ALTER INDEX IF EXISTS table_name_with_index RENAME TO name
   {
-    $$.val = &RenameIndex{Name: $5.qname(), NewName: Name($8), IfExists: true}
+    $$.val = &RenameIndex{Index: $5.tableWithIdx(), NewName: Name($8), IfExists: true}
   }
 | ALTER TABLE relation_expr RENAME opt_column name TO name
   {
@@ -1600,6 +1697,18 @@ opt_set_data:
   SET DATA {}
 | /* EMPTY */ {}
 
+release_stmt:
+ RELEASE savepoint_name
+ {
+  $$.val = &ReleaseSavepoint{Savepoint: $2}
+ }
+
+savepoint_stmt:
+ SAVEPOINT savepoint_name
+ {
+  $$.val = &Savepoint{Name: $2}
+ }
+
 // BEGIN / START / COMMIT / END / ROLLBACK / ...
 transaction_stmt:
   BEGIN opt_transaction opt_transaction_mode_list
@@ -1618,14 +1727,46 @@ transaction_stmt:
   {
     $$.val = &CommitTransaction{}
   }
-| ROLLBACK opt_transaction
+| ROLLBACK opt_to_savepoint
   {
-    $$.val = &RollbackTransaction{}
+    if $2 != "" {
+      $$.val = &RollbackToSavepoint{Savepoint: $2}
+    } else {
+      $$.val = &RollbackTransaction{}
+    }
   }
 
 opt_transaction:
   TRANSACTION {}
 | /* EMPTY */ {}
+
+opt_to_savepoint:
+  TRANSACTION
+  {
+    $$ = ""
+  }
+| TRANSACTION TO savepoint_name
+  {
+    $$ = $3
+  }
+| TO savepoint_name
+  {
+    $$ = $2
+  }
+| /* EMPTY */
+  {
+    $$ = ""
+  }
+
+savepoint_name:
+  SAVEPOINT name
+  {
+    $$ = $2
+  }
+| name
+  {
+    $$ = $1
+  }
 
 opt_transaction_mode_list:
   transaction_iso_level
@@ -1670,7 +1811,7 @@ insert_stmt:
   {
     $$.val = $5.stmt()
     $$.val.(*Insert).Table = $4.qname()
-    $$.val.(*Insert).Returning = $7.selExprs()
+    $$.val.(*Insert).Returning = $7.retExprs()
   }
 
 // Can't easily make AS optional here, because VALUES in insert_rest would have
@@ -1685,15 +1826,15 @@ insert_target:
 insert_rest:
   select_stmt
   {
-    $$.val = &Insert{Rows: $1.selectStmt()}
+    $$.val = &Insert{Rows: $1.slct()}
   }
 | '(' qualified_name_list ')' select_stmt
   {
-    $$.val = &Insert{Columns: $2.qnames(), Rows: $4.selectStmt()}
+    $$.val = &Insert{Columns: $2.qnames(), Rows: $4.slct()}
   }
 | DEFAULT VALUES
   {
-    $$.val = &Insert{}
+    $$.val = &Insert{Rows: &Select{}}
   }
 
 // TODO(andrei): If this is ever supported, `opt_conf_expr` needs to use something different
@@ -1720,9 +1861,9 @@ returning_clause:
 
 update_stmt:
   opt_with_clause UPDATE relation_expr_opt_alias
-    SET set_clause_list from_clause where_clause
+    SET set_clause_list from_clause where_clause returning_clause
   {
-    $$.val = &Update{Table: $3.tblExpr(), Exprs: $5.updateExprs(), Where: newWhere(astWhere, $7.expr())}
+    $$.val = &Update{Table: $3.tblExpr(), Exprs: $5.updateExprs(), Where: newWhere(astWhere, $7.expr()), Returning: $8.retExprs()}
   }
 
 set_clause_list:
@@ -1754,7 +1895,7 @@ single_set_clause:
 multiple_set_clause:
   '(' qualified_name_list ')' '=' ctext_row
   {
-    $$.val = &UpdateExpr{Tuple: true, Names: $2.qnames(), Expr: Tuple($5.exprs())}
+    $$.val = &UpdateExpr{Tuple: true, Names: $2.qnames(), Expr: &Tuple{$5.exprs()}}
   }
 | '(' qualified_name_list ')' '=' select_with_parens
   {
@@ -1801,15 +1942,18 @@ multiple_set_clause:
 select_stmt:
   select_no_parens %prec UMINUS
 | select_with_parens %prec UMINUS
+  {
+    $$.val = &Select{Select: $1.selectStmt()}
+  }
 
 select_with_parens:
   '(' select_no_parens ')'
   {
-    $$.val = &ParenSelect{Select: $2.selectStmt()}
+    $$.val = &ParenSelect{Select: $2.slct()}
   }
 | '(' select_with_parens ')'
   {
-    $$.val = &ParenSelect{Select: $2.selectStmt()}
+    $$.val = &ParenSelect{Select: &Select{Select: $2.selectStmt()}}
   }
 
 // This rule parses the equivalent of the standard's <query expression>. The
@@ -1823,39 +1967,28 @@ select_with_parens:
 //      - 2002-08-28 bjm
 select_no_parens:
   simple_select
+  {
+    $$.val = &Select{Select: $1.selectStmt()}
+  }
 | select_clause sort_clause
   {
-    $$.val = $1.selectStmt()
-    if s, ok := $$.val.(*Select); ok {
-      s.OrderBy = $2.orderBy()
-    }
+    $$.val = &Select{Select: $1.selectStmt(), OrderBy: $2.orderBy()}
   }
 | select_clause opt_sort_clause select_limit
   {
-    $$.val = $1.selectStmt()
-    if s, ok := $$.val.(*Select); ok {
-      s.OrderBy = $2.orderBy()
-      s.Limit = $3.limit()
-    }
+    $$.val = &Select{Select: $1.selectStmt(), OrderBy: $2.orderBy(), Limit: $3.limit()}
   }
 | with_clause select_clause
   {
-    $$.val = $2.selectStmt()
+    $$.val = &Select{Select: $2.selectStmt()}
   }
 | with_clause select_clause sort_clause
   {
-    $$.val = $2.selectStmt()
-    if s, ok := $$.val.(*Select); ok {
-      s.OrderBy = $3.orderBy()
-    }
+    $$.val = &Select{Select: $2.selectStmt(), OrderBy: $3.orderBy()}
   }
 | with_clause select_clause opt_sort_clause select_limit
   {
-    $$.val = $2.selectStmt()
-    if s, ok := $$.val.(*Select); ok {
-      s.OrderBy = $3.orderBy()
-      s.Limit = $4.limit()
-    }
+    $$.val = &Select{Select: $2.selectStmt(), OrderBy: $3.orderBy(), Limit: $4.limit()}
   }
 
 select_clause:
@@ -1885,11 +2018,11 @@ select_clause:
 // NOTE: only the leftmost component select_stmt should have INTO. However,
 // this is not checked by the grammar; parse analysis must check it.
 simple_select:
-  SELECT opt_all_clause opt_target_list
+  SELECT opt_all_clause target_list
     from_clause where_clause
     group_clause having_clause window_clause
   {
-    $$.val = &Select{
+    $$.val = &SelectClause{
       Exprs:   $3.selExprs(),
       From:    $4.tblExprs(),
       Where:   newWhere(astWhere, $5.expr()),
@@ -1901,7 +2034,7 @@ simple_select:
     from_clause where_clause
     group_clause having_clause window_clause
   {
-    $$.val = &Select{
+    $$.val = &SelectClause{
       Distinct: $2.bool(),
       Exprs:    $3.selExprs(),
       From:     $4.tblExprs(),
@@ -1913,7 +2046,7 @@ simple_select:
 | values_clause
 | TABLE relation_expr
   {
-    $$.val = &Select{
+    $$.val = &SelectClause{
       Exprs:       SelectExprs{starSelectExpr()},
       From:        TableExprs{&AliasedTableExpr{Expr: $2.qname()}},
       tableSelect: true,
@@ -1921,28 +2054,28 @@ simple_select:
   }
 | select_clause UNION all_or_distinct select_clause
   {
-    $$.val = &Union{
-      Type:  astUnion,
-      Left:  $1.selectStmt(),
-      Right: $4.selectStmt(),
+    $$.val = &UnionClause{
+      Type:  UnionOp,
+      Left:  &Select{Select: $1.selectStmt()},
+      Right: &Select{Select: $4.selectStmt()},
       All:   $3.bool(),
     }
   }
 | select_clause INTERSECT all_or_distinct select_clause
   {
-    $$.val = &Union{
-      Type:  astIntersect,
-      Left:  $1.selectStmt(),
-      Right: $4.selectStmt(),
+    $$.val = &UnionClause{
+      Type:  IntersectOp,
+      Left:  &Select{Select: $1.selectStmt()},
+      Right: &Select{Select: $4.selectStmt()},
       All:   $3.bool(),
     }
   }
 | select_clause EXCEPT all_or_distinct select_clause
   {
-    $$.val = &Union{
-      Type:  astExcept,
-      Left:  $1.selectStmt(),
-      Right: $4.selectStmt(),
+    $$.val = &UnionClause{
+      Type:  ExceptOp,
+      Left:  &Select{Select: $1.selectStmt()},
+      Right: &Select{Select: $4.selectStmt()},
       All:   $3.bool(),
     }
   }
@@ -1970,7 +2103,7 @@ common_table_expr:
 preparable_stmt:
   select_stmt
   {
-    $$.val = $1.selectStmt()
+    $$.val = $1.slct()
   }
 | insert_stmt
 | update_stmt
@@ -2153,11 +2286,13 @@ having_clause:
 values_clause:
   VALUES ctext_row
   {
-    $$.val = Values{Tuple($2.exprs())}
+    $$.val = &ValuesClause{[]*Tuple{{$2.exprs()}}}
   }
 | values_clause ',' ctext_row
   {
-    $$.val = append($1.selectStmt().(Values), Tuple($3.exprs()))
+    valNode := $1.selectStmt().(*ValuesClause)
+    valNode.Tuples = append(valNode.Tuples, &Tuple{$3.exprs()})
+    $$.val = valNode
   }
 
 // clauses common to all optimizable statements:
@@ -2184,11 +2319,61 @@ from_list:
     $$.val = append($1.tblExprs(), $3.tblExpr())
   }
 
+index_hints_param:
+  FORCE_INDEX '=' col_label
+  {
+     $$.val = &IndexHints{Index: Name($3)}
+  }
+|
+  NO_INDEX_JOIN
+  {
+     $$.val = &IndexHints{NoIndexJoin: true}
+  }
+
+index_hints_param_list:
+  index_hints_param
+  {
+    $$.val = $1.indexHints()
+  }
+|
+  index_hints_param_list ',' index_hints_param
+  {
+    a := $1.indexHints()
+    b := $3.indexHints()
+    index := a.Index
+    if index == "" {
+       index = b.Index
+    } else if b.Index != "" {
+       sqllex.Error("FORCE_INDEX specified multiple times")
+       return 1
+    }
+    if a.NoIndexJoin && b.NoIndexJoin {
+       sqllex.Error("NO_INDEX_JOIN specified multiple times")
+       return 1
+    }
+    noIndexJoin := a.NoIndexJoin || b.NoIndexJoin
+    $$.val = &IndexHints{Index: index, NoIndexJoin: noIndexJoin}
+  }
+
+opt_index_hints:
+  '@' col_label
+  {
+    $$.val = &IndexHints{Index: Name($2)}
+  }
+| '@' '{' index_hints_param_list '}'
+  {
+    $$.val = $3.indexHints()
+  }
+| /* EMPTY */
+  {
+    $$.val = (*IndexHints)(nil)
+  }
+
 // table_ref is where an alias clause can be attached.
 table_ref:
-  relation_expr opt_alias_clause
+  relation_expr opt_index_hints opt_alias_clause
   {
-    $$.val = &AliasedTableExpr{Expr: $1.qname(), As: $2.aliasClause()}
+    $$.val = &AliasedTableExpr{Expr: $1.qname(), Hints: $2.indexHints(), As: $3.aliasClause()}
   }
 | select_with_parens opt_alias_clause
   {
@@ -2404,10 +2589,6 @@ simple_typename:
   {
     $$.val = &StringType{Name: "TEXT"}
   }
-| STRING
-  {
-    $$.val = &StringType{Name: "STRING"}
-  }
 
 // We have a separate const_typename to allow defaulting fixed-length types
 // such as CHAR() and BIT() to an unspecified length. SQL9x requires that these
@@ -2566,6 +2747,10 @@ character_base:
   {
     $$.val = &StringType{Name: "VARCHAR"}
   }
+| STRING
+  {
+    $$.val = &StringType{Name: "STRING"}
+  }
 
 opt_varying:
   VARYING {}
@@ -2580,6 +2765,10 @@ const_datetime:
 | TIMESTAMP
   {
     $$.val = &TimestampType{}
+  }
+| TIMESTAMPTZ
+  {
+    $$.val = &TimestampType{withZone: true}
   }
 
 const_interval:
@@ -3213,31 +3402,31 @@ frame_bound:
 row:
   ROW '(' expr_list ')'
   {
-    $$.val = Row($3.exprs())
+    $$.val = &Row{$3.exprs()}
   }
 | ROW '(' ')'
   {
-    $$.val = Row(nil)
+    $$.val = &Row{nil}
   }
 | '(' expr_list ',' a_expr ')'
   {
-    $$.val = Tuple(append($2.exprs(), $4.expr()))
+    $$.val = &Tuple{append($2.exprs(), $4.expr())}
   }
 
 explicit_row:
   ROW '(' expr_list ')'
   {
-    $$.val = Row($3.exprs())
+    $$.val = &Row{$3.exprs()}
   }
 | ROW '(' ')'
   {
-    $$.val = Row(nil)
+    $$.val = &Row{nil}
   }
 
 implicit_row:
   '(' expr_list ',' a_expr ')'
   {
-    $$.val = Tuple(append($2.exprs(), $4.expr()))
+    $$.val = &Tuple{append($2.exprs(), $4.expr())}
   }
 
 // sub_type:
@@ -3298,15 +3487,15 @@ type_list:
 array_expr:
   '[' expr_list ']'
   {
-    $$.val = Array($2.exprs())
+    $$.val = &Array{$2.exprs()}
   }
 | '[' array_expr_list ']'
   {
-    $$.val = Array($2.exprs())
+    $$.val = &Array{$2.exprs()}
   }
 | '[' ']'
   {
-    $$.val = Array(nil)
+    $$.val = &Array{nil}
   }
 
 array_expr_list:
@@ -3438,7 +3627,7 @@ in_expr:
   }
 | '(' expr_list ')'
   {
-    $$.val = Tuple($2.exprs())
+    $$.val = &Tuple{$2.exprs()}
   }
 
 // Define SQL-style CASE clause.
@@ -3494,10 +3683,6 @@ indirection_elem:
 | glob_indirection
   {
     $$.val = $1.indirectElem()
-  }
-| '@' col_label
-  {
-    $$.val = IndexIndirection($2)
   }
 | '[' a_expr ']'
   {
@@ -3564,14 +3749,6 @@ ctext_row:
     $$.val = $2.exprs()
   }
 
-// target list for SELECT
-opt_target_list:
-  target_list
-| /* EMPTY */
-  {
-    $$.val = SelectExprs(nil)
-  }
-
 target_list:
   target_elem
   {
@@ -3617,6 +3794,16 @@ qualified_name_list:
     $$.val = append($1.qnames(), $3.qname())
   }
 
+table_name_with_index_list:
+  table_name_with_index
+  {
+    $$.val = TableNameWithIndexList{$1.tableWithIdx()}
+  }
+| table_name_with_index_list ',' table_name_with_index
+  {
+    $$.val = append($1.tableWithIdxList(), $3.tableWithIdx())
+  }
+
 indirect_name_or_glob_list:
   indirect_name_or_glob
   {
@@ -3640,6 +3827,12 @@ qualified_name:
 | name indirection
   {
     $$.val = &QualifiedName{Base: Name($1), Indirect: $2.indirect()}
+  }
+
+table_name_with_index:
+  qualified_name '@' name
+  {
+    $$.val = &TableNameWithIndex{Table: $1.qname(), Index: Name($3)}
   }
 
 // indirect_name_or_glob is a subset of `qualified_name` accepting only:
@@ -3837,12 +4030,15 @@ unreserved_keyword:
 | FILTER
 | FIRST
 | FOLLOWING
+| FORCE_INDEX
 | GRANTS
 | HIGH
 | HOUR
+| INDEXES
 | INSERT
 | ISOLATION
 | KEY
+| KEYS
 | LEVEL
 | LOCAL
 | LOW
@@ -3855,6 +4051,7 @@ unreserved_keyword:
 | NO
 | NORMAL
 | NOTHING
+| NO_INDEX_JOIN
 | NULLS
 | OF
 | OFF
@@ -3868,6 +4065,7 @@ unreserved_keyword:
 | READ
 | RECURSIVE
 | REF
+| RELEASE
 | RENAME
 | REPEATABLE
 | RESTRICT
@@ -3875,6 +4073,7 @@ unreserved_keyword:
 | ROLLBACK
 | ROLLUP
 | ROWS
+| SAVEPOINT
 | SEARCH
 | SECOND
 | SERIALIZABLE
@@ -3924,6 +4123,7 @@ col_name_keyword:
 | BYTES
 | CHAR
 | CHARACTER
+| CHARACTERISTICS
 | COALESCE
 | DATE
 | DEC
@@ -3953,6 +4153,7 @@ col_name_keyword:
 | SUBSTRING
 | TIME
 | TIMESTAMP
+| TIMESTAMPTZ
 | TREAT
 | TRIM
 | VALUES

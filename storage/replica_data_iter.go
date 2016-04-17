@@ -40,7 +40,18 @@ type replicaDataIterator struct {
 	engine.Iterator
 }
 
-func makeReplicaKeyRanges(d *roachpb.RangeDescriptor) []keyRange {
+// makeAllKeyRanges returns all key ranges for the given Range.
+func makeAllKeyRanges(d *roachpb.RangeDescriptor) []keyRange {
+	return makeReplicaKeyRanges(d, keys.MakeRangeIDPrefix)
+}
+
+// makeReplicatedKeyRanges returns all key ranges that are fully Raft replicated
+// for the given Range.
+func makeReplicatedKeyRanges(d *roachpb.RangeDescriptor) []keyRange {
+	return makeReplicaKeyRanges(d, keys.MakeRangeIDReplicatedPrefix)
+}
+
+func makeReplicaKeyRanges(d *roachpb.RangeDescriptor, metaFunc func(roachpb.RangeID) roachpb.Key) []keyRange {
 	// The first range in the keyspace starts at KeyMin, which includes the
 	// node-local space. We need the original StartKey to find the range
 	// metadata, but the actual data starts at LocalMax.
@@ -48,10 +59,11 @@ func makeReplicaKeyRanges(d *roachpb.RangeDescriptor) []keyRange {
 	if d.StartKey.Equal(roachpb.RKeyMin) {
 		dataStartKey = keys.LocalMax
 	}
+	sysRangeIDKey := metaFunc(d.RangeID)
 	return []keyRange{
 		{
-			start: engine.MakeMVCCMetadataKey(keys.MakeRangeIDPrefix(d.RangeID)),
-			end:   engine.MakeMVCCMetadataKey(keys.MakeRangeIDPrefix(d.RangeID + 1)),
+			start: engine.MakeMVCCMetadataKey(sysRangeIDKey),
+			end:   engine.MakeMVCCMetadataKey(sysRangeIDKey.PrefixEnd()),
 		},
 		{
 			start: engine.MakeMVCCMetadataKey(keys.MakeRangeKeyPrefix(d.StartKey)),
@@ -64,9 +76,13 @@ func makeReplicaKeyRanges(d *roachpb.RangeDescriptor) []keyRange {
 	}
 }
 
-func newReplicaDataIterator(d *roachpb.RangeDescriptor, e engine.Engine) *replicaDataIterator {
+func newReplicaDataIterator(d *roachpb.RangeDescriptor, e engine.Engine, replicatedOnly bool) *replicaDataIterator {
+	rangeFunc := makeAllKeyRanges
+	if replicatedOnly {
+		rangeFunc = makeReplicatedKeyRanges
+	}
 	ri := &replicaDataIterator{
-		ranges:   makeReplicaKeyRanges(d),
+		ranges:   rangeFunc(d),
 		Iterator: e.NewIterator(nil),
 	}
 	ri.Seek(ri.ranges[ri.curIndex].start)
@@ -118,3 +134,10 @@ func (ri *replicaDataIterator) SeekReverse(key []byte) {
 func (ri *replicaDataIterator) Prev() {
 	panic("cannot reverse scan replicaDataIterator")
 }
+
+// replicaDataIterator.{SeekReverse,Prev} are not intended for use and are not
+// currently referenced in code or tests. They existed to prohibit accidentally
+// calling the same methods on replicaDataIterator.Iterator. Silence unused
+// warnings.
+var _ = (*replicaDataIterator).SeekReverse
+var _ = (*replicaDataIterator).Prev

@@ -18,8 +18,10 @@ package sql
 
 import (
 	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/security"
+	"github.com/cockroachdb/cockroach/sql/parser"
 )
 
 // InternalExecutor can be used internally by cockroach to execute SQL
@@ -32,7 +34,35 @@ type InternalExecutor struct {
 
 // ExecuteStatementInTransaction executes the supplied SQL statement as part of
 // the supplied transaction. Statements are currently executed as the root user.
-func (ie InternalExecutor) ExecuteStatementInTransaction(txn *client.Txn, statement string, params ...interface{}) (int, *roachpb.Error) {
-	p := planner{txn: txn, user: security.RootUser, leaseMgr: ie.LeaseManager}
+func (ie InternalExecutor) ExecuteStatementInTransaction(
+	txn *client.Txn, statement string, params ...interface{},
+) (int, *roachpb.Error) {
+	p := makePlanner()
+	p.setTxn(txn)
+	p.session.User = security.RootUser
+	p.leaseMgr = ie.LeaseManager
 	return p.exec(statement, params...)
+}
+
+// GetTableSpan gets the key span for a SQL table, including any indices.
+func (ie InternalExecutor) GetTableSpan(user string, txn *client.Txn, dbName, tableName string) (roachpb.Span, *roachpb.Error) {
+	// Lookup the table ID.
+	p := makePlanner()
+	p.setTxn(txn)
+	p.session.User = user
+	p.leaseMgr = ie.LeaseManager
+	qname := &parser.QualifiedName{Base: parser.Name(tableName)}
+	if err := qname.NormalizeTableName(dbName); err != nil {
+		return roachpb.Span{}, roachpb.NewError(err)
+	}
+	tableID, pErr := p.getTableID(qname)
+	if pErr != nil {
+		return roachpb.Span{}, pErr
+	}
+
+	// Determine table data span.
+	tablePrefix := keys.MakeTablePrefix(uint32(tableID))
+	tableStartKey := roachpb.Key(tablePrefix)
+	tableEndKey := tableStartKey.PrefixEnd()
+	return roachpb.Span{Key: tableStartKey, EndKey: tableEndKey}, nil
 }

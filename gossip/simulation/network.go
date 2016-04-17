@@ -30,8 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/encoding"
-	"github.com/cockroachdb/cockroach/util/grpcutil"
-	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
@@ -56,15 +54,13 @@ type Network struct {
 
 // NewNetwork creates nodeCount gossip nodes.
 func NewNetwork(nodeCount int) *Network {
-	clock := hlc.NewClock(hlc.UnixNano)
-
 	log.Infof("simulating gossip network with %d nodes", nodeCount)
 
 	n := &Network{
 		Nodes:   []*Node{},
 		Stopper: stop.NewStopper(),
 	}
-	n.rpcContext = rpc.NewContext(&base.Context{Insecure: true}, clock, n.Stopper)
+	n.rpcContext = rpc.NewContext(&base.Context{Insecure: true}, nil, n.Stopper)
 	var err error
 	n.tlsConfig, err = n.rpcContext.GetServerTLSConfig()
 	if err != nil {
@@ -91,9 +87,8 @@ func NewNetwork(nodeCount int) *Network {
 
 // CreateNode creates a simulation node and starts an RPC server for it.
 func (n *Network) CreateNode() (*Node, error) {
-	server := grpc.NewServer()
-	testAddr := util.CreateTestAddr("tcp")
-	ln, err := grpcutil.ListenAndServeGRPC(n.Stopper, server, testAddr, n.tlsConfig)
+	server := rpc.NewServer(n.rpcContext)
+	ln, err := util.ListenAndServeGRPC(n.Stopper, server, util.TestAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +101,8 @@ func (n *Network) CreateNode() (*Node, error) {
 // StartNode initializes a gossip instance for the simulation node and
 // starts it.
 func (n *Network) StartNode(node *Node) error {
+	node.Gossip.Start(node.Server, node.Addr)
+	node.Gossip.EnableSimulationCycler(true)
 	n.nodeIDAllocator++
 	node.Gossip.SetNodeID(n.nodeIDAllocator)
 	if err := node.Gossip.SetNodeDescriptor(&roachpb.NodeDescriptor{
@@ -118,25 +115,12 @@ func (n *Network) StartNode(node *Node) error {
 		encoding.EncodeUint64Ascending(nil, 0), time.Hour); err != nil {
 		return err
 	}
-	node.Gossip.Start(node.Server, node.Addr)
-	node.Gossip.EnableSimulationCycler(true)
 	return nil
 }
 
-// getNodeFromAddr returns the simulation node associated with
-// provided network address, or nil if there is no such node.
-func (n *Network) getNodeFromAddr(addr string) (*Node, bool) {
-	for _, node := range n.Nodes {
-		if node.Addr.String() == addr {
-			return node, true
-		}
-	}
-	return nil, false
-}
-
-// getNodeFromID returns the simulation node associated with
+// GetNodeFromID returns the simulation node associated with
 // provided node ID, or nil if there is no such node.
-func (n *Network) getNodeFromID(nodeID roachpb.NodeID) (*Node, bool) {
+func (n *Network) GetNodeFromID(nodeID roachpb.NodeID) (*Node, bool) {
 	for _, node := range n.Nodes {
 		if node.Gossip.GetNodeID() == nodeID {
 			return node, true

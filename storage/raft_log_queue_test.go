@@ -19,7 +19,6 @@ package storage
 import (
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -30,7 +29,7 @@ import (
 // TestGetTruncatableIndexes verifies that the correctly returns when there are
 // indexes to be truncated.
 func TestGetTruncatableIndexes(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
 	if _, err := store.GetReplica(0); err == nil {
@@ -80,7 +79,7 @@ func TestGetTruncatableIndexes(t *testing.T) {
 	if truncatableIndexes == 0 {
 		t.Errorf("expected a value for truncatable index, got 0")
 	}
-	if oldestIndex <= firstIndex {
+	if oldestIndex < firstIndex {
 		t.Errorf("expected oldest index (%d) to be greater than or equal to first index (%d)", oldestIndex,
 			firstIndex)
 	}
@@ -107,7 +106,7 @@ func TestGetTruncatableIndexes(t *testing.T) {
 	// Once truncated, we should have no truncatable indexes. If this turns out
 	// to be flaky, we can remove it as the same functionality is tested in
 	// client_raft_log_queue_test.
-	util.SucceedsWithin(t, time.Second, func() error {
+	util.SucceedsSoon(t, func() error {
 		store.ForceRaftLogScanAndProcess()
 		truncatableIndexes, oldestIndex, err := getTruncatableIndexes(rngNew)
 		if err != nil {

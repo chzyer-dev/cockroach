@@ -22,10 +22,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 func newInfo(val float64) Info {
-	now := time.Now()
+	now := timeutil.Now()
 
 	v := roachpb.Value{Timestamp: roachpb.Timestamp{WallTime: now.UnixNano()}}
 	v.SetFloat(val)
@@ -38,7 +39,7 @@ func newInfo(val float64) Info {
 }
 
 func TestExpired(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	i := newInfo(float64(1))
 	if i.expired(i.Value.Timestamp.WallTime) {
@@ -50,42 +51,20 @@ func TestExpired(t *testing.T) {
 }
 
 func TestIsFresh(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	i := newInfo(float64(1))
-	i.Hops = 3
-	if !i.isFresh(nil) {
+	if !i.isFresh(i.OrigStamp - 1) {
 		t.Error("info should be fresh:", i)
 	}
-	if !i.isFresh(&Node{i.OrigStamp - 1, 2}) {
-		t.Error("info should be fresh:", i)
-	}
-	if !i.isFresh(&Node{i.OrigStamp - 1, 3}) {
-		t.Error("info should be fresh:", i)
-	}
-	if !i.isFresh(&Node{i.OrigStamp - 1, 4}) {
-		t.Error("info should be fresh:", i)
-	}
-	if i.isFresh(&Node{i.OrigStamp, 3}) {
+	if i.isFresh(i.OrigStamp) {
 		t.Error("info should not be fresh:", i)
 	}
-	if i.isFresh(&Node{i.OrigStamp, 4}) {
+	if i.isFresh(i.OrigStamp + 1) {
 		t.Error("info should not be fresh:", i)
 	}
-	if !i.isFresh(&Node{i.OrigStamp, 5}) {
-		t.Error("info should be fresh:", i)
-	}
-	if i.isFresh(&Node{i.OrigStamp, 2}) {
-		t.Error("info should not be fresh (hops + 1 will not be better):", i)
-	}
-	if i.isFresh(&Node{i.OrigStamp + 1, 3}) {
-		t.Error("info should not be fresh:", i)
-	}
-	if i.isFresh(&Node{i.OrigStamp + 1, 2}) {
-		t.Error("info should not be fresh:", i)
-	}
-	// Using node 0 will always yield fresh data.
-	if !i.isFresh(&Node{0, 0}) {
+	// Using timestamp 0 will always yield fresh data.
+	if !i.isFresh(0) {
 		t.Error("info should be fresh from node0:", i)
 	}
 }

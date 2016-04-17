@@ -19,10 +19,11 @@ package kv
 import (
 	"errors"
 	"net"
-	netrpc "net/rpc"
-	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
@@ -32,37 +33,21 @@ import (
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/retry"
 	"github.com/cockroachdb/cockroach/util/stop"
-	"github.com/gogo/protobuf/proto"
-	"github.com/opentracing/opentracing-go"
 )
 
 // newNodeTestContext returns a rpc.Context for testing.
 // It is meant to be used by nodes.
 func newNodeTestContext(clock *hlc.Clock, stopper *stop.Stopper) *rpc.Context {
-	if clock == nil {
-		clock = hlc.NewClock(hlc.UnixNano)
-	}
 	ctx := rpc.NewContext(testutils.NewNodeTestBaseContext(), clock, stopper)
 	ctx.HeartbeatInterval = 10 * time.Millisecond
 	ctx.HeartbeatTimeout = 5 * time.Second
 	return ctx
 }
 
-func newTestServer(t *testing.T, ctx *rpc.Context) (*rpc.Server, net.Listener) {
+func newTestServer(t *testing.T, ctx *rpc.Context) (*grpc.Server, net.Listener) {
 	s := rpc.NewServer(ctx)
 
-	tlsConfig, err := ctx.GetServerTLSConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// We may be called in a loop, meaning tlsConfig is may be in used by a
-	// running server during a call to `util.ListenAndServe`, which may
-	// mutate it (due to http2.ConfigureServer). Make a copy to avoid trouble.
-	tlsConfigCopy := *tlsConfig
-
-	addr := util.CreateTestAddr("tcp")
-	ln, err := util.ListenAndServe(ctx.Stopper, s, addr, &tlsConfigCopy)
+	ln, err := util.ListenAndServeGRPC(ctx.Stopper, s, util.TestAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,13 +57,7 @@ func newTestServer(t *testing.T, ctx *rpc.Context) (*rpc.Server, net.Listener) {
 
 type Node time.Duration
 
-func registerBatch(t *testing.T, s *rpc.Server, d time.Duration) {
-	if err := s.RegisterPublic("Node.Batch", Node(d).Batch, &roachpb.BatchRequest{}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (n Node) Batch(args proto.Message) (proto.Message, error) {
+func (n Node) Batch(ctx context.Context, args *roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
 	if n > 0 {
 		time.Sleep(time.Duration(n))
 	}
@@ -86,11 +65,12 @@ func (n Node) Batch(args proto.Message) (proto.Message, error) {
 }
 
 func TestInvalidAddrLength(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	// The provided replicas is nil, so its length will be always less than the
 	// specified response number
-	ret, err := send(SendOptions{}, nil, roachpb.BatchRequest{}, nil)
+	opts := SendOptions{Context: context.Background()}
+	ret, err := send(opts, nil, roachpb.BatchRequest{}, nil)
 
 	// the expected return is nil and SendError
 	if _, ok := err.(*roachpb.SendError); !ok || ret != nil {
@@ -101,19 +81,20 @@ func TestInvalidAddrLength(t *testing.T) {
 // TestSendToOneClient verifies that Send correctly sends a request
 // to one server using the heartbeat RPC.
 func TestSendToOneClient(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 
 	ctx := newNodeTestContext(nil, stopper)
 	s, ln := newTestServer(t, ctx)
-	registerBatch(t, s, 0)
+	roachpb.RegisterInternalServer(s, Node(0))
 
 	opts := SendOptions{
 		Ordering:        orderStable,
 		SendNextTimeout: 1 * time.Second,
 		Timeout:         10 * time.Second,
+		Context:         context.Background(),
 	}
 	reply, err := sendBatch(opts, []net.Addr{ln.Addr()}, ctx)
 	if err != nil {
@@ -127,38 +108,46 @@ func TestSendToOneClient(t *testing.T) {
 // TestRetryableError verifies that Send returns a retryable error
 // when it hits an RPC error.
 func TestRetryableError(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	clientStopper := stop.NewStopper()
 	defer clientStopper.Stop()
 	clientContext := newNodeTestContext(nil, clientStopper)
-	clientContext.HeartbeatTimeout = 10 * clientContext.HeartbeatInterval
 
 	serverStopper := stop.NewStopper()
 	serverContext := newNodeTestContext(nil, serverStopper)
 
 	s, ln := newTestServer(t, serverContext)
-	registerBatch(t, s, 0)
+	roachpb.RegisterInternalServer(s, Node(0))
 
-	c := rpc.NewClient(ln.Addr(), clientContext)
+	conn, err := clientContext.GRPCDial(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	waitForConnState := func(desiredState grpc.ConnectivityState) {
+		clientState, err := conn.State()
+		for clientState != desiredState {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if clientState == grpc.Shutdown {
+				t.Fatalf("%v has unexpectedly shut down", conn)
+			}
+			clientState, err = conn.WaitForStateChange(ctx, clientState)
+		}
+	}
 	// Wait until the client becomes healthy and shut down the server.
-	<-c.Healthy()
+	waitForConnState(grpc.Ready)
 	serverStopper.Stop()
 	// Wait until the client becomes unhealthy.
-	func() {
-		for r := retry.Start(retry.Options{}); r.Next(); {
-			select {
-			case <-c.Healthy():
-			case <-time.After(1 * time.Nanosecond):
-				return
-			}
-		}
-	}()
+	waitForConnState(grpc.TransientFailure)
 
 	opts := SendOptions{
 		Ordering:        orderStable,
 		SendNextTimeout: 100 * time.Millisecond,
 		Timeout:         100 * time.Millisecond,
+		Context:         context.Background(),
 	}
 	if _, err := sendBatch(opts, []net.Addr{ln.Addr()}, clientContext); err != nil {
 		retryErr, ok := err.(retry.Retryable)
@@ -176,7 +165,7 @@ func TestRetryableError(t *testing.T) {
 // TestUnretryableError verifies that Send returns an unretryable
 // error when it hits a critical error.
 func TestUnretryableError(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
@@ -188,15 +177,15 @@ func TestUnretryableError(t *testing.T) {
 		Ordering:        orderStable,
 		SendNextTimeout: 1 * time.Second,
 		Timeout:         10 * time.Second,
+		Context:         context.Background(),
 	}
 
-	sendOneFn = func(client *batchClient, timeout time.Duration,
-		context *rpc.Context, trace opentracing.Span, done chan *netrpc.Call) {
-		call := netrpc.Call{
-			Reply: &roachpb.BatchResponse{},
+	sendOneFn = func(_ SendOptions, _ *rpc.Context,
+		_ batchClient, done chan batchCall) {
+		done <- batchCall{
+			reply: &roachpb.BatchResponse{},
+			err:   errors.New("unretryable"),
 		}
-		call.Error = errors.New("unretryable")
-		done <- &call
 	}
 	defer func() { sendOneFn = sendOne }()
 
@@ -216,24 +205,28 @@ func TestUnretryableError(t *testing.T) {
 // TestClientNotReady verifies that Send gets an RPC error when a client
 // does not become ready.
 func TestClientNotReady(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 
-	nodeContext := newNodeTestContext(nil, stopper)
-
-	// Construct a server that listens but doesn't do anything.
-	s, ln := newTestServer(t, nodeContext)
-	registerBatch(t, s, 50*time.Millisecond)
+	// Construct a server that listens but doesn't do anything. Notice that we
+	// never start accepting connections on the listener.
+	ln, err := net.Listen(util.TestAddr.Network(), util.TestAddr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
 
 	opts := SendOptions{
 		Ordering:        orderStable,
 		SendNextTimeout: 100 * time.Nanosecond,
 		Timeout:         100 * time.Nanosecond,
+		Context:         context.Background(),
 	}
 
 	// Send RPC to an address where no server is running.
+	nodeContext := newNodeTestContext(nil, stopper)
 	if _, err := sendBatch(opts, []net.Addr{ln.Addr()}, nodeContext); err != nil {
 		retryErr, ok := err.(retry.Retryable)
 		if !ok {
@@ -246,28 +239,49 @@ func TestClientNotReady(t *testing.T) {
 		t.Fatalf("Unexpected success")
 	}
 
-	// Send the RPC again with no timeout.
+	// Send the RPC again with no timeout. We create a new node context to ensure
+	// there is a new connection.
+	nodeContext = newNodeTestContext(nil, stopper)
 	opts.SendNextTimeout = 0
 	opts.Timeout = 0
 	c := make(chan error)
+	sent := make(chan struct{})
+
+	// Start a goroutine to accept the connection from the client. We'll close
+	// the sent channel after receiving the connection, thus ensuring that the
+	// RPC was sent before we closed the connection. We intentionally do not
+	// close the server connection as doing so triggers other gRPC code paths.
 	go func() {
-		if _, err := sendBatch(opts, []net.Addr{ln.Addr()}, nodeContext); err == nil {
-			c <- util.Errorf("expected error when client is closed")
-		} else if !strings.Contains(err.Error(), "failed as client connection was closed") {
+		_, err := ln.Accept()
+		if err != nil {
 			c <- err
+		} else {
+			close(sent)
+		}
+	}()
+	go func() {
+		_, err := sendBatch(opts, []net.Addr{ln.Addr()}, nodeContext)
+		if !testutils.IsError(err, "failed as client connection was closed") {
+			c <- util.Errorf("unexpected error: %v", err)
 		}
 		close(c)
 	}()
 
 	select {
-	case <-c:
-		t.Fatalf("Unexpected end of rpc call")
-	case <-time.After(1 * time.Millisecond):
+	case err := <-c:
+		t.Fatalf("Unexpected end of rpc call: %v", err)
+	case <-sent:
 	}
 
 	// Grab the client for our invalid address and close it. This will cause the
 	// blocked ping RPC to finish.
-	rpc.NewClient(ln.Addr(), nodeContext).Close()
+	conn, err := nodeContext.GRPCDial(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := <-c; err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +290,7 @@ func TestClientNotReady(t *testing.T) {
 // TestComplexScenarios verifies various complex success/failure scenarios by
 // mocking sendOne.
 func TestComplexScenarios(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
@@ -323,29 +337,29 @@ func TestComplexScenarios(t *testing.T) {
 			Ordering:        orderStable,
 			SendNextTimeout: 1 * time.Second,
 			Timeout:         10 * time.Second,
+			Context:         context.Background(),
 		}
 
 		// Mock sendOne.
-		sendOneFn = func(client *batchClient, timeout time.Duration,
-			context *rpc.Context, trace opentracing.Span, done chan *netrpc.Call) {
-			addr := client.RemoteAddr()
+		sendOneFn = func(_ SendOptions, _ *rpc.Context,
+			client batchClient, done chan batchCall) {
 			addrID := -1
 			for serverAddrID, serverAddr := range serverAddrs {
-				if serverAddr.String() == addr.String() {
+				if serverAddr.String() == client.remoteAddr {
 					addrID = serverAddrID
 					break
 				}
 			}
 			if addrID == -1 {
-				t.Fatalf("%d: %v is not found in serverAddrs: %v", i, addr, serverAddrs)
+				t.Fatalf("%d: %s is not found in serverAddrs: %v", i, client.remoteAddr, serverAddrs)
 			}
-			call := netrpc.Call{
-				Reply: &roachpb.BatchResponse{},
+			call := batchCall{
+				reply: &roachpb.BatchResponse{},
 			}
 			if addrID < numErrors {
-				call.Error = roachpb.NewSendError("test", addrID < numRetryableErrors)
+				call.err = roachpb.NewSendError("test", addrID < numRetryableErrors)
 			}
-			done <- &call
+			done <- call
 		}
 		defer func() { sendOneFn = sendOne }()
 
@@ -378,6 +392,6 @@ func makeReplicas(addrs ...net.Addr) ReplicaSlice {
 }
 
 // sendBatch sends Batch requests to specified addresses using send.
-func sendBatch(opts SendOptions, addrs []net.Addr, rpcContext *rpc.Context) (proto.Message, error) {
+func sendBatch(opts SendOptions, addrs []net.Addr, rpcContext *rpc.Context) (*roachpb.BatchResponse, error) {
 	return send(opts, makeReplicas(addrs...), roachpb.BatchRequest{}, rpcContext)
 }

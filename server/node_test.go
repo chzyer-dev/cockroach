@@ -25,6 +25,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"google.golang.org/grpc"
 
 	"github.com/cockroachdb/cockroach/client"
@@ -39,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/cockroachdb/cockroach/util/grpcutil"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/metric"
@@ -48,31 +49,26 @@ import (
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
 
-const testTimeout = 3 * time.Second
-
 // createTestNode creates an rpc server using the specified address,
 // gossip instance, KV database and a node using the specified slice
 // of engines. The server, clock and node are returned. If gossipBS is
 // not nil, the gossip bootstrap address is set to gossipBS.
 func createTestNode(addr net.Addr, engines []engine.Engine, gossipBS net.Addr, t *testing.T) (
-	*rpc.Server, net.Addr, *hlc.Clock, *Node, *stop.Stopper) {
+	*grpc.Server, net.Addr, *hlc.Clock, *Node, *stop.Stopper) {
 	ctx := storage.StoreContext{}
 
 	stopper := stop.NewStopper()
 	ctx.Clock = hlc.NewClock(hlc.UnixNano)
 	nodeRPCContext := rpc.NewContext(nodeTestBaseContext, ctx.Clock, stopper)
 	ctx.ScanInterval = 10 * time.Hour
-	rpcServer := rpc.NewServer(nodeRPCContext)
-	grpcServer := grpc.NewServer()
-	tlsConfig, err := nodeRPCContext.GetServerTLSConfig()
+	ctx.ConsistencyCheckInterval = 10 * time.Hour
+	grpcServer := rpc.NewServer(nodeRPCContext)
+	ln, err := util.ListenAndServeGRPC(stopper, grpcServer, addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := util.ListenAndServe(stopper, grpcutil.GRPCHandlerFunc(grpcServer, rpcServer), addr, tlsConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	g := gossip.New(nodeRPCContext, testContext.GossipBootstrapResolvers, stopper)
+	serverCtx := NewTestContext()
+	g := gossip.New(nodeRPCContext, serverCtx.GossipBootstrapResolvers, stopper)
 	if gossipBS != nil {
 		// Handle possibility of a :0 port specification.
 		if gossipBS.Network() == addr.Network() && gossipBS.String() == addr.String() {
@@ -94,25 +90,24 @@ func createTestNode(addr net.Addr, engines []engine.Engine, gossipBS net.Addr, t
 		RPCRetryOptions: &retryOpts,
 	}, g)
 	tracer := tracing.NewTracer()
-	sender := kv.NewTxnCoordSender(distSender, ctx.Clock, false, tracer, stopper)
+	sender := kv.NewTxnCoordSender(distSender, ctx.Clock, false, tracer, stopper,
+		kv.NewTxnMetrics(metric.NewRegistry()))
 	ctx.DB = client.NewDB(sender)
-	// TODO(bdarnell): arrange to have the transport closed.
-	// (or attach LocalRPCTransport.Close to the stopper)
-	ctx.Transport = storage.NewLocalRPCTransport(stopper)
-	ctx.EventFeed = util.NewFeed(stopper)
+	ctx.Transport = storage.NewDummyRaftTransport()
 	ctx.Tracer = tracer
-	node := NewNode(ctx, metric.NewRegistry(), stopper, nil)
-	return rpcServer, ln.Addr(), ctx.Clock, node, stopper
+	node := NewNode(ctx, status.NewMetricsRecorder(ctx.Clock), stopper, kv.NewTxnMetrics(metric.NewRegistry()))
+	roachpb.RegisterInternalServer(grpcServer, node)
+	return grpcServer, ln.Addr(), ctx.Clock, node, stopper
 }
 
 // createAndStartTestNode creates a new test node and starts it. The server and node are returned.
 func createAndStartTestNode(addr net.Addr, engines []engine.Engine, gossipBS net.Addr, t *testing.T) (
-	*rpc.Server, net.Addr, *Node, *stop.Stopper) {
-	rpcServer, addr, _, node, stopper := createTestNode(addr, engines, gossipBS, t)
-	if err := node.start(rpcServer, addr, engines, roachpb.Attributes{}); err != nil {
+	*grpc.Server, net.Addr, *Node, *stop.Stopper) {
+	grpcServer, addr, _, node, stopper := createTestNode(addr, engines, gossipBS, t)
+	if err := node.start(addr, engines, roachpb.Attributes{}); err != nil {
 		t.Fatal(err)
 	}
-	return rpcServer, addr, node, stopper
+	return grpcServer, addr, node, stopper
 }
 
 func formatKeys(keys []roachpb.Key) string {
@@ -133,16 +128,16 @@ func (s keySlice) Less(i, j int) bool { return bytes.Compare(s[i], s[j]) < 0 }
 // TestBootstrapCluster verifies the results of bootstrapping a
 // cluster. Uses an in memory engine.
 func TestBootstrapCluster(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20, stopper)
-	if _, err := bootstrapCluster([]engine.Engine{e}); err != nil {
+	if _, err := bootstrapCluster([]engine.Engine{e}, kv.NewTxnMetrics(metric.NewRegistry())); err != nil {
 		t.Fatal(err)
 	}
 
 	// Scan the complete contents of the local database directly from the engine.
-	rows, _, err := engine.MVCCScan(e, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil)
+	rows, _, err := engine.MVCCScan(context.Background(), e, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,11 +170,11 @@ func TestBootstrapCluster(t *testing.T) {
 // TestBootstrapNewStore starts a cluster with two unbootstrapped
 // stores and verifies both stores are added and started.
 func TestBootstrapNewStore(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	engineStopper := stop.NewStopper()
 	defer engineStopper.Stop()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20, engineStopper)
-	if _, err := bootstrapCluster([]engine.Engine{e}); err != nil {
+	if _, err := bootstrapCluster([]engine.Engine{e}, kv.NewTxnMetrics(metric.NewRegistry())); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,14 +184,14 @@ func TestBootstrapNewStore(t *testing.T) {
 		engine.NewInMem(roachpb.Attributes{}, 1<<20, engineStopper),
 		engine.NewInMem(roachpb.Attributes{}, 1<<20, engineStopper),
 	}
-	_, _, node, stopper := createAndStartTestNode(util.CreateTestAddr("tcp"), engines, util.CreateTestAddr("tcp"), t)
+	_, _, node, stopper := createAndStartTestNode(util.TestAddr, engines, util.TestAddr, t)
 	defer stopper.Stop()
 
 	// Non-initialized stores (in this case the new in-memory-based
 	// store) will be bootstrapped by the node upon start. This happens
 	// in a goroutine, so we'll have to wait a bit until we can find the
 	// new node.
-	util.SucceedsWithin(t, testTimeout, func() error {
+	util.SucceedsSoon(t, func() error {
 		if n := node.stores.GetStoreCount(); n != 3 {
 			return util.Errorf("expected 3 stores but got %d", n)
 		}
@@ -217,35 +212,36 @@ func TestBootstrapNewStore(t *testing.T) {
 // TestNodeJoin verifies a new node is able to join a bootstrapped
 // cluster consisting of one node.
 func TestNodeJoin(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	engineStopper := stop.NewStopper()
 	defer engineStopper.Stop()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20, engineStopper)
-	if _, err := bootstrapCluster([]engine.Engine{e}); err != nil {
+	if _, err := bootstrapCluster([]engine.Engine{e}, kv.NewTxnMetrics(metric.NewRegistry())); err != nil {
 		t.Fatal(err)
 	}
 
 	// Start the bootstrap node.
 	engines1 := []engine.Engine{e}
-	addr1 := util.CreateTestAddr("tcp")
-	_, server1Addr, node1, stopper1 := createAndStartTestNode(addr1, engines1, addr1, t)
+	_, server1Addr, node1, stopper1 := createAndStartTestNode(util.TestAddr, engines1, util.TestAddr, t)
 	defer stopper1.Stop()
 
 	// Create a new node.
 	engines2 := []engine.Engine{engine.NewInMem(roachpb.Attributes{}, 1<<20, engineStopper)}
-	addr2 := util.CreateTestAddr("tcp")
-	_, server2Addr, node2, stopper2 := createAndStartTestNode(addr2, engines2, server1Addr, t)
+	_, server2Addr, node2, stopper2 := createAndStartTestNode(util.TestAddr, engines2, server1Addr, t)
 	defer stopper2.Stop()
 
 	// Verify new node is able to bootstrap its store.
-	if err := util.IsTrueWithin(func() bool { return node2.stores.GetStoreCount() == 1 }, testTimeout); err != nil {
-		t.Fatal(err)
-	}
+	util.SucceedsSoon(t, func() error {
+		if sc := node2.stores.GetStoreCount(); sc != 1 {
+			return util.Errorf("GetStoreCount() expected 1; got %d", sc)
+		}
+		return nil
+	})
 
 	// Verify node1 sees node2 via gossip and vice versa.
 	node1Key := gossip.MakeNodeIDKey(node1.Descriptor.NodeID)
 	node2Key := gossip.MakeNodeIDKey(node2.Descriptor.NodeID)
-	util.SucceedsWithin(t, 50*time.Millisecond, func() error {
+	util.SucceedsSoon(t, func() error {
 		var nodeDesc1 roachpb.NodeDescriptor
 		if err := node1.ctx.Gossip.GetInfoProto(node2Key, &nodeDesc1); err != nil {
 			return err
@@ -267,15 +263,14 @@ func TestNodeJoin(t *testing.T) {
 // TestNodeJoinSelf verifies that an uninitialized node trying to join
 // itself will fail.
 func TestNodeJoinSelf(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	engineStopper := stop.NewStopper()
 	defer engineStopper.Stop()
 	engines := []engine.Engine{engine.NewInMem(roachpb.Attributes{}, 1<<20, engineStopper)}
-	addr := util.CreateTestAddr("tcp")
-	rpcServer, addr, _, node, stopper := createTestNode(addr, engines, addr, t)
+	_, addr, _, node, stopper := createTestNode(util.TestAddr, engines, util.TestAddr, t)
 	defer stopper.Stop()
-	err := node.start(rpcServer, addr, engines, roachpb.Attributes{})
+	err := node.start(addr, engines, roachpb.Attributes{})
 	if err != errCannotJoinSelf {
 		t.Fatalf("expected err %s; got %s", errCannotJoinSelf, err)
 	}
@@ -284,11 +279,11 @@ func TestNodeJoinSelf(t *testing.T) {
 // TestCorruptedClusterID verifies that a node fails to start when a
 // store's cluster ID is empty.
 func TestCorruptedClusterID(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	engineStopper := stop.NewStopper()
 	e := engine.NewInMem(roachpb.Attributes{}, 1<<20, engineStopper)
 	defer engineStopper.Stop()
-	if _, err := bootstrapCluster([]engine.Engine{e}); err != nil {
+	if _, err := bootstrapCluster([]engine.Engine{e}, kv.NewTxnMetrics(metric.NewRegistry())); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,14 +293,14 @@ func TestCorruptedClusterID(t *testing.T) {
 		NodeID:    1,
 		StoreID:   1,
 	}
-	if err := engine.MVCCPutProto(e, nil, keys.StoreIdentKey(), roachpb.ZeroTimestamp, nil, &sIdent); err != nil {
+	if err := engine.MVCCPutProto(context.Background(), e, nil, keys.StoreIdentKey(), roachpb.ZeroTimestamp, nil, &sIdent); err != nil {
 		t.Fatal(err)
 	}
 
 	engines := []engine.Engine{e}
-	server, serverAddr, _, node, stopper := createTestNode(util.CreateTestAddr("tcp"), engines, nil, t)
+	_, serverAddr, _, node, stopper := createTestNode(util.TestAddr, engines, nil, t)
 	stopper.Stop()
-	if err := node.start(server, serverAddr, engines, roachpb.Attributes{}); !testutils.IsError(err, "unidentified store") {
+	if err := node.start(serverAddr, engines, roachpb.Attributes{}); !testutils.IsError(err, "unidentified store") {
 		t.Errorf("unexpected error %v", err)
 	}
 }
@@ -317,131 +312,125 @@ func TestCorruptedClusterID(t *testing.T) {
 // And that UpdatedAt has increased.
 // The latest actual stats are returned.
 func compareNodeStatus(t *testing.T, ts *TestServer, expectedNodeStatus *status.NodeStatus, testNumber int) *status.NodeStatus {
+	// ========================================
+	// Read NodeStatus from server and validate top-level fields.
+	// ========================================
 	nodeStatusKey := keys.NodeStatusKey(int32(ts.node.Descriptor.NodeID))
 	nodeStatus := &status.NodeStatus{}
 	if err := ts.db.GetProto(nodeStatusKey, nodeStatus); err != nil {
-		t.Fatalf("%v: failure getting node status: %s", testNumber, err)
+		t.Fatalf("%d: failure getting node status: %s", testNumber, err)
 	}
 
-	// These values must be equal.
-	if a, e := nodeStatus.RangeCount, expectedNodeStatus.RangeCount; a != e {
-		t.Errorf("%d: RangeCount does not match expected.\nexpected: %d actual: %d", testNumber, e, a)
-	}
+	// Descriptor values should be exactly equal to expected.
 	if a, e := nodeStatus.Desc, expectedNodeStatus.Desc; !reflect.DeepEqual(a, e) {
 		t.Errorf("%d: Descriptor does not match expected.\nexpected: %s\nactual: %s", testNumber, e, a)
 	}
-	if a, e := nodeStatus.ReplicatedRangeCount, expectedNodeStatus.ReplicatedRangeCount; a != e {
-		t.Errorf("%d: ReplicatedRangeCount does not match expected.\nexpected: %d actual: %d", testNumber, e, a)
+
+	// ========================================
+	// Ensure all expected stores are represented in the node status.
+	// ========================================
+	storesToMap := func(ns *status.NodeStatus) map[roachpb.StoreID]status.StoreStatus {
+		strMap := make(map[roachpb.StoreID]status.StoreStatus, len(ns.StoreStatuses))
+		for _, str := range ns.StoreStatuses {
+			strMap[str.Desc.StoreID] = str
+		}
+		return strMap
+	}
+	actualStores := storesToMap(nodeStatus)
+	expectedStores := storesToMap(expectedNodeStatus)
+
+	if a, e := len(actualStores), len(expectedStores); a != e {
+		t.Errorf("%d: actual status contained %d stores, expected %d", testNumber, a, e)
+	}
+	for key := range expectedStores {
+		if _, ok := actualStores[key]; !ok {
+			t.Errorf("%d: actual node status did not contain expected store %d", testNumber, key)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
 	}
 
-	// These values must >= to the older value.
-	// If StartedAt is 0, we skip this test as we don't have the base value yet.
-	if a, e := nodeStatus.StartedAt, expectedNodeStatus.StartedAt; e > 0 && e != a {
-		t.Errorf("%d: StartedAt does not match expected.\nexpected: %d actual: %d", testNumber, e, a)
-	}
-	if a, e := nodeStatus.Stats.LiveBytes, expectedNodeStatus.Stats.LiveBytes; a < e {
-		t.Errorf("%d: LiveBytes is not greater or equal to expected.\nexpected: %d actual: %d", testNumber, e, a)
-	}
-	if a, e := nodeStatus.Stats.KeyBytes, expectedNodeStatus.Stats.KeyBytes; a < e {
-		t.Errorf("%d: KeyBytes is not greater or equal to expected.\nexpected: %d actual: %d", testNumber, e, a)
-	}
-	if a, e := nodeStatus.Stats.ValBytes, expectedNodeStatus.Stats.ValBytes; a < e {
-		t.Errorf("%d: ValBytes is not greater or equal to expected.\nexpected: %d actual: %d", testNumber, e, a)
-	}
-	if a, e := nodeStatus.Stats.LiveCount, expectedNodeStatus.Stats.LiveCount; a < e {
-		t.Errorf("%d: LiveCount is not greater or equal to expected.\nexpected: %d actual: %d", testNumber, e, a)
-	}
-	if a, e := nodeStatus.Stats.KeyCount, expectedNodeStatus.Stats.KeyCount; a < e {
-		t.Errorf("%d: KeyCount is not greater or equal to expected.\nexpected: %d actual: %d", testNumber, e, a)
-	}
-	if a, e := nodeStatus.Stats.ValCount, expectedNodeStatus.Stats.ValCount; a < e {
-		t.Errorf("%d: ValCount is not greater or equal to expected.\nexpected: %d actual: %d", testNumber, e, a)
-	}
-	if a, e := nodeStatus.UpdatedAt, expectedNodeStatus.UpdatedAt; a < e {
-		t.Errorf("%d: UpdatedAt is not greater or equal to expected.\nexpected: %d actual: %d", testNumber, e, a)
+	// ========================================
+	// Ensure all metric sets (node and store level) are consistent with
+	// expected status.
+	// ========================================
+
+	// CompareMetricMaps accepts an actual and expected metric maps, along with
+	// two lists of string keys. For metrics with keys in the 'equal' map, the
+	// actual value must be equal to the expected value. For keys in the
+	// 'greater' map, the actul value must be greater than or equal to the
+	// expected value.
+	compareMetricMaps := func(actual, expected map[string]float64, equal, greater []string) {
+		// Make sure the actual value map contains all values in expected map.
+		for key := range expected {
+			if _, ok := actual[key]; !ok {
+				t.Errorf("%d: actual node status did not contain expected metric %s", testNumber, key)
+			}
+		}
+		if t.Failed() {
+			return
+		}
+
+		// For each equal key, ensure that the actual value is equal to expected
+		// key.
+		for _, key := range equal {
+			if _, ok := actual[key]; !ok {
+				t.Errorf("%d, actual node status did not contain expected 'equal' metric key %s", testNumber, key)
+				continue
+			}
+			if a, e := actual[key], expected[key]; a != e {
+				t.Errorf("%d: %s does not match expected value.\nExpected %f, Actual %f", testNumber, key, e, a)
+			}
+		}
+		for _, key := range greater {
+			if _, ok := actual[key]; !ok {
+				t.Errorf("%d: actual node status did not contain expected 'greater' metric key %s", testNumber, key)
+				continue
+			}
+			if a, e := actual[key], expected[key]; a < e {
+				t.Errorf("%d: %s is not greater than or equal to expected value.\nExpected %f, Actual %f", testNumber, key, e, a)
+			}
+		}
 	}
 
-	// Compare the store ids.
-	var actualStoreIDs, expectedStoreIDs sort.IntSlice
-	for _, id := range nodeStatus.StoreIDs {
-		actualStoreIDs = append(actualStoreIDs, int(id))
-	}
-	sort.Sort(actualStoreIDs)
-	for _, id := range expectedNodeStatus.StoreIDs {
-		expectedStoreIDs = append(expectedStoreIDs, int(id))
-	}
-	sort.Sort(expectedStoreIDs)
+	compareMetricMaps(nodeStatus.Metrics, expectedNodeStatus.Metrics, nil, []string{
+		"exec.success-count",
+		"exec.error-count",
+	})
 
-	if !reflect.DeepEqual(actualStoreIDs, expectedStoreIDs) {
-		t.Errorf("%d: actual Store IDs don't match expected.\nexpected: %d actual: %d", testNumber, expectedStoreIDs, actualStoreIDs)
+	for key := range actualStores {
+		// Directly verify a subset of metrics which have predictable output.
+		compareMetricMaps(actualStores[key].Metrics, expectedStores[key].Metrics,
+			[]string{
+				"replicas",
+				"ranges.replicated",
+			},
+			[]string{
+				"livebytes",
+				"keybytes",
+				"valbytes",
+				"livecount",
+				"keycount",
+				"valcount",
+			})
+	}
+
+	if t.Failed() {
+		t.FailNow()
 	}
 
 	return nodeStatus
 }
 
-// compareStoreStatus ensures that the actual store status for the passed in
-// store is updated correctly. It checks that the Desc.StoreID, Desc.Attrs,
-// Desc.Node, Desc.Capacity.Capacity, NodeID, RangeCount, ReplicatedRangeCount
-// are exactly correct and that the bytes and counts for Live, Key and Val are
-// at least the expected value.
-// The latest actual stats are returned.
-func compareStoreStatus(t *testing.T, ts *TestServer, store *storage.Store, expectedStoreStatus *storage.StoreStatus, testNumber int) *storage.StoreStatus {
-	// Retrieve store status from database.
-	storeStatusKey := keys.StoreStatusKey(int32(store.Ident.StoreID))
-	storeStatus := &storage.StoreStatus{}
-	if err := ts.db.GetProto(storeStatusKey, storeStatus); err != nil {
-		t.Fatalf("%v: failure getting store status: %s", testNumber, err)
-	}
-
-	// Values must match exactly.
-	if a, e := storeStatus.Desc.StoreID, expectedStoreStatus.Desc.StoreID; a != e {
-		t.Errorf("%d: actual Desc.StoreID does not match expected. expected: %d actual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.Desc.Attrs, expectedStoreStatus.Desc.Attrs; !reflect.DeepEqual(a, e) {
-		t.Errorf("%d: actual Desc.Attrs does not match expected.\nexpected: %s\nactual: %s", testNumber, e, a)
-	}
-	if a, e := storeStatus.Desc.Node, expectedStoreStatus.Desc.Node; !reflect.DeepEqual(a, e) {
-		t.Errorf("%d: actual Desc.Attrs does not match expected.\nexpected: %s\nactual: %s", testNumber, e, a)
-	}
-	if a, e := storeStatus.Desc.Capacity.Capacity, expectedStoreStatus.Desc.Capacity.Capacity; a != e {
-		t.Errorf("%d: actual Desc.Capacity.Capacity does not match expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.NodeID, expectedStoreStatus.NodeID; a != e {
-		t.Errorf("%d: actual node ID does not match expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.RangeCount, expectedStoreStatus.RangeCount; a != e {
-		t.Errorf("%d: actual RangeCount does not match expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.ReplicatedRangeCount, expectedStoreStatus.ReplicatedRangeCount; a != e {
-		t.Errorf("%d: actual ReplicatedRangeCount does not match expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-
-	// Values should be >= to expected values.
-	if a, e := storeStatus.Stats.LiveBytes, expectedStoreStatus.Stats.LiveBytes; a < e {
-		t.Errorf("%d: actual Live Bytes is not greater or equal to expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.Stats.KeyBytes, expectedStoreStatus.Stats.KeyBytes; a < e {
-		t.Errorf("%d: actual Key Bytes is not greater or equal to expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.Stats.ValBytes, expectedStoreStatus.Stats.ValBytes; a < e {
-		t.Errorf("%d: actual Val Bytes is not greater or equal to expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.Stats.LiveCount, expectedStoreStatus.Stats.LiveCount; a < e {
-		t.Errorf("%d: actual Live Count is not greater or equal to expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.Stats.KeyCount, expectedStoreStatus.Stats.KeyCount; a < e {
-		t.Errorf("%d: actual Key Count is not greater or equal to expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	if a, e := storeStatus.Stats.ValCount, expectedStoreStatus.Stats.ValCount; a < e {
-		t.Errorf("%d: actual Val Count is not greater or equal to expected.\nexpected: %d\nactual: %d", testNumber, e, a)
-	}
-	return storeStatus
-}
-
 // TestStatusSummaries verifies that status summaries are written correctly for
 // both the Node and stores within the node.
 func TestStatusSummaries(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
+
+	// ========================================
+	// Start test server and wait for full initialization.
+	// ========================================
 	ts := &TestServer{}
 	ts.Ctx = NewTestContext()
 	ts.StoresPerNode = 3
@@ -466,14 +455,9 @@ func TestStatusSummaries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	storeDesc, pErr := s.Descriptor()
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
-
 	// Wait for full replication of initial ranges.
-	initialRanges := int32(ExpectedInitialRangeCount())
-	util.SucceedsWithin(t, testTimeout, func() error {
+	initialRanges := ExpectedInitialRangeCount()
+	util.SucceedsSoon(t, func() error {
 		for i := 1; i <= int(initialRanges); i++ {
 			if s.RaftStatus(roachpb.RangeID(i)) == nil {
 				return util.Errorf("Store %d replica %d is not present in raft", s.StoreID(), i)
@@ -482,39 +466,48 @@ func TestStatusSummaries(t *testing.T) {
 		return nil
 	})
 
+	// ========================================
+	// Construct an initial expectation for NodeStatus to compare to the first
+	// status produced by the server.
+	// ========================================
 	expectedNodeStatus := &status.NodeStatus{
-		RangeCount:           initialRanges,
-		StoreIDs:             []roachpb.StoreID{1, 2, 3},
-		StartedAt:            0,
-		UpdatedAt:            0,
-		Desc:                 ts.node.Descriptor,
-		LeaderRangeCount:     initialRanges,
-		AvailableRangeCount:  initialRanges,
-		ReplicatedRangeCount: initialRanges,
-		Stats: engine.MVCCStats{
-			LiveBytes: 1,
-			KeyBytes:  1,
-			ValBytes:  1,
-			LiveCount: 1,
-			KeyCount:  1,
-			ValCount:  1,
+		Desc:      ts.node.Descriptor,
+		StartedAt: 0,
+		UpdatedAt: 0,
+		Metrics: map[string]float64{
+			"exec.success-count": 0,
+			"exec.error-count":   0,
 		},
 	}
-	expectedStoreStatus := &storage.StoreStatus{
-		Desc:                 *storeDesc,
-		NodeID:               1,
-		RangeCount:           initialRanges,
-		LeaderRangeCount:     initialRanges,
-		AvailableRangeCount:  initialRanges,
-		ReplicatedRangeCount: initialRanges,
-		Stats: engine.MVCCStats{
-			LiveBytes: 1,
-			KeyBytes:  1,
-			ValBytes:  1,
-			LiveCount: 1,
-			KeyCount:  1,
-			ValCount:  1,
-		},
+
+	expectedStoreStatuses := make(map[roachpb.StoreID]status.StoreStatus)
+	if err := ts.node.stores.VisitStores(func(s *storage.Store) error {
+		desc, err := s.Descriptor()
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectedReplicas := 0
+		if s.StoreID() == roachpb.StoreID(1) {
+			expectedReplicas = initialRanges
+		}
+		stat := status.StoreStatus{
+			Desc: *desc,
+			Metrics: map[string]float64{
+				"replicas":          float64(expectedReplicas),
+				"ranges.replicated": float64(expectedReplicas),
+				"livebytes":         0,
+				"keybytes":          0,
+				"valbytes":          0,
+				"livecount":         0,
+				"keycount":          0,
+				"valcount":          0,
+			},
+		}
+		expectedNodeStatus.StoreStatuses = append(expectedNodeStatus.StoreStatuses, stat)
+		expectedStoreStatuses[s.StoreID()] = stat
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	// Function to force summaries to be written synchronously, including all
@@ -523,27 +516,30 @@ func TestStatusSummaries(t *testing.T) {
 	// were multiple replicas, more care would need to be taken in the initial
 	// syncFeed().
 	forceWriteStatus := func() {
-		if err := ts.node.publishStoreStatuses(); err != nil {
+		if err := ts.node.computePeriodicMetrics(); err != nil {
 			t.Fatalf("error publishing store statuses: %s", err)
 		}
 
-		// Ensure that the event feed has been fully flushed.
-		ts.EventFeed().Flush()
-
-		if err := ts.writeSummaries(); err != nil {
+		if err := ts.WriteSummaries(); err != nil {
 			t.Fatalf("error writing summaries: %s", err)
 		}
 	}
 
+	// Verify initial status.
 	forceWriteStatus()
-	oldNodeStats := compareNodeStatus(t, ts, expectedNodeStatus, 0)
-	oldStoreStats := compareStoreStatus(t, ts, s, expectedStoreStatus, 0)
+	expectedNodeStatus = compareNodeStatus(t, ts, expectedNodeStatus, 1)
+	for _, s := range expectedNodeStatus.StoreStatuses {
+		expectedStoreStatuses[s.Desc.StoreID] = s
+	}
+
+	// ========================================
+	// Put some data into the K/V store and confirm change to status.
+	// ========================================
 
 	splitKey := "b"
 	rightKey := "c"
 
-	// Write some values left and right of the proposed split key. No
-	// particular reason.
+	// Write some values left and right of the proposed split key.
 	if err := ts.db.Put(leftKey, content); err != nil {
 		t.Fatal(err)
 	}
@@ -551,44 +547,27 @@ func TestStatusSummaries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedNodeStatus = &status.NodeStatus{
-		RangeCount:           initialRanges,
-		StoreIDs:             []roachpb.StoreID{1, 2, 3},
-		StartedAt:            oldNodeStats.StartedAt,
-		UpdatedAt:            oldNodeStats.UpdatedAt,
-		Desc:                 ts.node.Descriptor,
-		LeaderRangeCount:     initialRanges,
-		AvailableRangeCount:  initialRanges,
-		ReplicatedRangeCount: initialRanges,
-		Stats: engine.MVCCStats{
-			LiveBytes: 1,
-			KeyBytes:  1,
-			ValBytes:  1,
-			LiveCount: oldNodeStats.Stats.LiveCount + 1,
-			KeyCount:  oldNodeStats.Stats.KeyCount + 1,
-			ValCount:  oldNodeStats.Stats.ValCount + 1,
-		},
-	}
-	expectedStoreStatus = &storage.StoreStatus{
-		Desc:                 oldStoreStats.Desc,
-		NodeID:               1,
-		RangeCount:           initialRanges,
-		LeaderRangeCount:     initialRanges,
-		AvailableRangeCount:  initialRanges,
-		ReplicatedRangeCount: initialRanges,
-		Stats: engine.MVCCStats{
-			LiveBytes: 1,
-			KeyBytes:  1,
-			ValBytes:  1,
-			LiveCount: oldStoreStats.Stats.LiveCount + 1,
-			KeyCount:  oldStoreStats.Stats.KeyCount + 1,
-			ValCount:  oldStoreStats.Stats.ValCount + 1,
-		},
-	}
+	// Increment metrics on the node
+	expectedNodeStatus.Metrics["exec.success-count"] += 2
+
+	// Increment metrics on the first store.
+	store1 := expectedStoreStatuses[roachpb.StoreID(1)].Metrics
+	store1["livecount"]++
+	store1["keycount"]++
+	store1["valcount"]++
+	store1["livebytes"]++
+	store1["keybytes"]++
+	store1["valbytes"]++
 
 	forceWriteStatus()
-	oldNodeStats = compareNodeStatus(t, ts, expectedNodeStatus, 1)
-	oldStoreStats = compareStoreStatus(t, ts, s, expectedStoreStatus, 1)
+	expectedNodeStatus = compareNodeStatus(t, ts, expectedNodeStatus, 2)
+	for _, s := range expectedNodeStatus.StoreStatuses {
+		expectedStoreStatuses[s.Desc.StoreID] = s
+	}
+
+	// ========================================
+	// Perform an admin split and verify that status is updated.
+	// ========================================
 
 	// Split the range.
 	if err := ts.db.AdminSplit(splitKey); err != nil {
@@ -604,41 +583,19 @@ func TestStatusSummaries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedNodeStatus = &status.NodeStatus{
-		RangeCount:           initialRanges + 1,
-		StoreIDs:             []roachpb.StoreID{1, 2, 3},
-		StartedAt:            oldNodeStats.StartedAt,
-		UpdatedAt:            oldNodeStats.UpdatedAt,
-		Desc:                 ts.node.Descriptor,
-		LeaderRangeCount:     initialRanges + 1,
-		AvailableRangeCount:  initialRanges + 1,
-		ReplicatedRangeCount: initialRanges + 1,
-		Stats: engine.MVCCStats{
-			LiveBytes: 1,
-			KeyBytes:  1,
-			ValBytes:  1,
-			LiveCount: oldNodeStats.Stats.LiveCount,
-			KeyCount:  oldNodeStats.Stats.KeyCount,
-			ValCount:  oldNodeStats.Stats.ValCount,
-		},
-	}
-	expectedStoreStatus = &storage.StoreStatus{
-		Desc:                 oldStoreStats.Desc,
-		NodeID:               1,
-		RangeCount:           initialRanges + 1,
-		LeaderRangeCount:     initialRanges + 1,
-		AvailableRangeCount:  initialRanges + 1,
-		ReplicatedRangeCount: initialRanges + 1,
-		Stats: engine.MVCCStats{
-			LiveBytes: 1,
-			KeyBytes:  1,
-			ValBytes:  1,
-			LiveCount: oldStoreStats.Stats.LiveCount,
-			KeyCount:  oldStoreStats.Stats.KeyCount,
-			ValCount:  oldStoreStats.Stats.ValCount,
-		},
-	}
+	// Increment metrics on the node
+	expectedNodeStatus.Metrics["exec.success-count"] += 2
+
+	// Increment metrics on the first store.
+	store1 = expectedStoreStatuses[roachpb.StoreID(1)].Metrics
+	store1["replicas"]++
+	store1["ranges.leader"]++
+	store1["ranges.available"]++
+	store1["ranges.replicated"]++
+
 	forceWriteStatus()
-	compareNodeStatus(t, ts, expectedNodeStatus, 3)
-	compareStoreStatus(t, ts, s, expectedStoreStatus, 3)
+	expectedNodeStatus = compareNodeStatus(t, ts, expectedNodeStatus, 3)
+	for _, s := range expectedNodeStatus.StoreStatuses {
+		expectedStoreStatuses[s.Desc.StoreID] = s
+	}
 }

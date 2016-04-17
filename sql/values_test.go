@@ -27,12 +27,13 @@ import (
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 func TestValues(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
-	p := planner{}
+	p := makePlanner()
 
 	vInt := int64(5)
 	vNum := 3.14159
@@ -48,43 +49,50 @@ func TestValues(t *testing.T) {
 		return []parser.DTuple{datums}
 	}
 
+	makeValues := func(tuples ...*parser.Tuple) *parser.ValuesClause {
+		return &parser.ValuesClause{Tuples: tuples}
+	}
+	makeTuple := func(exprs ...parser.Expr) *parser.Tuple {
+		return &parser.Tuple{Exprs: exprs}
+	}
+
 	testCases := []struct {
-		stmt parser.Values
+		stmt *parser.ValuesClause
 		rows []parser.DTuple
 		ok   bool
 	}{
 		{
-			parser.Values{{intVal(vInt)}},
+			makeValues(makeTuple(intVal(vInt))),
 			asRow(parser.DInt(vInt)),
 			true,
 		},
 		{
-			parser.Values{{intVal(vInt), intVal(vInt)}},
+			makeValues(makeTuple(intVal(vInt), intVal(vInt))),
 			asRow(parser.DInt(vInt), parser.DInt(vInt)),
 			true,
 		},
 		{
-			parser.Values{{parser.NumVal(fmt.Sprintf("%0.5f", vNum))}},
+			makeValues(makeTuple(parser.NumVal(fmt.Sprintf("%0.5f", vNum)))),
 			asRow(parser.DFloat(vNum)),
 			true,
 		},
 		{
-			parser.Values{{parser.DString(vStr)}},
+			makeValues(makeTuple(parser.DString(vStr))),
 			asRow(parser.DString(vStr)),
 			true,
 		},
 		{
-			parser.Values{{parser.DBytes(vStr)}},
+			makeValues(makeTuple(parser.DBytes(vStr))),
 			asRow(parser.DBytes(vStr)),
 			true,
 		},
 		{
-			parser.Values{{parser.DBool(vBool)}},
+			makeValues(makeTuple(parser.DBool(vBool))),
 			asRow(parser.DBool(vBool)),
 			true,
 		},
 		{
-			parser.Values{{unsupp}},
+			makeValues(makeTuple(unsupp)),
 			nil,
 			false,
 		},
@@ -97,7 +105,7 @@ func TestValues(t *testing.T) {
 					pErr = roachpb.NewErrorf("%v", r)
 				}
 			}()
-			return p.Values(tc.stmt)
+			return p.ValuesClause(tc.stmt)
 		}()
 		if pErr == nil != tc.ok {
 			t.Errorf("%d: error_expected=%t, but got error %v", i, tc.ok, pErr)
@@ -119,7 +127,7 @@ type boolAlias bool
 type stringAlias string
 
 func TestGolangParams(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// Each test case pairs an arbitrary value and parser.Datum which has the same
 	// type
 	testCases := []struct {
@@ -159,7 +167,7 @@ func TestGolangParams(t *testing.T) {
 
 		// Interval and timestamp.
 		{time.Duration(1), reflect.TypeOf(parser.DummyInterval)},
-		{time.Now(), reflect.TypeOf(parser.DummyTimestamp)},
+		{timeutil.Now(), reflect.TypeOf(parser.DummyTimestamp)},
 
 		// Primitive type aliases.
 		{roachpb.NodeID(1), reflect.TypeOf(parser.DummyInt)},

@@ -103,17 +103,39 @@ func (p *planner) Insert(n *parser.Insert, autoCommit bool) (planNode, *roachpb.
 
 	// Construct the default expressions. The returned slice will be nil if no
 	// column in the table has a default expression.
-	defaultExprs, err := p.makeDefaultExprs(cols)
+	defaultExprs, err := makeDefaultExprs(cols, &p.parser, p.evalCtx)
 	if err != nil {
 		return nil, roachpb.NewError(err)
 	}
 
 	// Replace any DEFAULT markers with the corresponding default expressions.
-	n.Rows = p.fillDefaults(defaultExprs, cols, n)
+	insertRows := p.fillDefaults(defaultExprs, cols, n)
 
+	// Construct the check expressions. The returned slice will be nil if no
+	// column in the table has a check expression.
+	checkExprs, err := p.makeCheckExprs(cols)
+	if err != nil {
+		return nil, roachpb.NewError(err)
+	}
+
+	// Prepare the check expressions.
+	var qvals qvalMap
+	if len(checkExprs) > 0 {
+		qvals = make(qvalMap)
+		table := tableInfo{
+			columns: makeResultColumns(tableDesc.Columns),
+		}
+		for i := range checkExprs {
+			expr, err := resolveQNames(checkExprs[i], &table, qvals, &p.qnameVisitor)
+			if err != nil {
+				return nil, roachpb.NewError(err)
+			}
+			checkExprs[i] = expr
+		}
+	}
 	// Transform the values into a rows object. This expands SELECT statements or
 	// generates rows from the values contained within the query.
-	rows, pErr := p.makePlan(n.Rows, false)
+	rows, pErr := p.makePlan(insertRows, false)
 	if pErr != nil {
 		return nil, pErr
 	}
@@ -128,38 +150,38 @@ func (p *planner) Insert(n *parser.Insert, autoCommit bool) (planNode, *roachpb.
 	marshalled := make([]interface{}, len(cols))
 
 	b := p.txn.NewBatch()
-	result := &valuesNode{}
-	var qvals qvalMap
-	if n.Returning != nil {
-		result.columns = make([]ResultColumn, len(n.Returning))
-		table := tableInfo{
-			columns: makeResultColumns(cols, 0),
-			alias:   tableDesc.Name,
+	rh, err := makeReturningHelper(p, n.Returning, tableDesc.Name, tableDesc.Columns)
+	if err != nil {
+		return nil, roachpb.NewError(err)
+	}
+
+	// Prepare structures for building values to pass to rh.
+	var retVals parser.DTuple
+	var rowIdxToRetIdx []int
+	if rh.exprs != nil {
+		// In some cases (e.g. `INSERT INTO t (a) ...`) rowVals does not contain all the table
+		// columns. We need to pass values for all table columns to rh, in the correct order; we
+		// will use retVals for this. We also need a table that maps row indices to retVals indices
+		// to fill in the row values; any absent values will be NULLs.
+
+		retVals = make(parser.DTuple, len(tableDesc.Columns))
+		for i := range retVals {
+			retVals[i] = parser.DNull
 		}
-		qvals = make(qvalMap)
-		for i, c := range n.Returning {
-			expr, err := resolveQNames(&table, qvals, c.Expr)
-			if err != nil {
-				return nil, roachpb.NewError(err)
-			}
-			n.Returning[i].Expr = expr
-			typ, err := expr.TypeCheck(p.evalCtx.Args)
-			if err != nil {
-				return nil, roachpb.NewError(err)
-			}
-			name := string(c.As)
-			if name == "" {
-				name = expr.String()
-			}
-			result.columns[i] = ResultColumn{
-				Name: name,
-				Typ:  typ,
-			}
+
+		colIDToRetIndex := map[ColumnID]int{}
+		for i, col := range tableDesc.Columns {
+			colIDToRetIndex[col.ID] = i
+		}
+
+		rowIdxToRetIdx = make([]int, len(cols))
+		for i, col := range cols {
+			rowIdxToRetIdx[i] = colIDToRetIndex[col.ID]
 		}
 	}
+
 	for rows.Next() {
 		rowVals := rows.Values()
-		result.rows = append(result.rows, parser.DTuple(nil))
 
 		// The values for the row may be shorter than the number of columns being
 		// inserted into. Generate default values for those columns using the
@@ -185,6 +207,35 @@ func (p *planner) Insert(n *parser.Insert, autoCommit bool) (planNode, *roachpb.
 			}
 		}
 
+		// Ensure that the values honor the specified column widths.
+		for i := range rowVals {
+			if err := checkValueWidth(cols[i], rowVals[i]); err != nil {
+				return nil, roachpb.NewError(err)
+			}
+		}
+
+		if len(checkExprs) > 0 {
+			// Populate qvals.
+			for ref, qval := range qvals {
+				// The colIdx is 0-based, we need to change it to 1-based.
+				ri, has := colIDtoRowIndex[ColumnID(ref.colIdx+1)]
+				if !has {
+					return nil, roachpb.NewUErrorf("failed to to find column %d in row", ColumnID(ref.colIdx+1))
+				}
+				qval.datum = rowVals[ri]
+			}
+			for _, expr := range checkExprs {
+				if d, err := expr.Eval(p.evalCtx); err != nil {
+					return nil, roachpb.NewError(err)
+				} else if res, err := parser.GetBool(d); err != nil {
+					return nil, roachpb.NewError(err)
+				} else if !res {
+					// Failed to satisfy CHECK constraint.
+					return nil, roachpb.NewUErrorf("failed to satisfy CHECK constraint (%s)", expr.String())
+				}
+			}
+		}
+
 		// Check that the row value types match the column types. This needs to
 		// happen before index encoding because certain datum types (i.e. tuple)
 		// cannot be used as index values.
@@ -196,7 +247,7 @@ func (p *planner) Insert(n *parser.Insert, autoCommit bool) (planNode, *roachpb.
 			}
 		}
 
-		if p.prepareOnly {
+		if p.evalCtx.PrepareOnly {
 			continue
 		}
 
@@ -205,6 +256,18 @@ func (p *planner) Insert(n *parser.Insert, autoCommit bool) (planNode, *roachpb.
 		if eErr != nil {
 			return nil, roachpb.NewError(eErr)
 		}
+
+		// Write the row sentinel. We want to write the sentinel first in case
+		// we are trying to insert a duplicate primary key: if we write the
+		// secondary indexes first, we may get an error that looks like a
+		// uniqueness violation on a non-unique index.
+		sentinelKey := keys.MakeNonColumnKey(primaryIndexKey)
+		if log.V(2) {
+			log.Infof("CPut %s -> NULL", roachpb.Key(sentinelKey))
+		}
+		// This is subtle: An interface{}(nil) deletes the value, so we pass in
+		// []byte{} as a non-nil value.
+		b.CPut(sentinelKey, []byte{}, nil)
 
 		// Write the secondary indexes.
 		indexes := tableDesc.Indexes
@@ -230,18 +293,13 @@ func (p *planner) Insert(n *parser.Insert, autoCommit bool) (planNode, *roachpb.
 			b.CPut(secondaryIndexEntry.key, secondaryIndexEntry.value, nil)
 		}
 
-		// Write the row sentinel.
-		sentinelKey := keys.MakeNonColumnKey(primaryIndexKey)
-		if log.V(2) {
-			log.Infof("CPut %s -> NULL", roachpb.Key(sentinelKey))
-		}
-		// This is subtle: An interface{}(nil) deletes the value, so we pass in
-		// []byte{} as a non-nil value.
-		b.CPut(sentinelKey, []byte{}, nil)
-
 		// Write the row columns.
 		for i, val := range rowVals {
 			col := cols[i]
+			if retVals != nil {
+				retVals[rowIdxToRetIdx[i]] = val
+			}
+
 			if _, ok := primaryKeyCols[col.ID]; ok {
 				// Skip primary key columns as their values are encoded in the row
 				// sentinel key which is guaranteed to exist for as long as the row
@@ -263,26 +321,17 @@ func (p *planner) Insert(n *parser.Insert, autoCommit bool) (planNode, *roachpb.
 			}
 		}
 
-		if n.Returning == nil {
-			continue
+		if err := rh.append(retVals); err != nil {
+			return nil, roachpb.NewError(err)
 		}
-		qvals.populateQVals(rowVals)
-		resrow := make(parser.DTuple, len(n.Returning))
-		for i, c := range n.Returning {
-			d, err := c.Expr.Eval(p.evalCtx)
-			if err != nil {
-				return nil, roachpb.NewError(err)
-			}
-			resrow[i] = d
-		}
-		result.rows[len(result.rows)-1] = resrow
 	}
 	if pErr := rows.PErr(); pErr != nil {
 		return nil, pErr
 	}
 
-	if p.prepareOnly {
-		return nil, nil
+	if p.evalCtx.PrepareOnly {
+		// Return the result column types.
+		return rh.getResults()
 	}
 
 	if isSystemConfigID(tableDesc.GetID()) {
@@ -301,7 +350,7 @@ func (p *planner) Insert(n *parser.Insert, autoCommit bool) (planNode, *roachpb.
 	if pErr != nil {
 		return nil, convertBatchError(&tableDesc, *b, pErr)
 	}
-	return result, nil
+	return rh.getResults()
 }
 
 func (p *planner) processColumns(tableDesc *TableDescriptor,
@@ -339,7 +388,7 @@ func (p *planner) processColumns(tableDesc *TableDescriptor,
 func (p *planner) fillDefaults(defaultExprs []parser.Expr,
 	cols []ColumnDescriptor, n *parser.Insert) parser.SelectStatement {
 	if n.DefaultValues() {
-		row := make(parser.Tuple, 0, len(cols))
+		row := make(parser.Exprs, 0, len(cols))
 		for i := range cols {
 			if defaultExprs == nil {
 				row = append(row, parser.DNull)
@@ -347,31 +396,45 @@ func (p *planner) fillDefaults(defaultExprs []parser.Expr,
 			}
 			row = append(row, defaultExprs[i])
 		}
-		return parser.Values{row}
+		return &parser.ValuesClause{Tuples: []*parser.Tuple{{Exprs: row}}}
 	}
 
-	switch values := n.Rows.(type) {
-	case parser.Values:
-		for _, tuple := range values {
-			for i, val := range tuple {
-				switch val.(type) {
-				case parser.DefaultVal:
-					if defaultExprs == nil {
-						tuple[i] = parser.DNull
-						continue
+	values, ok := n.Rows.Select.(*parser.ValuesClause)
+	if !ok {
+		return n.Rows.Select
+	}
+
+	ret := values
+	for tIdx, tuple := range values.Tuples {
+		tupleCopied := false
+		for eIdx, val := range tuple.Exprs {
+			switch val.(type) {
+			case parser.DefaultVal:
+				if !tupleCopied {
+					if ret == values {
+						ret = &parser.ValuesClause{Tuples: append([]*parser.Tuple(nil), values.Tuples...)}
 					}
-					tuple[i] = defaultExprs[i]
+					ret.Tuples[tIdx] =
+						&parser.Tuple{Exprs: append([]parser.Expr(nil), tuple.Exprs...)}
+					tupleCopied = true
+				}
+				if defaultExprs == nil {
+					ret.Tuples[tIdx].Exprs[eIdx] = parser.DNull
+				} else {
+					ret.Tuples[tIdx].Exprs[eIdx] = defaultExprs[eIdx]
 				}
 			}
 		}
 	}
-	return n.Rows
+	return ret
 }
 
-func (p *planner) makeDefaultExprs(cols []ColumnDescriptor) ([]parser.Expr, error) {
-	// Check to see if any of the columns have DEFAULT expressions. If there are
-	// no DEFAULT expressions, we don't bother with constructing the defaults map
-	// as the defaults are all NULL.
+func makeDefaultExprs(
+	cols []ColumnDescriptor, parse *parser.Parser, evalCtx parser.EvalContext,
+) ([]parser.Expr, error) {
+	// Check to see if any of the columns have DEFAULT expressions. If there
+	// are no DEFAULT expressions, we don't bother with constructing the
+	// defaults map as the defaults are all NULL.
 	haveDefaults := false
 	for _, col := range cols {
 		if col.DefaultExpr != nil {
@@ -394,7 +457,7 @@ func (p *planner) makeDefaultExprs(cols []ColumnDescriptor) ([]parser.Expr, erro
 		if err != nil {
 			return nil, err
 		}
-		expr, err = p.parser.NormalizeExpr(p.evalCtx, expr)
+		expr, err = parse.NormalizeExpr(evalCtx, expr)
 		if err != nil {
 			return nil, err
 		}
@@ -404,4 +467,36 @@ func (p *planner) makeDefaultExprs(cols []ColumnDescriptor) ([]parser.Expr, erro
 		defaultExprs = append(defaultExprs, expr)
 	}
 	return defaultExprs, nil
+}
+
+func (p *planner) makeCheckExprs(cols []ColumnDescriptor) ([]parser.Expr, error) {
+	// Check to see if any of the columns have CHECK expressions. If there are
+	// no CHECK expressions, we don't bother with constructing it.
+	numCheck := 0
+	for _, col := range cols {
+		if col.CheckExpr != nil {
+			numCheck++
+			break
+		}
+	}
+	if numCheck == 0 {
+		return nil, nil
+	}
+
+	checkExprs := make([]parser.Expr, 0, numCheck)
+	for _, col := range cols {
+		if col.CheckExpr == nil {
+			continue
+		}
+		expr, err := parser.ParseExprTraditional(*col.CheckExpr)
+		if err != nil {
+			return nil, err
+		}
+		expr, err = p.parser.NormalizeExpr(p.evalCtx, expr)
+		if err != nil {
+			return nil, err
+		}
+		checkExprs = append(checkExprs, expr)
+	}
+	return checkExprs, nil
 }

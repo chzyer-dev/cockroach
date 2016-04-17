@@ -61,6 +61,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"google.golang.org/grpc"
 
 	"github.com/cockroachdb/cockroach/config"
@@ -70,8 +71,8 @@ import (
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 	"github.com/cockroachdb/cockroach/util/stop"
-	"github.com/gogo/protobuf/proto"
 )
 
 const (
@@ -102,11 +103,6 @@ const (
 	// "useful" outgoing gossip connection to free up space for a more
 	// efficiently targeted connection to the most distant node.
 	defaultCullInterval = 60 * time.Second
-)
-
-var (
-	// TestBootstrap is the default gossip bootstrap used for running tests.
-	TestBootstrap = []resolver.Resolver{}
 )
 
 // Storage is an interface which allows the gossip instance
@@ -148,7 +144,8 @@ type Gossip struct {
 	// here and its own set of callbacks.
 	// We do not use the infostore to avoid unmarshalling under the
 	// main gossip lock.
-	systemConfig         *config.SystemConfig
+	systemConfig         config.SystemConfig
+	systemConfigSet      bool
 	systemConfigMu       sync.RWMutex
 	systemConfigChannels []chan<- struct{}
 
@@ -158,12 +155,17 @@ type Gossip struct {
 	resolvers      []resolver.Resolver
 	resolversTried map[int]struct{} // Set of attempted resolver indexes
 	nodeDescs      map[roachpb.NodeID]*roachpb.NodeDescriptor
+
+	// Membership sets for resolvers and bootstrap addresses.
+	resolverAddrs  map[util.UnresolvedAddr]struct{}
+	bootstrapAddrs map[util.UnresolvedAddr]struct{}
 }
 
 // New creates an instance of a gossip node.
 func New(rpcContext *rpc.Context, resolvers []resolver.Resolver, stopper *stop.Stopper) *Gossip {
 	g := &Gossip{
 		Connected:         make(chan struct{}),
+		rpcContext:        rpcContext,
 		server:            newServer(stopper),
 		outgoing:          makeNodeSet(minPeers),
 		bootstrapping:     map[string]struct{}{},
@@ -174,18 +176,10 @@ func New(rpcContext *rpc.Context, resolvers []resolver.Resolver, stopper *stop.S
 		bootstrapInterval: defaultBootstrapInterval,
 		cullInterval:      defaultCullInterval,
 		nodeDescs:         map[roachpb.NodeID]*roachpb.NodeDescriptor{},
+		resolverAddrs:     map[util.UnresolvedAddr]struct{}{},
+		bootstrapAddrs:    map[util.UnresolvedAddr]struct{}{},
 	}
 	g.SetResolvers(resolvers)
-	// The gossip RPC context doesn't measure clock offsets, isn't
-	// shared with the other RPC clients which the node may be using,
-	// and disables reconnects to make it possible to know for certain
-	// which other nodes in the cluster are incoming via gossip.
-	if rpcContext != nil {
-		g.rpcContext = rpcContext.Copy()
-		g.rpcContext.DisableCache = true
-		g.rpcContext.DisableReconnects = true
-		g.rpcContext.RemoteClocks = nil
-	}
 
 	// Add ourselves as a SystemConfig watcher.
 	g.is.registerCallback(KeySystemConfig, g.updateSystemConfig)
@@ -207,10 +201,16 @@ func (g *Gossip) SetNodeID(nodeID roachpb.NodeID) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.is.NodeID != 0 && g.is.NodeID != nodeID {
-		// TODO(spencer): change this to a panic after fixing unittests
-		//   which do invoke this with different node IDs.
-		log.Errorf("different node IDs were set for the same gossip instance (%d, %d)", g.is.NodeID, nodeID)
+		panic(fmt.Sprintf("different node IDs were set for the same gossip instance (%d, %d)", g.is.NodeID, nodeID))
 	}
+	g.is.NodeID = nodeID
+}
+
+// ResetNodeID resets the infostore's node ID.
+// NOTE: use only from unittests.
+func (g *Gossip) ResetNodeID(nodeID roachpb.NodeID) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.is.NodeID = nodeID
 }
 
@@ -221,15 +221,6 @@ func (g *Gossip) SetNodeDescriptor(desc *roachpb.NodeDescriptor) error {
 		return util.Errorf("couldn't gossip descriptor for node %d: %v", desc.NodeID, err)
 	}
 	return nil
-}
-
-// SetStallInterval sets the interval between periodic checks to
-// determine whether the node is not fully connected to the gossip
-// network.
-func (g *Gossip) SetStallInterval(interval time.Duration) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.stallInterval = interval
 }
 
 // SetBootstrapInterval sets a minimum interval between successive
@@ -267,39 +258,30 @@ func (g *Gossip) SetStorage(storage Storage) error {
 	}
 
 	// Merge the stored bootstrap info addresses with any we've become
-	// aware of through the --join bootstrap hosts we've connected to.
-	if len(g.bootstrapInfo.Addresses) > 0 {
-		existing := map[string]struct{}{}
-		makeKey := func(a util.UnresolvedAddr) string { return fmt.Sprintf("%s,%s", a.Network(), a.String()) }
-		for _, addr := range g.bootstrapInfo.Addresses {
-			existing[makeKey(addr)] = struct{}{}
+	// aware of through gossip.
+	existing := map[string]struct{}{}
+	makeKey := func(a util.UnresolvedAddr) string { return fmt.Sprintf("%s,%s", a.Network(), a.String()) }
+	for _, addr := range g.bootstrapInfo.Addresses {
+		existing[makeKey(addr)] = struct{}{}
+	}
+	for _, addr := range storedBI.Addresses {
+		// If the address is new, and isn't our own address, add it.
+		if _, ok := existing[makeKey(addr)]; !ok && addr != g.is.NodeAddr {
+			g.maybeAddBootstrapAddress(addr)
 		}
-		for _, addr := range storedBI.Addresses {
-			// If the address is new, and isn't our own address, add it.
-			if _, ok := existing[makeKey(addr)]; !ok && addr != g.is.NodeAddr {
-				g.bootstrapInfo.Addresses = append(g.bootstrapInfo.Addresses, addr)
-			}
+	}
+	// Persist merged addresses.
+	if numAddrs := len(g.bootstrapInfo.Addresses); numAddrs > len(storedBI.Addresses) {
+		if err := g.storage.WriteBootstrapInfo(&g.bootstrapInfo); err != nil {
+			log.Error(err)
 		}
-		// Persist merged addresses.
-		if numAddrs := len(g.bootstrapInfo.Addresses); numAddrs > len(storedBI.Addresses) {
-			if err := g.storage.WriteBootstrapInfo(&g.bootstrapInfo); err != nil {
-				log.Error(err)
-			}
-		}
-	} else {
-		g.bootstrapInfo = storedBI
 	}
 
 	// Cycle through all persisted bootstrap hosts and add resolvers for
 	// any which haven't already been added.
 	newResolverFound := false
 	for _, addr := range g.bootstrapInfo.Addresses {
-		r, err := resolver.NewResolverFromUnresolvedAddr(addr)
-		if err != nil {
-			log.Warningf("bad node address %s: %s", addr, err)
-			continue
-		}
-		if g.haveResolver(r) {
+		if !g.maybeAddResolver(addr) {
 			continue
 		}
 		// If we find a new resolver, reset the resolver index so that the
@@ -308,7 +290,6 @@ func (g *Gossip) SetStorage(storage Storage) error {
 			newResolverFound = true
 			g.resolverIdx = len(g.resolvers) - 1
 		}
-		g.resolvers = append(g.resolvers, r)
 	}
 
 	// If a new resolver was found, immediately signal bootstrap.
@@ -330,6 +311,8 @@ func (g *Gossip) SetResolvers(resolvers []resolver.Resolver) {
 	g.resolverIdx = len(resolvers) - 1
 	g.resolvers = resolvers
 	g.resolversTried = map[int]struct{}{}
+	// Start new bootstrapping immediately instead of waiting for next bootstrap interval.
+	g.maybeSignalStalledLocked()
 }
 
 // GetResolvers returns a copy of the resolvers slice.
@@ -376,28 +359,31 @@ func (g *Gossip) SimulationCycle() {
 	g.simulationCycler.Broadcast()
 }
 
-// haveResolver returns whether the specified resolver is already in
-// the gossip node's list of resolvers. The caller must hold the
-// gossip mutex.
-// TODO(spencer): sort and binary search.
-func (g *Gossip) haveResolver(r resolver.Resolver) bool {
-	for _, ex := range g.resolvers {
-		if ex.Type() == r.Type() && ex.Addr() == r.Addr() {
-			return true
+// maybeAddResolver creates and adds a resolver for the specified
+// address if one does not already exist. Returns whether a new
+// resolver was added. The caller must hold the gossip mutex.
+func (g *Gossip) maybeAddResolver(addr util.UnresolvedAddr) bool {
+	if _, ok := g.resolverAddrs[addr]; !ok {
+		r, err := resolver.NewResolverFromUnresolvedAddr(addr)
+		if err != nil {
+			log.Warningf("bad address %s: %s", addr, err)
+			return false
 		}
+		g.resolvers = append(g.resolvers, r)
+		g.resolverAddrs[addr] = struct{}{}
+		return true
 	}
 	return false
 }
 
-// haveBootstrapAddress returns whether there is already a bootstrap
-// address matching the specified address. The caller must hold the
-// gossip mutex.
-// TODO(spencer): sort and binary search.
-func (g *Gossip) haveBootstrapAddress(addr util.UnresolvedAddr) bool {
-	for _, ex := range g.bootstrapInfo.Addresses {
-		if ex == addr {
-			return true
-		}
+// maybeAddBootstrapAddress adds the specified address to the list of
+// bootstrap addresses if not already present. Returns whether a new
+// bootstrap address was added. The caller must hold the gossip mutex.
+func (g *Gossip) maybeAddBootstrapAddress(addr util.UnresolvedAddr) bool {
+	if _, ok := g.bootstrapAddrs[addr]; !ok {
+		g.bootstrapInfo.Addresses = append(g.bootstrapInfo.Addresses, addr)
+		g.bootstrapAddrs[addr] = struct{}{}
+		return true
 	}
 	return false
 }
@@ -435,39 +421,36 @@ func (g *Gossip) updateNodeAddress(_ string, content roachpb.Value) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Recompute max peers based on size of network and set the max
-	// sizes for incoming and outgoing node sets.
-	defer func() {
-		maxPeers := g.maxPeers(len(g.nodeDescs))
-		g.incoming.setMaxSize(maxPeers)
-		g.outgoing.setMaxSize(maxPeers)
-	}()
-
-	// Skip if the node has already been seen or it's our own address.
-	if _, ok := g.nodeDescs[desc.NodeID]; ok || desc.Address == g.is.NodeAddr {
+	// Skip if the node has already been seen.
+	if _, ok := g.nodeDescs[desc.NodeID]; ok {
 		return
 	}
+
 	g.nodeDescs[desc.NodeID] = &desc
 
-	// Add this new node to our list of resolvers so we can keep
-	// connecting to gossip if the original resolvers go offline.
-	r, err := resolver.NewResolverFromUnresolvedAddr(desc.Address)
-	if err != nil {
-		log.Warningf("bad address from gossip node %s: %s", desc, err)
+	// Recompute max peers based on size of network and set the max
+	// sizes for incoming and outgoing node sets.
+	maxPeers := g.maxPeers(len(g.nodeDescs))
+	g.incoming.setMaxSize(maxPeers)
+	g.outgoing.setMaxSize(maxPeers)
+
+	// Skip if it's our own address.
+	if desc.Address == g.is.NodeAddr {
 		return
 	}
-	if !g.haveResolver(r) {
-		g.resolvers = append(g.resolvers, r)
-	}
-	// Add new address to bootstrap info and persist if possible.
-	if !g.haveBootstrapAddress(desc.Address) {
-		g.bootstrapInfo.Addresses = append(g.bootstrapInfo.Addresses, desc.Address)
-		if g.storage != nil {
-			// TODO(spencer): need to clean up ancient gossip nodes, which
-			//   will otherwise stick around in the bootstrap info forever.
-			if err := g.storage.WriteBootstrapInfo(&g.bootstrapInfo); err != nil {
-				log.Error(err)
-			}
+
+	// Add this new node address (if it's not already there) to our list
+	// of resolvers so we can keep connecting to gossip if the original
+	// resolvers go offline.
+	g.maybeAddResolver(desc.Address)
+
+	// Add new address (if it's not already there) to bootstrap info and
+	// persist if possible.
+	if g.maybeAddBootstrapAddress(desc.Address) && g.storage != nil {
+		// TODO(spencer): need to clean up ancient gossip nodes, which
+		//   will otherwise stick around in the bootstrap info forever.
+		if err := g.storage.WriteBootstrapInfo(&g.bootstrapInfo); err != nil {
+			log.Error(err)
 		}
 	}
 }
@@ -527,7 +510,7 @@ func (g *Gossip) AddInfo(key string, val []byte, ttl time.Duration) error {
 // AddInfoProto adds or updates an info object. Returns an error if info
 // couldn't be added.
 func (g *Gossip) AddInfoProto(key string, msg proto.Message, ttl time.Duration) error {
-	bytes, err := proto.Marshal(msg)
+	bytes, err := protoutil.Marshal(msg)
 	if err != nil {
 		return err
 	}
@@ -592,12 +575,12 @@ func (g *Gossip) RegisterCallback(pattern string, method Callback) func() {
 	}
 }
 
-// GetSystemConfig returns the local unmarshalled version of the
-// system config. It may be nil if it was never gossiped.
-func (g *Gossip) GetSystemConfig() *config.SystemConfig {
+// GetSystemConfig returns the local unmarshalled version of the system config.
+// The second return value indicates whether the system config has been set yet.
+func (g *Gossip) GetSystemConfig() (config.SystemConfig, bool) {
 	g.systemConfigMu.RLock()
 	defer g.systemConfigMu.RUnlock()
-	return g.systemConfig
+	return g.systemConfig, g.systemConfigSet
 }
 
 // RegisterSystemConfigChannel registers a channel to signify updates for the
@@ -613,7 +596,7 @@ func (g *Gossip) RegisterSystemConfigChannel() <-chan struct{} {
 	g.systemConfigChannels = append(g.systemConfigChannels, c)
 
 	// Notify the channel right away if we have a config.
-	if g.systemConfig != nil {
+	if g.systemConfigSet {
 		c <- struct{}{}
 	}
 
@@ -628,8 +611,8 @@ func (g *Gossip) updateSystemConfig(key string, content roachpb.Value) {
 		log.Fatalf("wrong key received on SystemConfig callback: %s", key)
 		return
 	}
-	cfg := &config.SystemConfig{}
-	if err := content.GetProto(cfg); err != nil {
+	cfg := config.SystemConfig{}
+	if err := content.GetProto(&cfg); err != nil {
 		log.Errorf("could not unmarshal system config on callback: %s", err)
 		return
 	}
@@ -637,6 +620,7 @@ func (g *Gossip) updateSystemConfig(key string, content roachpb.Value) {
 	g.systemConfigMu.Lock()
 	defer g.systemConfigMu.Unlock()
 	g.systemConfig = cfg
+	g.systemConfigSet = true
 	for _, c := range g.systemConfigChannels {
 		select {
 		case c <- struct{}{}:
@@ -705,17 +689,6 @@ func (g *Gossip) hasOutgoing(nodeID roachpb.NodeID) bool {
 	return g.outgoing.hasNode(nodeID)
 }
 
-// filterExtant removes any nodes from the supplied nodeSet which
-// are already connected to this node, either via outgoing or incoming
-// client connections.
-func (g *Gossip) filterExtant(nodes nodeSet) nodeSet {
-	return nodes.filter(func(a roachpb.NodeID) bool {
-		return !g.outgoing.hasNode(a)
-	}).filter(func(a roachpb.NodeID) bool {
-		return !g.incoming.hasNode(a)
-	})
-}
-
 // getNextBootstrapAddress returns the next available bootstrap
 // address by consulting the first non-exhausted resolver from the
 // slice supplied to the constructor or set using setBootstrap().
@@ -723,21 +696,19 @@ func (g *Gossip) filterExtant(nodes nodeSet) nodeSet {
 func (g *Gossip) getNextBootstrapAddress() net.Addr {
 	// Run through resolvers round robin starting at last resolved index.
 	for i := 0; i < len(g.resolvers); i++ {
-		g.resolverIdx = (g.resolverIdx + 1) % len(g.resolvers)
+		g.resolverIdx++
+		g.resolverIdx %= len(g.resolvers)
 		g.resolversTried[g.resolverIdx] = struct{}{}
 		resolver := g.resolvers[g.resolverIdx]
-		addr, err := resolver.GetAddress()
-		if err != nil {
+		if addr, err := resolver.GetAddress(); err != nil {
 			log.Errorf("invalid bootstrap address: %+v, %v", resolver, err)
 			continue
-		} else if addr.String() == g.is.NodeAddr.String() {
-			// Skip our own node address.
-			continue
-		}
-		_, addrActive := g.bootstrapping[addr.String()]
-		if !resolver.IsExhausted() || !addrActive {
-			g.bootstrapping[addr.String()] = struct{}{}
-			return addr
+		} else {
+			addrStr := addr.String()
+			if _, addrActive := g.bootstrapping[addrStr]; !addrActive {
+				g.bootstrapping[addrStr] = struct{}{}
+				return addr
+			}
 		}
 	}
 
@@ -766,6 +737,10 @@ func (g *Gossip) bootstrap() {
 					// Try to get another bootstrap address from the resolvers.
 					if addr := g.getNextBootstrapAddress(); addr != nil {
 						g.startClient(addr, stopper)
+					} else {
+						// We couldn't start a client, signal that we're stalled so that
+						// we'll retry.
+						g.maybeSignalStalledLocked()
 					}
 				}
 			})
@@ -775,14 +750,14 @@ func (g *Gossip) bootstrap() {
 			select {
 			case <-bootstrapTimer.C:
 				bootstrapTimer.Read = true
-				// continue
+				// break
 			case <-stopper.ShouldStop():
 				return
 			}
 			// Block until we need bootstrapping again.
 			select {
 			case <-g.stalled:
-				// continue
+				// break
 			case <-stopper.ShouldStop():
 				return
 			}

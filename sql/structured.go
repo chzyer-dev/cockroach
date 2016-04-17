@@ -43,10 +43,22 @@ type IndexID uint32
 // DescriptorVersion is a custom type for TableDescriptor Versions.
 type DescriptorVersion uint32
 
+// FormatVersion is a custom type for TableDescriptor versions of the sql to
+// key:value mapping.
+//go:generate stringer -type=FormatVersion
+type FormatVersion uint32
+
+const (
+	_ FormatVersion = iota
+	// BaseFormatVersion corresponds to the encoding described in
+	// https://www.cockroachlabs.com/blog/sql-in-cockroachdb-mapping-table-data-to-key-value-storage/.
+	BaseFormatVersion
+)
+
 // MutationID is custom type for TableDescriptor mutations.
 type MutationID uint32
 
-const invalidMutationID = 0
+const invalidMutationID MutationID = 0
 
 const (
 	// PrimaryKeyIndexName is the name of the index for the primary key.
@@ -250,7 +262,7 @@ func (desc *TableDescriptor) AllocateIDs() error {
 			columnID = desc.NextColumnID
 			desc.NextColumnID++
 		}
-		columnNames[normalizeName(c.Name)] = columnID
+		columnNames[NormalizeName(c.Name)] = columnID
 		c.ID = columnID
 	}
 	for i := range desc.Columns {
@@ -298,7 +310,7 @@ func (desc *TableDescriptor) AllocateIDs() error {
 				index.ColumnIDs = append(index.ColumnIDs, 0)
 			}
 			if index.ColumnIDs[j] == 0 {
-				index.ColumnIDs[j] = columnNames[normalizeName(colName)]
+				index.ColumnIDs[j] = columnNames[NormalizeName(colName)]
 			}
 		}
 		if index != &desc.PrimaryIndex {
@@ -365,6 +377,12 @@ func (desc *TableDescriptor) Validate() error {
 		return fmt.Errorf("invalid parent ID %d", desc.ParentID)
 	}
 
+	if desc.GetFormatVersion() != BaseFormatVersion {
+		return fmt.Errorf(
+			"table %q is encoded using using version %d, but this client only supports version %d",
+			desc.Name, desc.GetFormatVersion(), BaseFormatVersion)
+	}
+
 	if len(desc.Columns) == 0 {
 		return errMissingColumns
 	}
@@ -378,10 +396,12 @@ func (desc *TableDescriptor) Validate() error {
 		if column.ID == 0 {
 			return fmt.Errorf("invalid column ID %d", column.ID)
 		}
-		if _, ok := columnNames[normalizeName(column.Name)]; ok {
+
+		normName := NormalizeName(column.Name)
+		if _, ok := columnNames[normName]; ok {
 			return fmt.Errorf("duplicate column name: \"%s\"", column.Name)
 		}
-		columnNames[normalizeName(column.Name)] = column.ID
+		columnNames[normName] = column.ID
 
 		if other, ok := columnIDs[column.ID]; ok {
 			return fmt.Errorf("column \"%s\" duplicate ID of column \"%s\": %d",
@@ -429,10 +449,11 @@ func (desc *TableDescriptor) Validate() error {
 			return fmt.Errorf("invalid index ID %d", index.ID)
 		}
 
-		if _, ok := indexNames[normalizeName(index.Name)]; ok {
+		normName := NormalizeName(index.Name)
+		if _, ok := indexNames[normName]; ok {
 			return fmt.Errorf("duplicate index name: \"%s\"", index.Name)
 		}
-		indexNames[normalizeName(index.Name)] = struct{}{}
+		indexNames[normName] = struct{}{}
 
 		if other, ok := indexIDs[index.ID]; ok {
 			return fmt.Errorf("index \"%s\" duplicate ID of index \"%s\": %d",
@@ -459,7 +480,7 @@ func (desc *TableDescriptor) Validate() error {
 		}
 
 		for i, name := range index.ColumnNames {
-			colID, ok := columnNames[normalizeName(name)]
+			colID, ok := columnNames[NormalizeName(name)]
 			if !ok {
 				return fmt.Errorf("index \"%s\" contains unknown column \"%s\"", index.Name, name)
 			}
@@ -469,6 +490,7 @@ func (desc *TableDescriptor) Validate() error {
 			}
 		}
 	}
+
 	// Validate the privilege descriptor.
 	return desc.Privileges.Validate(desc.GetID())
 }
@@ -501,14 +523,15 @@ func (desc *TableDescriptor) AddIndex(idx IndexDescriptor, primary bool) error {
 // DescriptorStatus for the column, and an index into either the columns
 // (status == DescriptorActive) or mutations (status == DescriptorIncomplete).
 func (desc *TableDescriptor) FindColumnByName(name string) (DescriptorStatus, int, error) {
+	normName := NormalizeName(name)
 	for i, c := range desc.Columns {
-		if equalName(c.Name, name) {
+		if NormalizeName(c.Name) == normName {
 			return DescriptorActive, i, nil
 		}
 	}
 	for i, m := range desc.Mutations {
 		if c := m.GetColumn(); c != nil {
-			if equalName(c.Name, name) {
+			if NormalizeName(c.Name) == normName {
 				return DescriptorIncomplete, i, nil
 			}
 		}
@@ -518,8 +541,9 @@ func (desc *TableDescriptor) FindColumnByName(name string) (DescriptorStatus, in
 
 // FindActiveColumnByName finds an active column with the specified name.
 func (desc *TableDescriptor) FindActiveColumnByName(name string) (ColumnDescriptor, error) {
+	normName := NormalizeName(name)
 	for _, c := range desc.Columns {
-		if equalName(c.Name, name) {
+		if NormalizeName(c.Name) == normName {
 			return c, nil
 		}
 	}
@@ -540,14 +564,15 @@ func (desc *TableDescriptor) FindColumnByID(id ColumnID) (*ColumnDescriptor, err
 // DescriptorStatus for the index, and an index into either the indexes
 // (status == DescriptorActive) or mutations (status == DescriptorIncomplete).
 func (desc *TableDescriptor) FindIndexByName(name string) (DescriptorStatus, int, error) {
+	normName := NormalizeName(name)
 	for i, idx := range desc.Indexes {
-		if equalName(idx.Name, name) {
+		if NormalizeName(idx.Name) == normName {
 			return DescriptorActive, i, nil
 		}
 	}
 	for i, m := range desc.Mutations {
 		if idx := m.GetIndex(); idx != nil {
-			if equalName(idx.Name, name) {
+			if NormalizeName(idx.Name) == normName {
 				return DescriptorIncomplete, i, nil
 			}
 		}
@@ -684,4 +709,28 @@ func (desc *DatabaseDescriptor) Validate() error {
 	}
 	// Validate the privilege descriptor.
 	return desc.Privileges.Validate(desc.GetID())
+}
+
+// GetID returns the ID of the descriptor.
+func (desc *Descriptor) GetID() ID {
+	switch t := desc.Union.(type) {
+	case *Descriptor_Table:
+		return t.Table.ID
+	case *Descriptor_Database:
+		return t.Database.ID
+	default:
+		return 0
+	}
+}
+
+// GetName returns the Name of the descriptor.
+func (desc *Descriptor) GetName() string {
+	switch t := desc.Union.(type) {
+	case *Descriptor_Table:
+		return t.Table.Name
+	case *Descriptor_Database:
+		return t.Database.Name
+	default:
+		return ""
+	}
 }

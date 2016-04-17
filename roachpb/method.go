@@ -19,6 +19,7 @@ package roachpb
 // Method is the enumerated type for methods.
 type Method int
 
+//go:generate stringer -type=Method
 const (
 	// Get fetches the value for a key from the KV map, respecting a
 	// possibly historical timestamp. If the timestamp is 0, returns
@@ -102,7 +103,12 @@ const (
 	TruncateLog
 	// LeaderLease requests a leader lease for a replica.
 	LeaderLease
-	// Batch implements batch processing of commands. This is a
-	// superset of the Batch method.
-	Batch
+	// ComputeChecksum starts a checksum computation over a replica snapshot.
+	ComputeChecksum
+	// VerifyChecksum verifies the checksum computed through an earlier
+	// ComputeChecksum.
+	VerifyChecksum
+	// CheckConsistency verifies the consistency of all ranges falling within a
+	// key span.
+	CheckConsistency
 )

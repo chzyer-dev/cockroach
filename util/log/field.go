@@ -16,15 +16,56 @@
 
 package log
 
-// A Field is an integer used to enumerate allowed field names in structured
-// log output.
-type Field int
-
-//go:generate stringer -type Field
-const (
-	NodeID   Field = iota // the ID of the node
-	StoreID               // the ID of the store
-	RangeID               // the ID of the range
-	Key                   // a roachpb.Key related to an event.
-	maxField              // internal field bounding the range of allocated fields
+import (
+	"bytes"
+	"fmt"
 )
+
+type field interface {
+	format(buf *bytes.Buffer, v interface{})
+}
+
+type nodeIDField struct{}
+
+func (nodeIDField) String() string {
+	return "NodeID"
+}
+
+func (nodeIDField) format(buf *bytes.Buffer, v interface{}) {
+	fmt.Fprintf(buf, "node=%d", v)
+}
+
+type storeIDField struct{}
+
+func (storeIDField) String() string {
+	return "StoreID"
+}
+
+func (storeIDField) format(buf *bytes.Buffer, v interface{}) {
+	fmt.Fprintf(buf, "store=%d", v)
+}
+
+type rangeIDField struct{}
+
+func (rangeIDField) String() string {
+	return "RangeID"
+}
+
+func (rangeIDField) format(buf *bytes.Buffer, v interface{}) {
+	fmt.Fprintf(buf, "range=%d", v)
+}
+
+var (
+	// NodeID is a context key identifying a node ID.
+	NodeID = nodeIDField{}
+	// StoreID is a context key identifying a store ID.
+	StoreID = storeIDField{}
+	// RangeID is a context key identifying a range ID.
+	RangeID = rangeIDField{}
+)
+
+var allFields = []field{
+	NodeID,
+	StoreID,
+	RangeID,
+}

@@ -22,80 +22,138 @@ import (
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/sql/parser"
-	"github.com/cockroachdb/cockroach/util"
 )
 
-// limit constructs a limitNode based on the LIMIT and OFFSET clauses.
-func (p *planner) limit(n *parser.Select, plan planNode) (planNode, error) {
-	if n.Limit == nil {
-		return plan, nil
+// evalLimit evaluates the Count and Offset fields. If Count is missing, the
+// value is MaxInt64. If Offset is missing, the value is 0
+func (p *planner) evalLimit(limit *parser.Limit) (count, offset int64, err error) {
+	count = math.MaxInt64
+	offset = 0
+
+	if limit == nil {
+		return count, offset, nil
 	}
 
-	var count, offset int64
-
 	data := []struct {
-		name       string
-		src        parser.Expr
-		dst        *int64
-		defaultVal int64
+		name string
+		src  parser.Expr
+		dst  *int64
 	}{
-		{"LIMIT", n.Limit.Count, &count, math.MaxInt64},
-		{"OFFSET", n.Limit.Offset, &offset, 0},
+		{"LIMIT", limit.Count, &count},
+		{"OFFSET", limit.Offset, &offset},
 	}
 
 	for _, datum := range data {
-		if datum.src == nil {
-			*datum.dst = datum.defaultVal
-		} else {
-			if parser.ContainsVars(datum.src) {
-				return nil, util.Errorf("argument of %s must not contain variables", datum.name)
+		if datum.src != nil {
+			valType, err := datum.src.TypeCheck(p.evalCtx.Args)
+			if err != nil {
+				return 0, 0, err
 			}
 
-			normalized, err := p.parser.NormalizeExpr(p.evalCtx, datum.src)
+			set, err := p.evalCtx.Args.SetInferredType(valType, parser.DummyInt)
 			if err != nil {
-				return nil, err
+				return 0, 0, err
 			}
-			dstDatum, err := normalized.Eval(p.evalCtx)
+			if set == nil && !valType.TypeEqual(parser.DummyInt) && valType != parser.DNull {
+				return 0, 0, fmt.Errorf("argument of %s must be type %s, not type %s",
+					datum.name, parser.DummyInt.Type(), valType.Type())
+			}
+
+			if p.evalCtx.PrepareOnly {
+				continue
+			}
+
+			dstDatum, err := datum.src.Eval(p.evalCtx)
 			if err != nil {
-				return nil, err
+				return 0, 0, err
 			}
 
 			if dstDatum == parser.DNull {
-				*datum.dst = datum.defaultVal
+				// Use the default value.
 				continue
 			}
 
-			if dstDInt, ok := dstDatum.(parser.DInt); ok {
-				*datum.dst = int64(dstDInt)
-				continue
+			dstDInt := dstDatum.(parser.DInt)
+			val := int64(dstDInt)
+			if val < 0 {
+				return 0, 0, fmt.Errorf("negative value for %s", datum.name)
 			}
-
-			return nil, fmt.Errorf("argument of %s must be type %s, not type %s", datum.name, parser.DummyInt.Type(), dstDatum.Type())
+			*datum.dst = val
 		}
 	}
+	return count, offset, nil
+}
 
-	return &limitNode{planNode: plan, count: count, offset: offset}, nil
+// limit constructs a limitNode based on the LIMIT and OFFSET clauses.
+func (p *planner) limit(count, offset int64, plan planNode) planNode {
+	if count == math.MaxInt64 && offset == 0 {
+		return plan
+	}
+
+	if count != math.MaxInt64 {
+		plan.SetLimitHint(offset+count, false /* hard */)
+	}
+
+	return &limitNode{planNode: plan, count: count, offset: offset}
 }
 
 type limitNode struct {
 	planNode
-	count          int64
-	offset         int64
-	rowIndex       int64
-	outputRowIndex int64
+	count     int64
+	offset    int64
+	rowIndex  int64
+	explain   explainMode
+	debugVals debugValues
+}
+
+func (n *limitNode) MarkDebug(mode explainMode) {
+	if mode != explainDebug {
+		panic(fmt.Sprintf("unknown debug mode %d", mode))
+	}
+	n.explain = mode
+	n.planNode.MarkDebug(mode)
+}
+
+func (n *limitNode) DebugValues() debugValues {
+	if n.explain != explainDebug {
+		panic(fmt.Sprintf("node not in debug mode (mode %d)", n.explain))
+	}
+	return n.debugVals
 }
 
 func (n *limitNode) Next() bool {
-	if n.outputRowIndex >= n.count {
+	// n.rowIndex is the 0-based index of the next row.
+	// We don't do (n.rowIndex >= n.offset + n.count) to avoid overflow (count can be MaxInt64).
+	if n.rowIndex-n.offset >= n.count {
 		return false
 	}
 
-	for n.rowIndex < n.offset && n.planNode.Next() {
-		n.rowIndex++
-	}
+	for {
+		if !n.planNode.Next() {
+			return false
+		}
 
-	n.outputRowIndex++
-	return n.planNode.Next()
+		if n.explain == explainDebug {
+			n.debugVals = n.planNode.DebugValues()
+			if n.debugVals.output != debugValueRow {
+				// Let the non-row debug values pass through.
+				return true
+			}
+		}
+
+		n.rowIndex++
+		if n.rowIndex > n.offset {
+			// Row within limits, return it.
+			return true
+		}
+
+		if n.explain == explainDebug {
+			// Return as a filtered row.
+			n.debugVals.output = debugValueFiltered
+			return true
+		}
+		// Fetch the next row.
+	}
 }
 
 func (n *limitNode) ExplainPlan() (string, string, []planNode) {
@@ -108,3 +166,5 @@ func (n *limitNode) ExplainPlan() (string, string, []planNode) {
 
 	return "limit", fmt.Sprintf("count: %s, offset: %d", count, n.offset), []planNode{n.planNode}
 }
+
+func (*limitNode) SetLimitHint(_ int64, _ bool) {}

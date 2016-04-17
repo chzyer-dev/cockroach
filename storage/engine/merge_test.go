@@ -23,9 +23,11 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/gogo/protobuf/proto"
+
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/leaktest"
-	"github.com/gogo/protobuf/proto"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 )
 
 var testtime = int64(-446061360000000000)
@@ -47,7 +49,7 @@ func gibberishString(n int) string {
 }
 
 func mustMarshal(m proto.Message) []byte {
-	b, err := proto.Marshal(m)
+	b, err := protoutil.Marshal(m)
 	if err != nil {
 		panic(err)
 	}
@@ -61,14 +63,20 @@ func appender(s string) []byte {
 }
 
 // timeSeries generates a simple InternalTimeSeriesData object which starts
-// at the given timestamp and has samples of the given duration.
+// at the given timestamp and has samples of the given duration. The object is
+// stored in an MVCCMetadata object and marshalled to bytes.
 func timeSeries(start int64, duration int64, samples ...tsSample) []byte {
+	tsv := timeSeriesAsValue(start, duration, samples...)
+	return mustMarshal(&MVCCMetadata{RawBytes: tsv.RawBytes})
+}
+
+func timeSeriesAsValue(start int64, duration int64, samples ...tsSample) roachpb.Value {
 	ts := &roachpb.InternalTimeSeriesData{
 		StartTimestampNanos: start,
 		SampleDurationNanos: duration,
 	}
 	for _, sample := range samples {
-		newSample := &roachpb.InternalTimeSeriesSample{
+		newSample := roachpb.InternalTimeSeriesSample{
 			Offset: sample.offset,
 			Count:  sample.count,
 			Sum:    sample.sum,
@@ -83,13 +91,13 @@ func timeSeries(start int64, duration int64, samples ...tsSample) []byte {
 	if err := v.SetProto(ts); err != nil {
 		panic(err)
 	}
-	return mustMarshal(&MVCCMetadata{RawBytes: v.RawBytes})
+	return v
 }
 
 // TestGoMerge tests the function goMerge but not the integration with
 // the storage engines. For that, see the engine tests.
 func TestGoMerge(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// Let's start with stuff that should go wrong.
 	badCombinations := []struct {
 		existing, update []byte
@@ -189,7 +197,7 @@ func TestGoMerge(t *testing.T) {
 			}...),
 			timeSeries(testtime, 1000, []tsSample{
 				{1, 1, 5, 5, 5},
-				{2, 2, 10, 5, 5},
+				{2, 1, 5, 5, 5},
 			}...),
 		},
 		{
@@ -230,8 +238,8 @@ func TestGoMerge(t *testing.T) {
 				{3, 1, 5, 5, 5},
 			}...),
 			timeSeries(testtime, 1000, []tsSample{
-				{1, 3, 115, 100, 5},
-				{2, 2, 10, 5, 5},
+				{1, 1, 100, 100, 100},
+				{2, 1, 5, 5, 5},
 				{3, 1, 5, 5, 5},
 			}...),
 		},
@@ -251,7 +259,6 @@ func TestGoMerge(t *testing.T) {
 
 	for i, c := range testCasesTimeSeries {
 		expectedTS := unmarshalTimeSeries(t, c.expected)
-		existingTS := unmarshalTimeSeries(t, c.existing)
 		updateTS := unmarshalTimeSeries(t, c.update)
 
 		// Directly test the C++ implementation of merging using goMerge.  goMerge
@@ -267,9 +274,10 @@ func TestGoMerge(t *testing.T) {
 		}
 
 		// Test the MergeInternalTimeSeriesData method separately.
-		if existingTS == nil {
+		if c.existing == nil {
 			resultTS, err = MergeInternalTimeSeriesData(updateTS)
 		} else {
+			existingTS := unmarshalTimeSeries(t, c.existing)
 			resultTS, err = MergeInternalTimeSeriesData(existingTS, updateTS)
 		}
 		if err != nil {
@@ -286,10 +294,7 @@ func TestGoMerge(t *testing.T) {
 // unmarshalTimeSeries unmarshals the time series value stored in the given byte
 // array. It is assumed that the time series value was originally marshalled as
 // a MVCCMetadata with an inline value.
-func unmarshalTimeSeries(t testing.TB, b []byte) *roachpb.InternalTimeSeriesData {
-	if b == nil {
-		return nil
-	}
+func unmarshalTimeSeries(t testing.TB, b []byte) roachpb.InternalTimeSeriesData {
 	var meta MVCCMetadata
 	if err := proto.Unmarshal(b, &meta); err != nil {
 		t.Fatalf("error unmarshalling time series in text: %s", err.Error())
@@ -298,5 +303,5 @@ func unmarshalTimeSeries(t testing.TB, b []byte) *roachpb.InternalTimeSeriesData
 	if err != nil {
 		t.Fatalf("error unmarshalling time series in text: %s", err.Error())
 	}
-	return &valueTS
+	return valueTS
 }

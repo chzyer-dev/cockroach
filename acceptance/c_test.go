@@ -14,8 +14,6 @@
 //
 // Author: Matt Jibson (mjibson@cockroachlabs.com)
 
-// +build acceptance
-
 package acceptance
 
 import (
@@ -23,9 +21,7 @@ import (
 	"testing"
 )
 
-// TestC connects to a cluster with C.
-func TestC(t *testing.T) {
-	t.Skip("https://github.com/cockroachdb/cockroach/issues/3826")
+func TestDockerC(t *testing.T) {
 	testDockerSuccess(t, "c", []string{"/bin/sh", "-c", strings.Replace(c, "%v", "3", 1)})
 	testDockerFail(t, "c", []string{"/bin/sh", "-c", strings.Replace(c, "%v", "a", 1)})
 }
@@ -33,6 +29,7 @@ func TestC(t *testing.T) {
 const c = `
 set -e
 cat > main.c << 'EOF'
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,6 +81,6 @@ main(int argc, char **argv)
 	return 0;
 }
 EOF
-gcc -lpq main.c
+gcc -std=c99 -I/usr/include/postgresql/ -lpq main.c
 ./a.out
 `

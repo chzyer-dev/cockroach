@@ -17,16 +17,9 @@
 package client
 
 import (
-	"fmt"
-	"net/url"
-	"sync"
-
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/util/log"
-	"github.com/cockroachdb/cockroach/util/stop"
 )
 
 // Sender is the interface used to call into a Cockroach instance.
@@ -44,43 +37,13 @@ func (f SenderFunc) Send(ctx context.Context, ba roachpb.BatchRequest) (*roachpb
 	return f(ctx, ba)
 }
 
-// newSenderFunc creates a new sender for the registered scheme.
-type newSenderFunc func(u *url.URL, ctx *base.Context, stopper *stop.Stopper) (Sender, error)
-
-var senders = struct {
-	sync.Mutex
-	m map[string]newSenderFunc
-}{m: map[string]newSenderFunc{}}
-
-// RegisterSender registers the specified function to be used for
-// creation of a new sender when the specified scheme is encountered.
-func RegisterSender(scheme string, f newSenderFunc) {
-	if f == nil {
-		log.Fatalf("unable to register nil function for \"%s\"", scheme)
-	}
-	senders.Lock()
-	defer senders.Unlock()
-	if _, ok := senders.m[scheme]; ok {
-		log.Fatalf("sender already registered for \"%s\"", scheme)
-	}
-	senders.m[scheme] = f
-}
-
-func newSender(u *url.URL, ctx *base.Context, stopper *stop.Stopper) (Sender, error) {
-	senders.Lock()
-	defer senders.Unlock()
-	f := senders.m[u.Scheme]
-	if f == nil {
-		return nil, fmt.Errorf("no sender registered for \"%s\"", u.Scheme)
-	}
-	return f(u, ctx, stopper)
-}
-
 // SendWrappedWith is a convenience function which wraps the request in a batch
-// and sends it via the provided Sender at the given timestamp. It returns the
-// unwrapped response or an error. It's valid to pass a `nil` context;
-// context.Background() is used in that case.
-func SendWrappedWith(sender Sender, ctx context.Context, h roachpb.Header, args roachpb.Request) (roachpb.Response, *roachpb.Error) {
+// and sends it via the provided Sender and headers. It returns the unwrapped
+// response or an error. It's valid to pass a `nil` context; an empty one is
+// used in that case.
+func SendWrappedWith(
+	sender Sender, ctx context.Context, h roachpb.Header, args roachpb.Request,
+) (roachpb.Response, *roachpb.Error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -93,11 +56,15 @@ func SendWrappedWith(sender Sender, ctx context.Context, h roachpb.Header, args 
 		return nil, pErr
 	}
 	unwrappedReply := br.Responses[0].GetInner()
-	unwrappedReply.Header().Txn = br.Txn
+	header := unwrappedReply.Header()
+	header.Txn = br.Txn
+	unwrappedReply.SetHeader(header)
 	return unwrappedReply, nil
 }
 
 // SendWrapped is identical to SendWrappedAt with a zero header.
+// TODO(tschottdorf): should move this to testutils and merge with other helpers
+// which are used, for example, in `storage`.
 func SendWrapped(sender Sender, ctx context.Context, args roachpb.Request) (roachpb.Response, *roachpb.Error) {
 	return SendWrappedWith(sender, ctx, roachpb.Header{}, args)
 }

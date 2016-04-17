@@ -31,7 +31,7 @@ var (
 	// the store and/or ranges which they refer to. Storing this
 	// information in the normal system keyspace would place the data on
 	// an arbitrary set of stores, with no guarantee of collocation.
-	// Local data includes store metadata, range metadata, sequence
+	// Local data includes store metadata, range metadata, abort
 	// cache values, transaction records, range-spanning binary tree
 	// node pointers, and message queues.
 	//
@@ -40,7 +40,7 @@ var (
 	// via the meta range addressing indexes.
 	//
 	// Some local data are not replicated, such as the store's 'ident'
-	// record. Most local data are replicated, such as sequence cache
+	// record. Most local data are replicated, such as abort cache
 	// entries and transaction rows, but are not addressable as normal
 	// MVCC values as part of transactions. Finally, some local data are
 	// stored as MVCC values and are addressable as part of distributed
@@ -71,33 +71,51 @@ var (
 	// encoded using EncodeUvarint. The specific sort of per-range
 	// metadata is identified by one of the suffixes listed below, along
 	// with potentially additional encoded key info, for instance in the
-	// case of sequence cache entry.
+	// case of abort cache entry.
 	//
 	// NOTE: LocalRangeIDPrefix must be kept in sync with the value
 	// in storage/engine/rocksdb/db.cc.
 	LocalRangeIDPrefix = roachpb.RKey(makeKey(localPrefix, roachpb.Key("i")))
-	// LocalSequenceCacheSuffix is the suffix used for the replay protection
-	// mechanism.
-	LocalSequenceCacheSuffix = []byte("res-")
-	// localRaftLeaderLeaseSuffix is the suffix for the raft leader lease.
-	localRaftLeaderLeaseSuffix = []byte("rfll")
+
+	// localRangeIDReplicatedInfix is the post-Range ID specifier for all Raft
+	// replicated per-range data. By appending this after the Range ID, these
+	// keys will be sorted directly before the local unreplicated keys for the
+	// same Range ID, so they can be manipulated either together or individually
+	// in a single scan.
+	localRangeIDReplicatedInfix = []byte("r")
+	// LocalAbortCacheSuffix is the suffix for abort cache entries. The
+	// abort cache protects a transaction from re-reading its own intents
+	// after it's been aborted.
+	LocalAbortCacheSuffix = []byte("abc-")
 	// localRaftTombstoneSuffix is the suffix for the raft tombstone.
 	localRaftTombstoneSuffix = []byte("rftb")
-	// localRaftHardStateSuffix is the Suffix for the raft HardState.
-	localRaftHardStateSuffix = []byte("rfth")
 	// localRaftAppliedIndexSuffix is the suffix for the raft applied index.
 	localRaftAppliedIndexSuffix = []byte("rfta")
-	// localRaftLogSuffix is the suffix for the raft log.
-	localRaftLogSuffix = []byte("rftl")
 	// localRaftTruncatedStateSuffix is the suffix for the RaftTruncatedState.
 	localRaftTruncatedStateSuffix = []byte("rftt")
+	// localRangeLeaderLeaseSuffix is the suffix for a range leader lease.
+	localRangeLeaderLeaseSuffix = []byte("rll-")
+	// localRangeStatsSuffix is the suffix for range statistics.
+	localRangeStatsSuffix = []byte("stat")
+
+	// localRangeIDUnreplicatedInfix is the post-Range ID specifier for all
+	// per-range data that is not fully Raft replicated. By appending this
+	// after the Range ID, these keys will be sorted directly after the local
+	// replicated keys for the same Range ID, so they can be manipulated either
+	// together or individually in a single scan.
+	localRangeIDUnreplicatedInfix = []byte("u")
+	// localRaftHardStateSuffix is the Suffix for the raft HardState.
+	localRaftHardStateSuffix = []byte("rfth")
 	// localRaftLastIndexSuffix is the suffix for raft's last index.
 	localRaftLastIndexSuffix = []byte("rfti")
+	// localRaftLogSuffix is the suffix for the raft log.
+	localRaftLogSuffix = []byte("rftl")
+	// localRangeLastReplicaGCTimestampSuffix is the suffix for a range's
+	// last replica GC timestamp (for GC of old replicas).
+	localRangeLastReplicaGCTimestampSuffix = []byte("rlrt")
 	// localRangeLastVerificationTimestampSuffix is the suffix for a range's
 	// last verification timestamp (for checking integrity of on-disk data).
 	localRangeLastVerificationTimestampSuffix = []byte("rlvt")
-	// localRangeStatsSuffix is the suffix for range statistics.
-	localRangeStatsSuffix = []byte("stat")
 
 	// LocalRangePrefix is the prefix identifying per-range data indexed
 	// by range key (either start key, or some key in the range). The
@@ -160,13 +178,15 @@ var (
 
 	// StatusPrefix specifies the key prefix to store all status details.
 	StatusPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("status-")))
-	// StatusStorePrefix stores all status info for stores.
-	StatusStorePrefix = roachpb.Key(makeKey(StatusPrefix, roachpb.RKey("store-")))
 	// StatusNodePrefix stores all status info for nodes.
 	StatusNodePrefix = roachpb.Key(makeKey(StatusPrefix, roachpb.RKey("node-")))
 
 	// TimeseriesPrefix is the key prefix for all timeseries data.
 	TimeseriesPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("tsd")))
+
+	// UpdateCheckPrefix is the key prefix for all update check times.
+	UpdateCheckPrefix  = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("update-")))
+	UpdateCheckCluster = roachpb.Key(makeKey(UpdateCheckPrefix, roachpb.RKey("cluster")))
 
 	// TableDataMin is the start of the range of table data keys.
 	TableDataMin = roachpb.Key(encoding.EncodeVarintAscending(nil, math.MinInt64))
@@ -210,9 +230,11 @@ const (
 	UsersTableID      = 4
 	ZonesTableID      = 5
 
-	// Reserved IDs for other system tables.
+	// Reserved IDs for other system tables. If you're adding a new system table,
+	// it probably belongs here.
 	// NOTE: IDs must be <= MaxReservedDescID.
 	LeaseTableID      = 11
 	EventLogTableID   = 12
 	RangeEventTableID = 13
+	UITableID         = 14
 )

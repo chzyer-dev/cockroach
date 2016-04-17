@@ -17,13 +17,15 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
 	"runtime"
 	"strconv"
-	"time"
+
+	"github.com/julienschmidt/httprouter"
 
 	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/client"
@@ -31,11 +33,9 @@ import (
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/server/status"
-	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
-	"github.com/cockroachdb/cockroach/util/metric"
-	"github.com/julienschmidt/httprouter"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 const (
@@ -53,8 +53,6 @@ const (
 										   goroutines
 		/_status/nodes				     - all nodes' status
 		/_status/nodes/:node_id		     - a specific node's status
-		/_status/stores                  - all stores' status
-		/_status/stores/:store_id        - a specific store's status
 	*/
 
 	// statusPrefix is the root of the cluster statistics and metrics API.
@@ -86,12 +84,9 @@ const (
 	// statusNodePattern exposes status for a single node.
 	statusNodePattern = statusPrefix + "nodes/:node_id"
 
-	// statusStoresPrefix exposes status for all stores in the cluster.
-	statusStoresPrefix = statusPrefix + "stores/"
-	// statusStorePattern exposes status for a single store.
-	statusStorePattern = statusPrefix + "stores/:store_id"
-
-	// statusMetricsPattern exposes transient stats / metrics for a node.
+	// statusMetricsPrefix exposes transient stats.
+	statusMetricsPrefix = statusPrefix + "metrics/"
+	// statusMetricsPattern exposes transient stats for a node.
 	statusMetricsPattern = statusPrefix + "metrics/:node_id"
 
 	// healthEndpoint is a shortcut for local details, intended for use by
@@ -106,14 +101,14 @@ var localRE = regexp.MustCompile(`(?i)local`)
 type statusServer struct {
 	db           *client.DB
 	gossip       *gossip.Gossip
-	metaRegistry *metric.Registry
+	metricSource json.Marshaler
 	router       *httprouter.Router
 	ctx          *Context
 	proxyClient  *http.Client
 }
 
 // newStatusServer allocates and returns a statusServer.
-func newStatusServer(db *client.DB, gossip *gossip.Gossip, metaRegistry *metric.Registry, ctx *Context) *statusServer {
+func newStatusServer(db *client.DB, gossip *gossip.Gossip, metricSource json.Marshaler, ctx *Context) *statusServer {
 	// Create an http client with a timeout
 	tlsConfig, err := ctx.GetClientTLSConfig()
 	if err != nil {
@@ -128,7 +123,7 @@ func newStatusServer(db *client.DB, gossip *gossip.Gossip, metaRegistry *metric.
 	server := &statusServer{
 		db:           db,
 		gossip:       gossip,
-		metaRegistry: metaRegistry,
+		metricSource: metricSource,
 		router:       httprouter.New(),
 		ctx:          ctx,
 		proxyClient:  httpClient,
@@ -139,11 +134,11 @@ func newStatusServer(db *client.DB, gossip *gossip.Gossip, metaRegistry *metric.
 	server.router.GET(statusLogFilesListPattern, server.handleLogFilesList)
 	server.router.GET(statusLogFilePattern, server.handleLogFile)
 	server.router.GET(statusLogsPattern, server.handleLogs)
+	// TODO(tschottdorf): significant overlap with /debug/pprof/goroutine,
+	// except that this one allows querying by NodeID.
 	server.router.GET(statusStacksPattern, server.handleStacks)
 	server.router.GET(statusNodesPrefix, server.handleNodesStatus)
 	server.router.GET(statusNodePattern, server.handleNodeStatus)
-	server.router.GET(statusStoresPrefix, server.handleStoresStatus)
-	server.router.GET(statusStorePattern, server.handleStoreStatus)
 	server.router.GET(statusMetricsPattern, server.handleMetrics)
 
 	server.router.GET(healthEndpoint, server.handleDetailsLocal)
@@ -317,8 +312,8 @@ func (s *statusServer) handleLogFileLocal(w http.ResponseWriter, r *http.Request
 	}
 	defer reader.Close()
 
-	entry := log.LogEntry{}
-	var entries []log.LogEntry
+	entry := log.Entry{}
+	var entries []log.Entry
 	decoder := log.NewEntryDecoder(reader)
 	for {
 		if err := decoder.Decode(&entry); err != nil {
@@ -398,7 +393,7 @@ func (s *statusServer) handleLogsLocal(w http.ResponseWriter, r *http.Request, _
 
 	startTimestamp, err := parseInt64WithDefault(
 		r.URL.Query().Get("starttime"),
-		time.Now().AddDate(0, 0, -1).UnixNano())
+		timeutil.Now().AddDate(0, 0, -1).UnixNano())
 	if err != nil {
 		http.Error(w,
 			fmt.Sprintf("starttime could not be parsed: %s", err),
@@ -408,7 +403,7 @@ func (s *statusServer) handleLogsLocal(w http.ResponseWriter, r *http.Request, _
 
 	endTimestamp, err := parseInt64WithDefault(
 		r.URL.Query().Get("endtime"),
-		time.Now().UnixNano())
+		timeutil.Now().UnixNano())
 	if err != nil {
 		http.Error(w,
 			fmt.Sprintf("endtime could not be parsed: %s", err),
@@ -514,7 +509,7 @@ func (s *statusServer) handleNodesStatus(w http.ResponseWriter, r *http.Request,
 	startKey := keys.StatusNodePrefix
 	endKey := startKey.PrefixEnd()
 
-	rows, pErr := s.db.Scan(startKey, endKey, 0)
+	rows, pErr := s.db.ScanInconsistent(startKey, endKey, 0)
 	if pErr != nil {
 		log.Error(pErr)
 		http.Error(w, pErr.String(), http.StatusInternalServerError)
@@ -544,59 +539,13 @@ func (s *statusServer) handleNodeStatus(w http.ResponseWriter, r *http.Request, 
 
 	key := keys.NodeStatusKey(int32(nodeID))
 	nodeStatus := &status.NodeStatus{}
-	if pErr := s.db.GetProto(key, nodeStatus); pErr != nil {
+	if pErr := s.db.GetProtoInconsistent(key, nodeStatus); pErr != nil {
 		log.Error(pErr)
 		http.Error(w, pErr.String(), http.StatusInternalServerError)
 		return
 	}
 
 	respondAsJSON(w, r, nodeStatus)
-}
-
-// handleStoresStatus handles GET requests for all store statuses.
-func (s *statusServer) handleStoresStatus(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	startKey := keys.StatusStorePrefix
-	endKey := startKey.PrefixEnd()
-
-	rows, pErr := s.db.Scan(startKey, endKey, 0)
-	if pErr != nil {
-		log.Error(pErr)
-		http.Error(w, pErr.String(), http.StatusInternalServerError)
-		return
-	}
-
-	storeStatuses := []storage.StoreStatus{}
-	for _, row := range rows {
-		storeStatus := &storage.StoreStatus{}
-		if err := row.ValueProto(storeStatus); err != nil {
-			log.Error(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		storeStatuses = append(storeStatuses, *storeStatus)
-	}
-	respondAsJSON(w, r, storeStatuses)
-}
-
-// handleStoreStatus handles GET requests for a single node's status.
-func (s *statusServer) handleStoreStatus(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-
-	id, err := strconv.ParseInt(ps.ByName("store_id"), 10, 32)
-	if err != nil {
-		http.Error(w,
-			fmt.Sprintf("store id could not be parsed: %s", err),
-			http.StatusBadRequest)
-		return
-	}
-
-	key := keys.StoreStatusKey(int32(id))
-	storeStatus := &storage.StoreStatus{}
-	if pErr := s.db.GetProto(key, storeStatus); pErr != nil {
-		log.Error(pErr)
-		http.Error(w, pErr.String(), http.StatusInternalServerError)
-		return
-	}
-	respondAsJSON(w, r, storeStatus)
 }
 
 func (s *statusServer) handleMetrics(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
@@ -610,7 +559,7 @@ func (s *statusServer) handleMetrics(w http.ResponseWriter, r *http.Request, ps 
 		s.proxyRequest(nodeID, w, r)
 		return
 	}
-	respondAsJSON(w, r, s.metaRegistry)
+	respondAsJSON(w, r, s.metricSource)
 }
 
 func respondAsJSON(w http.ResponseWriter, r *http.Request, response interface{}) {

@@ -26,11 +26,12 @@ import "fmt"
 
 // Delete represents a DELETE statement.
 type Delete struct {
-	Table TableExpr
-	Where *Where
+	Table     TableExpr
+	Where     *Where
+	Returning ReturningExprs
 }
 
 func (node *Delete) String() string {
-	return fmt.Sprintf("DELETE FROM %s%s",
-		node.Table, node.Where)
+	return fmt.Sprintf("DELETE FROM %s%s%s",
+		node.Table, node.Where, node.Returning)
 }

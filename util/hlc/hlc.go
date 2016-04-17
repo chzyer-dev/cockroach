@@ -27,6 +27,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // TODO(Tobias): Figure out if it would make sense to save some
@@ -55,6 +56,13 @@ type Clock struct {
 	// clock (and cluster time) the wall time can be.
 	// See SetMaxOffset.
 	maxOffset time.Duration
+
+	// monotonicityErrorsCount indicate how often this clock was
+	// observed to jump backwards.
+	monotonicityErrorsCount int32
+	// lastPhysicalTime reports the last measured physical time. This
+	// is used to detect clock jumps.
+	lastPhysicalTime int64
 }
 
 // ManualClock is a convenience type to facilitate
@@ -89,7 +97,7 @@ func (m *ManualClock) Set(nanos int64) {
 // unix epoch timestamp as a convenience to create a HLC via
 // c := hlc.NewClock(hlc.UnixNano).
 func UnixNano() int64 {
-	return time.Now().UnixNano()
+	return timeutil.Now().UnixNano()
 }
 
 // NewClock creates a new hybrid logical clock associated
@@ -146,6 +154,23 @@ func (c *Clock) timestamp() roachpb.Timestamp {
 	}
 }
 
+// getPhysicalClock returns the current physical clock and checks for
+// time jumps.
+func (c *Clock) getPhysicalClock() int64 {
+	newTime := c.physicalClock()
+
+	if c.lastPhysicalTime != 0 {
+		interval := c.lastPhysicalTime - newTime
+		if interval > int64(c.maxOffset/10) {
+			c.monotonicityErrorsCount++
+			log.Warningf("backward time jump detected (%f seconds)", float64(newTime-c.lastPhysicalTime)/1e9)
+		}
+	}
+
+	c.lastPhysicalTime = newTime
+	return newTime
+}
+
 // Now returns a timestamp associated with an event from
 // the local machine that may be sent to other members
 // of the distributed network. This is the counterpart
@@ -155,7 +180,7 @@ func (c *Clock) Now() roachpb.Timestamp {
 	c.Lock()
 	defer c.Unlock()
 
-	physicalClock := c.physicalClock()
+	physicalClock := c.getPhysicalClock()
 	if c.state.WallTime >= physicalClock {
 		// The wall time is ahead, so the logical clock ticks.
 		c.state.Logical++
@@ -170,14 +195,15 @@ func (c *Clock) Now() roachpb.Timestamp {
 // PhysicalNow returns the local wall time. It corresponds to the physicalClock
 // provided at instantiation. For a timestamp value, use Now() instead.
 func (c *Clock) PhysicalNow() int64 {
-	wallTime := c.physicalClock()
+	c.Lock()
+	defer c.Unlock()
+	wallTime := c.getPhysicalClock()
 	return wallTime
 }
 
 // PhysicalTime returns a time.Time struct using the local wall time.
 func (c *Clock) PhysicalTime() time.Time {
-	physNow := c.PhysicalNow()
-	return time.Unix(physNow/1E9, physNow%1E9)
+	return time.Unix(0, c.PhysicalNow()).UTC()
 }
 
 // Update takes a hybrid timestamp, usually originating from
@@ -192,7 +218,7 @@ func (c *Clock) PhysicalTime() time.Time {
 func (c *Clock) Update(rt roachpb.Timestamp) roachpb.Timestamp {
 	c.Lock()
 	defer c.Unlock()
-	physicalClock := c.physicalClock()
+	physicalClock := c.getPhysicalClock()
 
 	if physicalClock > c.state.WallTime && physicalClock > rt.WallTime {
 		// Our physical clock is ahead of both wall times. It is used
@@ -206,11 +232,9 @@ func (c *Clock) Update(rt roachpb.Timestamp) roachpb.Timestamp {
 	// as it is behind the local and remote wall times. Instead,
 	// the logical clock comes into play.
 	if rt.WallTime > c.state.WallTime {
-		if c.maxOffset.Nanoseconds() > 0 &&
-			rt.WallTime-physicalClock > c.maxOffset.Nanoseconds() {
-			// The remote wall time is too far ahead to be trustworthy.
-			log.Errorf("Remote wall time offsets from local physical clock: %d (%dns ahead)",
-				rt.WallTime, rt.WallTime-physicalClock)
+		offset := time.Duration(rt.WallTime-physicalClock) * time.Nanosecond
+		if c.maxOffset > 0 && offset > c.maxOffset {
+			log.Warningf("remote wall time is too far ahead (%s) to be trustworthy - updating anyway", offset)
 		}
 		// The remote clock is ahead of ours, and we update
 		// our own logical clock with theirs.

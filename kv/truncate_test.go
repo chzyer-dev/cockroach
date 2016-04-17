@@ -8,14 +8,17 @@ import (
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/testutils"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/uuid"
 )
 
 func TestTruncate(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	loc := func(s string) string {
 		return string(keys.RangeDescriptorKey(roachpb.RKey(s)))
+	}
+	locPrefix := func(s string) string {
+		return string(keys.MakeRangeKeyPrefix(roachpb.RKey(s)))
 	}
 	testCases := []struct {
 		keys     [][2]string
@@ -54,12 +57,35 @@ func TestTruncate(t *testing.T) {
 			expKeys: [][2]string{{loc("b"), loc("e") + "\x00"}},
 			from:    "b", to: "e\x00",
 		},
-
 		{
 			// Range-local range not contained in active range.
-			keys: [][2]string{{loc("a"), loc("b")}},
-			from: "b", to: "e",
-			err: "local key range must not span ranges",
+			keys:    [][2]string{{loc("a"), loc("b")}},
+			expKeys: [][2]string{{}},
+			from:    "c", to: "e",
+		},
+		{
+			// Range-local range not contained in active range.
+			keys:    [][2]string{{loc("a"), locPrefix("b")}, {loc("e"), loc("f")}},
+			expKeys: [][2]string{{}, {}},
+			from:    "b", to: "e",
+		},
+		{
+			// Range-local range partially contained in active range.
+			keys:    [][2]string{{loc("a"), loc("b")}},
+			expKeys: [][2]string{{loc("a"), locPrefix("b")}},
+			from:    "a", to: "b",
+		},
+		{
+			// Range-local range partially contained in active range.
+			keys:    [][2]string{{loc("a"), loc("b")}},
+			expKeys: [][2]string{{locPrefix("b"), loc("b")}},
+			from:    "b", to: "e",
+		},
+		{
+			// Range-local range contained in active range.
+			keys:    [][2]string{{locPrefix("b"), loc("b")}},
+			expKeys: [][2]string{{locPrefix("b"), loc("b")}},
+			from:    "b", to: "c",
 		},
 		{
 			// Mixed range-local vs global key range.
@@ -92,8 +118,9 @@ func TestTruncate(t *testing.T) {
 		goldenOriginal := roachpb.BatchRequest{}
 		for _, ks := range test.keys {
 			if len(ks[1]) > 0 {
-				goldenOriginal.Add(&roachpb.ScanRequest{
-					Span: roachpb.Span{Key: roachpb.Key(ks[0]), EndKey: roachpb.Key(ks[1])},
+				goldenOriginal.Add(&roachpb.ResolveIntentRangeRequest{
+					Span:      roachpb.Span{Key: roachpb.Key(ks[0]), EndKey: roachpb.Key(ks[1])},
+					IntentTxn: roachpb.TxnMeta{ID: uuid.NewV4()},
 				})
 			} else {
 				goldenOriginal.Add(&roachpb.GetRequest{
@@ -102,7 +129,10 @@ func TestTruncate(t *testing.T) {
 			}
 		}
 
-		original := *util.CloneProto(&goldenOriginal).(*roachpb.BatchRequest)
+		original := roachpb.BatchRequest{Requests: make([]roachpb.RequestUnion, len(goldenOriginal.Requests))}
+		for i, request := range goldenOriginal.Requests {
+			original.Requests[i].SetValue(request.GetInner().ShallowCopy())
+		}
 
 		desc := &roachpb.RangeDescriptor{
 			StartKey: roachpb.RKey(test.desc[0]), EndKey: roachpb.RKey(test.desc[1]),

@@ -14,6 +14,7 @@
 //
 // Author: Tamir Duberstein (tamird@gmail.com)
 
+// Cannot be proto3 because we use nullable primitives.
 syntax = "proto2";
 package cockroach.sql;
 option go_package = "sql";
@@ -54,6 +55,7 @@ message ColumnDescriptor {
   // value is provided.
   optional string default_expr = 5;
   optional bool hidden = 6 [(gogoproto.nullable) = false];
+  optional string check_expr = 7;
 }
 
 message IndexDescriptor {
@@ -211,13 +213,6 @@ message TableDescriptor {
   // the version, why do it later on? We increment the version
   // to ensure that all the nodes renew their leases with the new version
   // and get to see what the schema change command has done quickly.
-  //
-  // TODO(vivek): Implement the above invariants by ensuring that
-  // the Version is only incremented in LeaseManager.Publish().
-  // Move applyMutation() and applyUpVersion() out of the transaction for
-  // schema commands and into LeaseManager.Publish(), and remove
-  // Version++ from applyUpVersion().
-  //
   optional uint32 version = 5 [(gogoproto.nullable) = false, (gogoproto.casttype) = "DescriptorVersion"];
   // See comment above.
   optional bool up_version = 6 [(gogoproto.nullable) = false];
@@ -252,6 +247,11 @@ message TableDescriptor {
   // An id for the next group of mutations to be applied together.
   optional uint32 next_mutation_id = 16 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "NextMutationID", (gogoproto.casttype) = "MutationID"];
+
+  // format_version declares which sql to key:value mapping is being used to
+  // represent the data in this table.
+  optional uint32 format_version = 17 [(gogoproto.nullable) = false,
+      (gogoproto.casttype) = "FormatVersion"];
 }
 
 // DatabaseDescriptor represents a namespace (aka database) and is stored

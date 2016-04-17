@@ -25,8 +25,8 @@ import (
 
 var nodeTestBaseContext = testutils.NewNodeTestBaseContext()
 
-func TestParseResolverSpec(t *testing.T) {
-	def := ensureHostPort(":", base.CockroachPort)
+func TestParseResolverAddress(t *testing.T) {
+	def := ensureHostPort(":", base.DefaultPort)
 	testCases := []struct {
 		input           string
 		success         bool
@@ -35,21 +35,11 @@ func TestParseResolverSpec(t *testing.T) {
 	}{
 		// Ports are not checked at parsing time. They are at GetAddress time though.
 		{"127.0.0.1:26222", true, "tcp", "127.0.0.1:26222"},
-		{":" + base.CockroachPort, true, "tcp", def},
-		{"127.0.0.1", true, "tcp", "127.0.0.1:" + base.CockroachPort},
-		{"tcp=127.0.0.1", true, "tcp", "127.0.0.1:" + base.CockroachPort},
-		{"tcp=127.0.0.1:23456", true, "tcp", "127.0.0.1:23456"},
-		{"unix=/tmp/unix-socket12345", true, "unix", "/tmp/unix-socket12345"},
-		{"http-lb=localhost:" + base.CockroachPort, true, "http-lb", "localhost:" + base.CockroachPort},
-		{"http-lb=newhost:1234", true, "http-lb", "newhost:1234"},
-		{"http-lb=:" + base.CockroachPort, true, "http-lb", def},
-		{"http-lb=:", true, "http-lb", def},
+		{":" + base.DefaultPort, true, "tcp", def},
+		{"127.0.0.1", true, "tcp", "127.0.0.1:" + base.DefaultPort},
 		{"", false, "", ""},
-		{"foo=127.0.0.1", false, "", ""},
 		{"", false, "tcp", ""},
 		{":", true, "tcp", def},
-		{"tcp=", false, "tcp", ""},
-		{"tcp=:", true, "tcp", def},
 	}
 
 	for tcNum, tc := range testCases {
@@ -71,21 +61,18 @@ func TestParseResolverSpec(t *testing.T) {
 
 func TestGetAddress(t *testing.T) {
 	testCases := []struct {
-		resolverSpec string
+		address      string
 		success      bool
-		oneShot      bool
 		addressType  string
 		addressValue string
 	}{
-		{"tcp=127.0.0.1:26222", true, true, "tcp", "127.0.0.1:26222"},
-		{"tcp=127.0.0.1", true, true, "tcp", "127.0.0.1:" + base.CockroachPort},
-		{"tcp=localhost:80", true, true, "tcp", "localhost:80"},
-		// We should test unresolvable dns too, but this would be fragile.
-		{"unix=/tmp/foo", true, true, "unix", "/tmp/foo"},
+		{"127.0.0.1:26222", true, "tcp", "127.0.0.1:26222"},
+		{"127.0.0.1", true, "tcp", "127.0.0.1:" + base.DefaultPort},
+		{"localhost:80", true, "tcp", "localhost:80"},
 	}
 
 	for tcNum, tc := range testCases {
-		resolver, err := NewResolver(nodeTestBaseContext, tc.resolverSpec)
+		resolver, err := NewResolver(nodeTestBaseContext, tc.address)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,9 +82,6 @@ func TestGetAddress(t *testing.T) {
 		}
 		if err != nil {
 			continue
-		}
-		if resolver.IsExhausted() != tc.oneShot {
-			t.Errorf("#%d: expected exhausted resolver=%t, but is: %+v", tcNum, tc.oneShot, resolver)
 		}
 		if address.Network() != tc.addressType {
 			t.Errorf("#%d: expected address type=%s, got %+v", tcNum, tc.addressType, address)

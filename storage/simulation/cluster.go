@@ -24,7 +24,6 @@ import (
 	"sort"
 	"text/tabwriter"
 
-	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
@@ -33,6 +32,13 @@ import (
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
+
+// nodeIDSlice implements sort.Interface.
+type nodeIDSlice []roachpb.NodeID
+
+func (n nodeIDSlice) Len() int           { return len(n) }
+func (n nodeIDSlice) Swap(i, j int)      { n[i], n[j] = n[j], n[i] }
+func (n nodeIDSlice) Less(i, j int) bool { return n[i] < n[j] }
 
 // Cluster maintains a list of all nodes, stores and ranges as well as any
 // shared resources.
@@ -59,10 +65,19 @@ type Cluster struct {
 
 // createCluster generates a new cluster using the provided stopper and the
 // number of nodes supplied. Each node will have one store to start.
-func createCluster(stopper *stop.Stopper, nodeCount int, epochWriter, actionWriter io.Writer, script Script, rand *rand.Rand) *Cluster {
+func createCluster(
+	stopper *stop.Stopper,
+	nodeCount int,
+	epochWriter, actionWriter io.Writer,
+	script Script,
+	rand *rand.Rand,
+) *Cluster {
 	clock := hlc.NewClock(hlc.UnixNano)
-	rpcContext := rpc.NewContext(&base.Context{}, clock, stopper)
-	g := gossip.New(rpcContext, gossip.TestBootstrap, stopper)
+	rpcContext := rpc.NewContext(nil, clock, stopper)
+	g := gossip.New(rpcContext, nil, stopper)
+	// NodeID is required for Gossip, so set it to -1 for the cluster Gossip
+	// instance to prevent conflicts with real NodeIDs.
+	g.SetNodeID(-1)
 	storePool := storage.NewStorePool(g, clock, storage.TestTimeUntilStoreDeadOff, stopper)
 	c := &Cluster{
 		stopper:   stopper,
@@ -193,7 +208,7 @@ func (c *Cluster) runEpoch() bool {
 	c.prepareActions()
 
 	// Execute the determined operations.
-	// TODO(bram): Add ability to end when stable.
+	// TODO(bram): #4566 Add ability to end when stable.
 	c.performActions()
 
 	// Recalculate the ranges IDs by store map.
@@ -337,7 +352,7 @@ func (c *Cluster) performActions() bool {
 					c.epoch, storeID, topRangeID, newStoreID)
 			case storage.AllocatorRemoveDead:
 				stable = false
-				// TODO(bram): implement this.
+				// TODO(bram): #4566 implement this.
 				usedRanges[topRangeID] = storeID
 				fmt.Fprintf(c.actionWriter, "%d:\tStore:%d\tRange:%d\tREPAIR\n", c.epoch, storeID, topRangeID)
 			case storage.AllocatorRemove:
@@ -389,7 +404,7 @@ func (c *Cluster) String() string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "Cluster Info:\tEpoch - %d\n", c.epoch)
 
-	var nodeIDs roachpb.NodeIDSlice
+	var nodeIDs nodeIDSlice
 	for nodeID := range c.nodes {
 		nodeIDs = append(nodeIDs, nodeID)
 	}

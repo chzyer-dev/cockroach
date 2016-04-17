@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/keys"
@@ -34,8 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/util/randutil"
 	"github.com/cockroachdb/cockroach/util/retry"
 )
-
-const cleanMVCCScanTimeout = 500 * time.Millisecond
 
 // setTestRetryOptions sets client retry options for speedier testing.
 func setTestRetryOptions() func() {
@@ -102,12 +102,12 @@ func startTestWriter(db *client.DB, i int64, valBytes int32, wg *sync.WaitGroup,
 // and checks that all created intents are resolved. This includes both intents
 // which are resolved synchronously with EndTransaction and via RPC.
 func TestRangeSplitMeta(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := createTestDB(t)
 	defer s.Stop()
 
-	splitKeys := []roachpb.RKey{roachpb.RKey("G"), meta(roachpb.RKey("F")),
-		meta(roachpb.RKey("K")), meta(roachpb.RKey("H"))}
+	splitKeys := []roachpb.RKey{roachpb.RKey("G"), mustMeta(roachpb.RKey("F")),
+		mustMeta(roachpb.RKey("K")), mustMeta(roachpb.RKey("H"))}
 
 	// Execute the consecutive splits.
 	for _, splitKey := range splitKeys {
@@ -118,22 +118,19 @@ func TestRangeSplitMeta(t *testing.T) {
 		log.Infof("split at key %q complete", splitKey)
 	}
 
-	if err := util.IsTrueWithin(func() bool {
-		if _, _, err := engine.MVCCScan(s.Eng, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil); err != nil {
-			log.Infof("mvcc scan should be clean: %s", err)
-			return false
+	util.SucceedsSoon(t, func() error {
+		if _, _, err := engine.MVCCScan(context.Background(), s.Eng, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil); err != nil {
+			return util.Errorf("failed to verify no dangling intents: %s", err)
 		}
-		return true
-	}, cleanMVCCScanTimeout); err != nil {
-		t.Error("failed to verify no dangling intents within 500ms")
-	}
+		return nil
+	})
 }
 
 // TestRangeSplitsWithConcurrentTxns does 5 consecutive splits while
 // 10 concurrent goroutines are each running successive transactions
 // composed of a random mix of puts.
 func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := createTestDB(t)
 	defer s.Stop()
 
@@ -178,11 +175,11 @@ func TestRangeSplitsWithConcurrentTxns(t *testing.T) {
 // TestRangeSplitsWithWritePressure sets the zone config max bytes for
 // a range to 256K and writes data until there are five ranges.
 func TestRangeSplitsWithWritePressure(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// Override default zone config.
-	previousMaxBytes := config.DefaultZoneConfig.RangeMaxBytes
-	config.DefaultZoneConfig.RangeMaxBytes = 1 << 18
-	defer func() { config.DefaultZoneConfig.RangeMaxBytes = previousMaxBytes }()
+	cfg := config.DefaultZoneConfig()
+	cfg.RangeMaxBytes = 1 << 18
+	defer config.TestingSetDefaultZoneConfig(cfg)()
 
 	s := createTestDB(t)
 	// This is purely to silence log spam.
@@ -197,16 +194,17 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 	go startTestWriter(s.DB, int64(0), 1<<15, &wg, nil, nil, done, t)
 
 	// Check that we split 5 times in allotted time.
-	if err := util.IsTrueWithin(func() bool {
+	util.SucceedsSoon(t, func() error {
 		// Scan the txn records.
 		rows, err := s.DB.Scan(keys.Meta2Prefix, keys.MetaMax, 0)
 		if err != nil {
-			t.Fatalf("failed to scan meta2 keys: %s", err)
+			return util.Errorf("failed to scan meta2 keys: %s", err)
 		}
-		return len(rows) >= 5
-	}, 6*time.Second); err != nil {
-		t.Errorf("failed to split 5 times: %s", err)
-	}
+		if lr := len(rows); lr < 5 {
+			return util.Errorf("expected >= 5 scans; got %d", lr)
+		}
+		return nil
+	})
 	close(done)
 	wg.Wait()
 
@@ -214,24 +212,21 @@ func TestRangeSplitsWithWritePressure(t *testing.T) {
 	// intents are in flight, causing them to fail with range key
 	// mismatch errors. However, LocalSender should retry in these
 	// cases. Check here via MVCC scan that there are no dangling write
-	// intents. We do this using an IsTrueWithin construct to account
+	// intents. We do this using a SucceedsSoon construct to account
 	// for timing of finishing the test writer and a possibly-ongoing
 	// asynchronous split.
-	if err := util.IsTrueWithin(func() bool {
-		if _, _, err := engine.MVCCScan(s.Eng, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil); err != nil {
-			log.Infof("mvcc scan should be clean: %s", err)
-			return false
+	util.SucceedsSoon(t, func() error {
+		if _, _, err := engine.MVCCScan(context.Background(), s.Eng, keys.LocalMax, roachpb.KeyMax, 0, roachpb.MaxTimestamp, true, nil); err != nil {
+			return util.Errorf("failed to verify no dangling intents: %s", err)
 		}
-		return true
-	}, cleanMVCCScanTimeout); err != nil {
-		t.Error("failed to verify no dangling intents within 500ms")
-	}
+		return nil
+	})
 }
 
 // TestRangeSplitsWithSameKeyTwice check that second range split
 // on the same splitKey should not cause infinite retry loop.
 func TestRangeSplitsWithSameKeyTwice(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := createTestDB(t)
 	defer s.Stop()
 

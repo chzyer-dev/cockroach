@@ -64,13 +64,10 @@ func (qt qvalResolver) findColumn(qname *parser.QualifiedName) (columnRef, error
 	// TODO(radu): when we support multiple FROMs, we will find the node with the correct alias; if
 	// no alias is given, we will search for the column in all FROMs and make sure there is only
 	// one.  For now we just check that the name matches (if given).
-	if qname.Base == "" {
-		qname.Base = parser.Name(qt.table.alias)
-	}
-	if equalName(qt.table.alias, string(qname.Base)) {
-		colName := qname.Column()
+	if qname.Base == "" || equalName(qt.table.alias, string(qname.Base)) {
+		colName := NormalizeName(qname.Column())
 		for idx, col := range qt.table.columns {
-			if equalName(col.Name, colName) {
+			if NormalizeName(col.Name) == colName {
 				ref.table = qt.table
 				ref.colIdx = idx
 				return ref, nil
@@ -101,8 +98,13 @@ func (q *qvalue) String() string {
 	return q.colRef.get().Name
 }
 
-func (q *qvalue) Walk(v parser.Visitor) {
-	q.datum = parser.WalkExpr(v, q.datum).(parser.Datum)
+func (q *qvalue) Walk(v parser.Visitor) parser.Expr {
+	e, _ := parser.WalkExpr(v, q.datum)
+	// Typically Walk implementations are not supposed to modify nodes in-place, in order to
+	// preserve the original transaction statement and expressions. However, `qvalue` is our type
+	// (which we have "stiched" into an expression) so we aren't modifying an original expression.
+	q.datum = e.(parser.Datum)
+	return q
 }
 
 func (q *qvalue) TypeCheck(args parser.MapArgs) (parser.Datum, error) {
@@ -111,10 +113,6 @@ func (q *qvalue) TypeCheck(args parser.MapArgs) (parser.Datum, error) {
 
 func (q *qvalue) Eval(ctx parser.EvalContext) (parser.Datum, error) {
 	return q.datum.Eval(ctx)
-}
-
-func (q *qvalue) DeepCopy() parser.Expr {
-	return q
 }
 
 // getQVal creates a qvalue for a column reference. Created qvalues are
@@ -145,35 +143,28 @@ type qnameVisitor struct {
 
 var _ parser.Visitor = &qnameVisitor{}
 
-// Visit is invoked for each Expr node. It can return a new expression for the
-// node, or it can stop processing by returning a nil Visitor.
-func (v *qnameVisitor) Visit(expr parser.Expr, pre bool) (parser.Visitor, parser.Expr) {
-	if !pre || v.err != nil {
-		return nil, expr
+func (v *qnameVisitor) VisitPre(expr parser.Expr) (recurse bool, newNode parser.Expr) {
+	if v.err != nil {
+		return false, expr
 	}
 
 	switch t := expr.(type) {
 	case *qvalue:
-		// We will encounter a qvalue in the expression during retry of an
-		// auto-transaction. When that happens, we've already gone through
-		// qualified name normalization and lookup, we just need to hook the qvalue
-		// up to the scanNode.
-		//
-		// TODO(pmattis): Should we be more careful about ensuring that the various
-		// statement implementations do not modify the AST nodes they are passed?
-		colRef := t.colRef
-		// TODO(radu): this is pretty hacky and won't work with multiple FROMs..
-		colRef.table = v.qt.table
-		return v, v.qt.qvals.getQVal(colRef)
+		// We allow resolving qvalues on expressions that have already been resolved by this
+		// resolver. This is used in some cases when adding render targets for grouping or sorting.
+		if v.qt.qvals[t.colRef] != t {
+			panic(fmt.Sprintf("qvalue already resolved with different resolver (name: %s)", t))
+		}
+		return true, expr
 
 	case *parser.QualifiedName:
 		var colRef columnRef
 
 		colRef, v.err = v.qt.findColumn(t)
 		if v.err != nil {
-			return nil, expr
+			return false, expr
 		}
-		return v, v.qt.qvals.getQVal(colRef)
+		return true, v.qt.qvals.getQVal(colRef)
 
 	case *parser.FuncExpr:
 		// Special case handling for COUNT(*). This is a special construct to
@@ -193,7 +184,7 @@ func (v *qnameVisitor) Visit(expr parser.Expr, pre bool) (parser.Visitor, parser
 		}
 		v.err = qname.NormalizeColumnName()
 		if v.err != nil {
-			return nil, expr
+			return false, expr
 		}
 		if !qname.IsStar() {
 			// This will cause us to recurse into the arguments of the function which
@@ -201,32 +192,45 @@ func (v *qnameVisitor) Visit(expr parser.Expr, pre bool) (parser.Visitor, parser
 			break
 		}
 		// Replace the function argument with a special non-NULL VariableExpr.
+		t = t.CopyNode()
 		t.Exprs[0] = starDatumInstance
-		return v, expr
+		return true, t
 
 	case *parser.Subquery:
 		// Do not recurse into subqueries.
-		return nil, expr
+		return false, expr
 	}
 
-	return v, expr
+	return true, expr
 }
+
+func (*qnameVisitor) VisitPost(expr parser.Expr) parser.Expr { return expr }
 
 func (s *selectNode) resolveQNames(expr parser.Expr) (parser.Expr, error) {
-	return resolveQNames(&s.table, s.qvals, expr)
+	var v *qnameVisitor
+	if s.planner != nil {
+		v = &s.planner.qnameVisitor
+	}
+	return resolveQNames(expr, &s.table, s.qvals, v)
 }
 
-func resolveQNames(table *tableInfo, qvals qvalMap, expr parser.Expr) (parser.Expr, error) {
+// resolveQNames walks the provided expression and resolves all qualified
+// names using the tableInfo and qvalMap. The function takes an optional
+// qnameVisitor to provide the caller the option of avoiding an allocation.
+func resolveQNames(expr parser.Expr, table *tableInfo, qvals qvalMap, v *qnameVisitor) (parser.Expr, error) {
 	if expr == nil {
 		return expr, nil
 	}
-	v := qnameVisitor{
+	if v == nil {
+		v = new(qnameVisitor)
+	}
+	*v = qnameVisitor{
 		qt: qvalResolver{
 			table: table,
 			qvals: qvals,
 		},
 	}
-	expr = parser.WalkExpr(&v, expr)
+	expr, _ = parser.WalkExpr(v, expr)
 	return expr, v.err
 }
 
@@ -258,7 +262,7 @@ func (*starDatum) String() string {
 	return "*"
 }
 
-func (*starDatum) Walk(v parser.Visitor) {}
+func (e *starDatum) Walk(v parser.Visitor) parser.Expr { return e }
 
 func (*starDatum) TypeCheck(args parser.MapArgs) (parser.Datum, error) {
 	return parser.DummyInt.TypeCheck(args)
@@ -266,8 +270,4 @@ func (*starDatum) TypeCheck(args parser.MapArgs) (parser.Datum, error) {
 
 func (*starDatum) Eval(ctx parser.EvalContext) (parser.Datum, error) {
 	return parser.DummyInt.Eval(ctx)
-}
-
-func (*starDatum) DeepCopy() parser.Expr {
-	return starDatumInstance
 }

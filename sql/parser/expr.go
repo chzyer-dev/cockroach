@@ -25,10 +25,10 @@ import (
 // Expr represents an expression.
 type Expr interface {
 	fmt.Stringer
-	// Walk replaces each child of the receiver with the return of
-	// `WalkExpr(v, child)`. For childless (leaf) Exprs, its
-	// implementation is empty.
-	Walk(Visitor)
+	// Walk recursively walks all children using WalkExpr. If any children are changed, it returns a
+	// copy of this node updated to point to the new children. Otherwise the receiver is returned.
+	// For childless (leaf) Exprs, its implementation is empty.
+	Walk(Visitor) Expr
 	// TypeCheck returns the zero value of the expression's type, or an
 	// error if the expression doesn't type-check. args maps bind var argument
 	// names to types.
@@ -42,8 +42,6 @@ type Expr interface {
 	// WalkExpr. For example, ValArg should be replace by the argument passed from
 	// the client.
 	Eval(EvalContext) (Datum, error)
-	// DeepCopy returns a new copy of the entire expression.
-	DeepCopy() Expr
 }
 
 // VariableExpr is an Expr that may change per row. It is used to
@@ -143,7 +141,7 @@ func (i ComparisonOp) String() string {
 type ComparisonExpr struct {
 	Operator    ComparisonOp
 	Left, Right Expr
-	fn          cmpOp
+	fn          CmpOp
 }
 
 func (node *ComparisonExpr) String() string {
@@ -163,9 +161,6 @@ func (node *RangeCond) String() string {
 	}
 	return fmt.Sprintf("%s BETWEEN %s AND %s", node.Left, node.From, node.To)
 }
-
-// IsOp represents an IS expression operator.
-type IsOp int
 
 // IsOfTypeExpr represents an IS {,NOT} OF (type_list) expression.
 type IsOfTypeExpr struct {
@@ -285,6 +280,9 @@ type QualifiedName struct {
 	Base       Name
 	Indirect   Indirection
 	normalized nameType
+
+	// We preserve the "original" string representation (before normalization).
+	origString string
 }
 
 // Variable implements the VariableExpr interface.
@@ -319,13 +317,8 @@ func (n *QualifiedName) NormalizeTableName(database string) error {
 		return err
 	}
 
-	if len(n.Indirect) > 2 {
+	if len(n.Indirect) > 1 {
 		return fmt.Errorf("invalid table name: %s", n)
-	}
-	if len(n.Indirect) == 2 {
-		if _, ok := n.Indirect[1].(IndexIndirection); !ok {
-			return fmt.Errorf("invalid table name: %s", n)
-		}
 	}
 	n.normalized = tableName
 	return nil
@@ -337,6 +330,7 @@ func (n *QualifiedName) NormalizeTableName(database string) error {
 // table@index -> database.table@index
 // *           -> database.*
 func (n *QualifiedName) QualifyWithDatabase(database string) error {
+	n.setString()
 	if len(n.Indirect) == 0 {
 		if database == "" {
 			return fmt.Errorf("no database specified: %s", n)
@@ -353,17 +347,6 @@ func (n *QualifiedName) QualifyWithDatabase(database string) error {
 	switch n.Indirect[0].(type) {
 	case NameIndirection:
 		// Nothing to do.
-	case IndexIndirection:
-		// table@index -> database.table@index
-		// *           -> database.*
-		//
-		// Accomplished by prepending n.Base to the existing indirection and then
-		// setting n.Base to the supplied database.
-		if database == "" {
-			return fmt.Errorf("no database specified: %s", n)
-		}
-		n.Indirect = append(Indirection{NameIndirection(n.Base)}, n.Indirect...)
-		n.Base = Name(database)
 	case StarIndirection:
 		// * -> database.*
 		if n.Base != "" {
@@ -408,6 +391,7 @@ func (n *QualifiedName) NormalizeColumnName() error {
 	if n.normalized == tableName {
 		return fmt.Errorf("already normalized as a table name: %s", n)
 	}
+	n.setString()
 	if len(n.Indirect) == 0 {
 		// column -> table.column
 		if n.Base == "" {
@@ -469,18 +453,6 @@ func (n *QualifiedName) Table() string {
 	return string(n.Base)
 }
 
-// Index returns the index portion of the name. Note that the returned string
-// is not quoted even if the name is a keyword.
-func (n *QualifiedName) Index() string {
-	if n.normalized != tableName {
-		panic(fmt.Sprintf("%s is not a table name", n))
-	}
-	if len(n.Indirect) == 2 {
-		return string(n.Indirect[1].(IndexIndirection))
-	}
-	return ""
-}
-
 // Column returns the column portion of the name. Note that the returned string
 // is not quoted even if the name is a keyword.
 func (n *QualifiedName) Column() string {
@@ -504,12 +476,27 @@ func (n *QualifiedName) IsStar() bool {
 	return true
 }
 
-func (n *QualifiedName) String() string {
-	// Special handling for unqualified star indirection.
-	if n.Base == "" && len(n.Indirect) == 1 && n.Indirect[0] == unqualifiedStar {
-		return n.Indirect[0].String()
+// ClearString causes String to return the current (possibly normalized) name instead of the
+// original name (used for testing).
+func (n *QualifiedName) ClearString() {
+	n.origString = ""
+}
+
+func (n *QualifiedName) setString() {
+	// We preserve the representation pre-normalization.
+	if n.origString != "" {
+		return
 	}
-	return fmt.Sprintf("%s%s", n.Base, n.Indirect)
+	if n.Base == "" && len(n.Indirect) == 1 && n.Indirect[0] == unqualifiedStar {
+		n.origString = n.Indirect[0].String()
+	} else {
+		n.origString = fmt.Sprintf("%s%s", n.Base, n.Indirect)
+	}
+}
+
+func (n *QualifiedName) String() string {
+	n.setString()
+	return n.origString
 }
 
 // QualifiedNames represents a command separated list (see the String method)
@@ -527,26 +514,57 @@ func (n QualifiedNames) String() string {
 	return buf.String()
 }
 
-// Tuple represents a parenthesized list of expressions.
-type Tuple Exprs
+// TableNameWithIndex represents a "table@index", used in statements that
+// specifically refer to an index.
+type TableNameWithIndex struct {
+	Table *QualifiedName
+	Index Name
+}
 
-func (node Tuple) String() string {
-	return fmt.Sprintf("(%s)", Exprs(node))
+func (n *TableNameWithIndex) String() string {
+	return fmt.Sprintf("%s@%s", n.Table, n.Index)
+}
+
+// TableNameWithIndexList is a list of indexes.
+type TableNameWithIndexList []*TableNameWithIndex
+
+func (n TableNameWithIndexList) String() string {
+	var buf bytes.Buffer
+	for i, e := range n {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(e.String())
+	}
+	return buf.String()
+}
+
+// Tuple represents a parenthesized list of expressions.
+type Tuple struct {
+	Exprs Exprs
+}
+
+func (node *Tuple) String() string {
+	return fmt.Sprintf("(%s)", node.Exprs)
 }
 
 // Row represents a parenthesized list of expressions. Similar to Tuple except
 // in how it is textually represented.
-type Row Exprs
+type Row struct {
+	Exprs Exprs
+}
 
-func (node Row) String() string {
-	return fmt.Sprintf("ROW(%s)", Exprs(node))
+func (node *Row) String() string {
+	return fmt.Sprintf("ROW(%s)", node.Exprs)
 }
 
 // Array represents an array constructor.
-type Array Exprs
+type Array struct {
+	Exprs Exprs
+}
 
-func (node Array) String() string {
-	return fmt.Sprintf("ARRAY[%s]", Exprs(node))
+func (node *Array) String() string {
+	return fmt.Sprintf("ARRAY[%s]", node.Exprs)
 }
 
 // Exprs represents a list of value expressions. It's not a valid expression
@@ -615,7 +633,7 @@ func (i BinaryOp) String() string {
 type BinaryExpr struct {
 	Operator    BinaryOp
 	Left, Right Expr
-	fn          binOp
+	fn          BinOp
 	ltype       reflect.Type
 	rtype       reflect.Type
 }
@@ -624,12 +642,12 @@ func (node *BinaryExpr) String() string {
 	return fmt.Sprintf("%s %s %s", node.Left, node.Operator, node.Right)
 }
 
-// UnaryOp represents a unary operator.
-type UnaryOp int
+// UnaryOperator represents a unary operator.
+type UnaryOperator int
 
 // UnaryExpr.Operator
 const (
-	UnaryPlus UnaryOp = iota
+	UnaryPlus UnaryOperator = iota
 	UnaryMinus
 	UnaryComplement
 )
@@ -640,8 +658,8 @@ var unaryOpName = [...]string{
 	UnaryComplement: "~",
 }
 
-func (i UnaryOp) String() string {
-	if i < 0 || i > UnaryOp(len(unaryOpName)-1) {
+func (i UnaryOperator) String() string {
+	if i < 0 || i > UnaryOperator(len(unaryOpName)-1) {
 		return fmt.Sprintf("UnaryOp(%d)", i)
 	}
 	return unaryOpName[i]
@@ -649,9 +667,9 @@ func (i UnaryOp) String() string {
 
 // UnaryExpr represents a unary value expression.
 type UnaryExpr struct {
-	Operator UnaryOp
+	Operator UnaryOperator
 	Expr     Expr
-	fn       unaryOp
+	fn       UnaryOp
 	dtype    reflect.Type
 }
 
@@ -666,7 +684,7 @@ type FuncExpr struct {
 	Exprs Exprs
 
 	// These fields are not part of the Expr AST.
-	fn      builtin
+	fn      Builtin
 	fnFound bool
 }
 

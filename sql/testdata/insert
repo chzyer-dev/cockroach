@@ -66,8 +66,8 @@ EXPLAIN (DEBUG) SELECT * FROM kv@a
 7  /kv/a/'d'  /'c'     ROW
 8  /kv/a/'f'  /'e'     ROW
 
-statement error duplicate key value \(v\)=\('f'\) violates unique constraint "a"
-INSERT INTO kv VALUES ('e', 'f')
+statement error pgcode 23505 duplicate key value \(v\)=\('f'\) violates unique constraint "a"
+INSERT INTO kv VALUES ('h', 'f')
 
 query ITTT
 EXPLAIN (DEBUG) SELECT * FROM kv
@@ -287,7 +287,7 @@ EXPLAIN (DEBUG) SELECT * FROM kv5@a
 0 /kv5/a/NULL/'a' ROW
 
 query TT
-SELECT * FROM kv5@a
+SELECT v, k FROM kv5@a
 ----
 NULL a
 
@@ -333,12 +333,75 @@ INSERT INTO return VALUES (default) RETURNING return.a
 
 # Can fetch rowid
 statement ok
-INSERT INTO return VALUES (default) RETURNING rowid != experimental_unique_int()
+INSERT INTO return VALUES (default) RETURNING rowid != unique_rowid()
 
-# Cannot return non-default columns when columns specified.
-statement error pq: qualified name "return.b" not found
+query I colnames
 INSERT INTO return (a) VALUES (default) RETURNING b
+----
+b
+NULL
 
-# TODO(mjibson): support *
-statement error pq: qualified name """.*" not found
+query III
+INSERT INTO return (b) VALUES (1) RETURNING *, a+1
+----
+3 1 4
+
+query II colnames
 INSERT INTO return VALUES (default) RETURNING *
+----
+a b
+3 NULL
+
+query II colnames
+INSERT INTO return VALUES (1, 2), (3, 4) RETURNING return.a, b
+----
+a b
+1 2
+3 4
+
+query II colnames
+INSERT INTO return VALUES (1, 2), (3, 4) RETURNING *
+----
+a b
+1 2
+3 4
+
+# Verify we return all columns even if we don't provide a value for all of them.
+query II colnames
+INSERT INTO return VALUES (1) RETURNING *
+----
+a b
+1 NULL
+
+query II colnames
+INSERT INTO return (a) VALUES (1) RETURNING *
+----
+a b
+1 NULL
+
+statement error pq: "return.*" cannot be aliased
+INSERT INTO return VALUES (1, 2), (3, 4) RETURNING return.* as x
+
+query III colnames
+INSERT INTO return VALUES (1, 2), (3, 4) RETURNING return.*, a + b
+----
+a b a + b
+1 2 3
+3 4 7
+
+statement ok
+CREATE TABLE abc (
+  a INT,
+  b INT,
+  c INT,
+  PRIMARY KEY (a, b),
+  INDEX a (a)
+)
+
+statement ok
+INSERT INTO abc VALUES (1, 2, 10)
+
+# Verify we get the correct message, even though internally the ConditionalPut
+# for the index key will also fail.
+statement error pgcode 23505 duplicate key value \(a,b\)=\(1,2\) violates unique constraint "primary"
+INSERT INTO abc VALUES (1, 2, 20)

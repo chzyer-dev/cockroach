@@ -34,7 +34,7 @@ var (
 )
 
 // RenameDatabase renames the database.
-// Privileges: "root" user.
+// Privileges: security.RootUser user.
 //   Notes: postgres requires superuser, db owner, or "CREATEDB".
 //          mysql >= 5.1.23 does not allow database renames.
 func (p *planner) RenameDatabase(n *parser.RenameDatabase) (planNode, *roachpb.Error) {
@@ -42,7 +42,7 @@ func (p *planner) RenameDatabase(n *parser.RenameDatabase) (planNode, *roachpb.E
 		return nil, roachpb.NewError(errEmptyDatabaseName)
 	}
 
-	if p.user != security.RootUser {
+	if p.session.User != security.RootUser {
 		return nil, roachpb.NewUErrorf("only %s is allowed to rename databases", security.RootUser)
 	}
 
@@ -81,7 +81,7 @@ func (p *planner) RenameDatabase(n *parser.RenameDatabase) (planNode, *roachpb.E
 		return nil, pErr
 	}
 
-	p.testingVerifyMetadata = func(systemConfig config.SystemConfig) error {
+	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		if err := expectDescriptorID(systemConfig, newKey, descID); err != nil {
 			return err
 		}
@@ -89,7 +89,7 @@ func (p *planner) RenameDatabase(n *parser.RenameDatabase) (planNode, *roachpb.E
 			return err
 		}
 		return expectDeleted(systemConfig, oldKey)
-	}
+	})
 
 	return &emptyNode{}, nil
 }
@@ -181,7 +181,7 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, *roachpb.Error) 
 		return nil, pErr
 	}
 
-	p.testingVerifyMetadata = func(systemConfig config.SystemConfig) error {
+	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		if err := expectDescriptorID(systemConfig, newTbKey, descID); err != nil {
 			return err
 		}
@@ -189,7 +189,7 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, *roachpb.Error) 
 			return err
 		}
 		return expectDeleted(systemConfig, tbKey)
-	}
+	})
 
 	return &emptyNode{}, nil
 }
@@ -204,16 +204,16 @@ func (p *planner) RenameIndex(n *parser.RenameIndex) (planNode, *roachpb.Error) 
 		return nil, roachpb.NewError(errEmptyIndexName)
 	}
 
-	if err := n.Name.NormalizeTableName(p.session.Database); err != nil {
+	if err := n.Index.Table.NormalizeTableName(p.session.Database); err != nil {
 		return nil, roachpb.NewError(err)
 	}
 
-	tableDesc, pErr := p.getTableDesc(n.Name)
+	tableDesc, pErr := p.getTableDesc(n.Index.Table)
 	if pErr != nil {
 		return nil, pErr
 	}
 
-	idxName := n.Name.Index()
+	idxName := string(n.Index.Index)
 	status, i, err := tableDesc.FindIndexByName(idxName)
 	if err != nil {
 		if n.IfExists {

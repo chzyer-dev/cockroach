@@ -34,37 +34,33 @@ import (
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/server/status"
-	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/ts"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // TestStatusLocalStacks verifies that goroutine stack traces are available
 // via the /_status/stacks/local endpoint.
 func TestStatusLocalStacks(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := StartTestServer(t)
 	defer s.Stop()
 
-	body, err := getText(testContext.HTTPRequestScheme() + "://" + s.ServingAddr() + "/_status/stacks/local")
-	if err != nil {
-		t.Fatal(err)
-	}
 	// Verify match with at least two goroutine stacks.
 	re := regexp.MustCompile("(?s)goroutine [0-9]+.*goroutine [0-9]+.*")
-	if !re.Match(body) {
+
+	if body, err := getText(s.Ctx.HTTPRequestScheme() + "://" + s.HTTPAddr() + "/_status/stacks/local"); err != nil {
+		t.Fatal(err)
+	} else if !re.Match(body) {
 		t.Errorf("expected %s to match %s", body, re)
 	}
 
-	body, err = getText(testContext.HTTPRequestScheme() + "://" + s.ServingAddr() + "/_status/stacks/1")
-	if err != nil {
+	if body, err := getText(s.Ctx.HTTPRequestScheme() + "://" + s.HTTPAddr() + "/_status/stacks/1"); err != nil {
 		t.Fatal(err)
-	}
-	// Verify match with at least two goroutine stacks.
-	if !re.Match(body) {
+	} else if !re.Match(body) {
 		t.Errorf("expected %s to match %s", body, re)
 	}
 }
@@ -72,7 +68,7 @@ func TestStatusLocalStacks(t *testing.T) {
 // TestStatusJson verifies that status endpoints return expected Json results.
 // The content type of the responses is always util.JSONContentType.
 func TestStatusJson(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := StartTestServer(t)
 	defer s.Stop()
 
@@ -98,21 +94,23 @@ func TestStatusJson(t *testing.T) {
     "goVersion": "%s",
     "tag": "",
     "time": "",
-    "dependencies": ""
+    "dependencies": "",
+    "cgoCompiler": ".*",
+    "platform": ".*"
   }
 }`, addr.Network(), addr.String(), regexp.QuoteMeta(runtime.Version()))
 	testCases = append(testCases, TestCase{"/health", expectedResult})
 	testCases = append(testCases, TestCase{"/_status/details/local", expectedResult})
 	testCases = append(testCases, TestCase{"/_status/details/1", expectedResult})
 
-	httpClient, err := testContext.GetHTTPClient()
+	httpClient, err := s.Ctx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, spec := range testCases {
 		contentTypes := []string{util.JSONContentType, util.ProtoContentType, util.YAMLContentType}
 		for _, contentType := range contentTypes {
-			req, err := http.NewRequest("GET", testContext.HTTPRequestScheme()+"://"+s.ServingAddr()+spec.keyPrefix, nil)
+			req, err := http.NewRequest("GET", s.Ctx.HTTPRequestScheme()+"://"+s.HTTPAddr()+spec.keyPrefix, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -143,7 +141,7 @@ func TestStatusJson(t *testing.T) {
 // TestStatusGossipJson ensures that the output response for the full gossip
 // info contains the required fields.
 func TestStatusGossipJson(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := StartTestServer(t)
 	defer s.Stop()
 
@@ -156,13 +154,13 @@ func TestStatusGossipJson(t *testing.T) {
 		} `json:"infos"`
 	}
 
-	httpClient, err := testContext.GetHTTPClient()
+	httpClient, err := s.Ctx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 	contentTypes := []string{util.JSONContentType, util.ProtoContentType, util.YAMLContentType}
 	for _, contentType := range contentTypes {
-		req, err := http.NewRequest("GET", testContext.HTTPRequestScheme()+"://"+s.ServingAddr()+"/_status/gossip/local", nil)
+		req, err := http.NewRequest("GET", s.Ctx.HTTPRequestScheme()+"://"+s.HTTPAddr()+"/_status/gossip/local", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -212,13 +210,12 @@ var retryOptions = retry.Options{
 // getRequest returns the results of a get request to the test server with
 // the given path.  It returns the contents of the body of the result.
 func getRequest(t *testing.T, ts TestServer, path string) []byte {
-	httpClient, err := testContext.GetHTTPClient()
+	httpClient, err := ts.Ctx.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	url := testContext.HTTPRequestScheme() + "://" + ts.ServingAddr() + path
-	// TODO(bram) #1940: Remove retry logic.
+	url := ts.Ctx.HTTPRequestScheme() + "://" + ts.HTTPAddr() + path
 	for r := retry.Start(retryOptions); r.Next(); {
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
@@ -255,7 +252,6 @@ func getRequest(t *testing.T, ts TestServer, path string) []byte {
 // startServer will start a server with a short scan interval, wait for
 // the scan to complete, and return the server. The caller is
 // responsible for stopping the server.
-// TODO(bram): Add more nodes.
 func startServer(t *testing.T) TestServer {
 	var ts TestServer
 	ts.Ctx = NewTestContext()
@@ -273,13 +269,11 @@ func startServer(t *testing.T) TestServer {
 	// Make sure the node status is available. This is done by forcing stores to
 	// publish their status, synchronizing to the event feed with a canary
 	// event, and then forcing the server to write summaries immediately.
-	if err := ts.node.publishStoreStatuses(); err != nil {
+	if err := ts.node.computePeriodicMetrics(); err != nil {
 		t.Fatalf("error publishing store statuses: %s", err)
 	}
 
-	ts.EventFeed().Flush()
-
-	if err := ts.writeSummaries(); err != nil {
+	if err := ts.WriteSummaries(); err != nil {
 		t.Fatalf("error writing summaries: %s", err)
 	}
 
@@ -290,7 +284,7 @@ func startServer(t *testing.T) TestServer {
 // local/logfiles/{filename}, local/log and local/log/{level} function
 // correctly.
 func TestStatusLocalLogs(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	dir, err := ioutil.TempDir("", "local_log_test")
 	if err != nil {
 		t.Fatal(err)
@@ -307,13 +301,13 @@ func TestStatusLocalLogs(t *testing.T) {
 	defer ts.Stop()
 
 	// Log an error which we expect to show up on every log file.
-	timestamp := time.Now().UnixNano()
+	timestamp := timeutil.Now().UnixNano()
 	log.Errorf("TestStatusLocalLogFile test message-Error")
-	timestampE := time.Now().UnixNano()
+	timestampE := timeutil.Now().UnixNano()
 	log.Warningf("TestStatusLocalLogFile test message-Warning")
-	timestampEW := time.Now().UnixNano()
+	timestampEW := timeutil.Now().UnixNano()
 	log.Infof("TestStatusLocalLogFile test message-Info")
-	timestampEWI := time.Now().UnixNano()
+	timestampEWI := timeutil.Now().UnixNano()
 
 	type logsWrapper struct {
 		Data []log.FileInfo `json:"d"`
@@ -333,7 +327,7 @@ func TestStatusLocalLogs(t *testing.T) {
 
 	// Fetch the full list of log entries.
 	type logWrapper struct {
-		Data []log.LogEntry `json:"d"`
+		Data []log.Entry `json:"d"`
 	}
 
 	// Check each individual log can be fetched and is non-empty.
@@ -344,7 +338,7 @@ func TestStatusLocalLogs(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, entry := range log.Data {
-			switch entry.Format {
+			switch entry.Message {
 			case "TestStatusLocalLogFile test message-Error":
 				foundError = true
 			case "TestStatusLocalLogFile test message-Warning":
@@ -423,9 +417,9 @@ func TestStatusLocalLogs(t *testing.T) {
 			var actualInfo, actualWarning, actualError bool
 			var formats bytes.Buffer
 			for _, entry := range log.Data {
-				fmt.Fprintf(&formats, "%s\n", entry.Format)
+				fmt.Fprintf(&formats, "%s\n", entry.Message)
 
-				switch entry.Format {
+				switch entry.Message {
 				case "TestStatusLocalLogFile test message-Error":
 					actualError = true
 				case "TestStatusLocalLogFile test message-Warning":
@@ -456,7 +450,7 @@ func TestStatusLocalLogs(t *testing.T) {
 // TestNodeStatusResponse verifies that node status returns the expected
 // results.
 func TestNodeStatusResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	ts := startServer(t)
 	defer ts.Stop()
 
@@ -493,64 +487,13 @@ func TestNodeStatusResponse(t *testing.T) {
 	}
 }
 
-// TestStoreStatusResponse verifies that node status returns the expected
-// results.
-func TestStoreStatusResponse(t *testing.T) {
-	defer leaktest.AfterTest(t)
-	ts := startServer(t)
-	defer ts.Stop()
-
-	body := getRequest(t, ts, statusStoresPrefix)
-
-	type ssWrapper struct {
-		Data []storage.StoreStatus `json:"d"`
-	}
-	wrapper := ssWrapper{}
-	if err := json.Unmarshal(body, &wrapper); err != nil {
-		t.Fatal(err)
-	}
-	storeStatuses := wrapper.Data
-
-	if len(storeStatuses) != ts.node.stores.GetStoreCount() {
-		t.Errorf("expected %d node statuses, got %d", ts.node.stores.GetStoreCount(), len(storeStatuses))
-	}
-	for _, storeStatus := range storeStatuses {
-		storeID := storeStatus.Desc.StoreID
-		store, err := ts.node.stores.GetStore(storeID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		desc, pErr := store.Descriptor()
-		if pErr != nil {
-			t.Fatal(pErr)
-		}
-		// The capacities fluctuate a lot, so drop them for the deep equal.
-		desc.Capacity = roachpb.StoreCapacity{}
-		storeStatus.Desc.Capacity = roachpb.StoreCapacity{}
-		if !reflect.DeepEqual(*desc, storeStatus.Desc) {
-			t.Errorf("store status descriptors are not equal\nexpected:%+v\nactual:%+v\n", *desc, storeStatus.Desc)
-		}
-
-		// Also fetch the each status individually.
-		fetchedStoreStatus := storage.StoreStatus{}
-		requestBody := getRequest(t, ts, fmt.Sprintf("%s%s", statusStoresPrefix, storeStatus.Desc.StoreID))
-		if err := json.Unmarshal(requestBody, &fetchedStoreStatus); err != nil {
-			t.Fatal(err)
-		}
-		fetchedStoreStatus.Desc.Capacity = roachpb.StoreCapacity{}
-		if !reflect.DeepEqual(*desc, fetchedStoreStatus.Desc) {
-			t.Errorf("store status descriptors are not equal\nexpected:%+v\nactual:%+v\n", *desc, fetchedStoreStatus.Desc)
-		}
-	}
-}
-
 // TestMetricsRecording verifies that Node statistics are periodically recorded
 // as time series data.
 func TestMetricsRecording(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tsrv := TestServer{}
 	tsrv.Ctx = NewTestContext()
-	tsrv.Ctx.MetricsFrequency = 5 * time.Millisecond
+	tsrv.Ctx.MetricsSampleInterval = 5 * time.Millisecond
 	if err := tsrv.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +507,7 @@ func TestMetricsRecording(t *testing.T) {
 
 	// Verify that metrics for the current timestamp are recorded. This should
 	// be true very quickly.
-	util.SucceedsWithin(t, time.Second, func() error {
+	util.SucceedsSoon(t, func() error {
 		now := tsrv.Clock().PhysicalNow()
 		if err := checkTimeSeriesKey(now, "cr.store.livebytes.1"); err != nil {
 			return err
@@ -574,4 +517,17 @@ func TestMetricsRecording(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestMetricsEndpoint retrieves the metrics endpoint, which is currently only
+// used for development purposes. The metrics within the response are verified
+// in other tests.
+func TestMetricsEndpoint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := startServer(t)
+	defer s.Stop()
+
+	nodeID := s.Gossip().GetNodeID()
+	url := fmt.Sprintf("%s/%s", statusMetricsPrefix, nodeID)
+	getRequest(t, s, url)
 }

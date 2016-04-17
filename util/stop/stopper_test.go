@@ -18,6 +18,7 @@ package stop_test
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ import (
 )
 
 func TestStopper(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	running := make(chan struct{})
 	waiting := make(chan struct{})
@@ -78,7 +79,7 @@ func (bc *blockingCloser) Close() {
 }
 
 func TestStopperIsStopped(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	bc := newBlockingCloser()
 	s.AddCloser(bc)
@@ -105,7 +106,7 @@ func TestStopperIsStopped(t *testing.T) {
 }
 
 func TestStopperMultipleStopees(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	const count = 3
 	s := stop.NewStopper()
 
@@ -125,7 +126,7 @@ func TestStopperMultipleStopees(t *testing.T) {
 }
 
 func TestStopperStartFinishTasks(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 
 	if !s.RunTask(func() {
@@ -149,7 +150,7 @@ func TestStopperStartFinishTasks(t *testing.T) {
 }
 
 func TestStopperRunWorker(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	s.RunWorker(func() {
 		select {
@@ -172,7 +173,7 @@ func TestStopperRunWorker(t *testing.T) {
 
 // TestStopperQuiesce tests coordinate drain with Quiesce.
 func TestStopperQuiesce(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	var stoppers []*stop.Stopper
 	for i := 0; i < 3; i++ {
 		stoppers = append(stoppers, stop.NewStopper())
@@ -234,7 +235,7 @@ func (tc *testCloser) Close() {
 }
 
 func TestStopperClosers(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	var tc1, tc2 testCloser
 	s.AddCloser(&tc1)
@@ -246,7 +247,7 @@ func TestStopperClosers(t *testing.T) {
 }
 
 func TestStopperNumTasks(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	var tasks []chan bool
 	for i := 0; i < 3; i++ {
@@ -283,10 +284,12 @@ func TestStopperNumTasks(t *testing.T) {
 		// Close the channel to let the task proceed.
 		close(c)
 		expNum := len(tasks[i+1:])
-		err := util.IsTrueWithin(func() bool { return s.NumTasks() == expNum }, 20*time.Millisecond)
-		if err != nil {
-			t.Errorf("%d: stopper should have %d running tasks, got %d", i, expNum, s.NumTasks())
-		}
+		util.SucceedsSoon(t, func() error {
+			if nt := s.NumTasks(); nt != expNum {
+				return util.Errorf("%d: stopper should have %d running tasks, got %d", i, expNum, nt)
+			}
+			return nil
+		})
 	}
 	// The taskmap should've been cleared out.
 	if m := s.RunningTasks(); len(m) != 0 {
@@ -299,7 +302,7 @@ func TestStopperNumTasks(t *testing.T) {
 // RunAsyncTask has a similar bit of logic, but it is not testable because
 // we cannot insert a recover() call in the right place.
 func TestStopperRunTaskPanic(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	// If RunTask were not panic-safe, Stop() would deadlock.
 	defer s.Stop()
@@ -314,7 +317,7 @@ func TestStopperRunTaskPanic(t *testing.T) {
 }
 
 func TestStopperShouldDrain(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
 	running := make(chan struct{})
 	runningTask := make(chan struct{})
@@ -370,6 +373,47 @@ func TestStopperShouldDrain(t *testing.T) {
 	s.Stop()
 	close(waiting)
 	<-cleanup
+}
+
+func TestStopperRunLimitedAsyncTask(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := stop.NewStopper()
+	defer s.Stop()
+
+	const maxConcurrency = 5
+	const duration = 10 * time.Millisecond
+	sem := make(chan struct{}, maxConcurrency)
+	var mu sync.Mutex
+	concurrency := 0
+	peakConcurrency := 0
+	var wg sync.WaitGroup
+
+	f := func() {
+		mu.Lock()
+		concurrency++
+		if concurrency > peakConcurrency {
+			peakConcurrency = concurrency
+		}
+		mu.Unlock()
+		time.Sleep(duration)
+		mu.Lock()
+		concurrency--
+		mu.Unlock()
+		wg.Done()
+	}
+
+	for i := 0; i < maxConcurrency*3; i++ {
+		wg.Add(1)
+		s.RunLimitedAsyncTask(sem, f)
+	}
+	wg.Wait()
+	if concurrency != 0 {
+		t.Fatalf("expected 0 concurrency at end of test but got %d", concurrency)
+	}
+	if peakConcurrency != maxConcurrency {
+		t.Fatalf("expected peak concurrency %d to equal max concurrency %d",
+			peakConcurrency, maxConcurrency)
+	}
 }
 
 func maybePrint() {

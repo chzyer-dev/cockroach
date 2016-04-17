@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 type stringMatcher interface {
@@ -60,11 +61,11 @@ type callback struct {
 type infoStore struct {
 	stopper *stop.Stopper
 
-	Infos     infoMap             `json:"infos,omitempty"` // Map from key to info
-	NodeID    roachpb.NodeID      `json:"-"`               // Owning node's ID
-	NodeAddr  util.UnresolvedAddr `json:"-"`               // Address of node owning this info store: "host:port"
-	nodes     map[int32]*Node     // Per-node information for gossip peers
-	callbacks []*callback
+	Infos           infoMap                  `json:"infos,omitempty"` // Map from key to info
+	NodeID          roachpb.NodeID           `json:"-"`               // Owning node's ID
+	NodeAddr        util.UnresolvedAddr      `json:"-"`               // Address of node owning this info store: "host:port"
+	highWaterStamps map[roachpb.NodeID]int64 // Per-node information for gossip peers
+	callbacks       []*callback
 
 	callbackMu     sync.Mutex // Serializes callbacks
 	callbackWorkMu sync.Mutex // Protects callbackWork
@@ -88,7 +89,7 @@ func monotonicUnixNano() int64 {
 	monoTime.Lock()
 	defer monoTime.Unlock()
 
-	now := time.Now().UnixNano()
+	now := timeutil.Now().UnixNano()
 	if now <= monoTime.last {
 		now = monoTime.last + 1
 	}
@@ -120,11 +121,11 @@ func (is *infoStore) String() string {
 // newInfoStore allocates and returns a new infoStore.
 func newInfoStore(nodeID roachpb.NodeID, nodeAddr util.UnresolvedAddr, stopper *stop.Stopper) *infoStore {
 	return &infoStore{
-		stopper:  stopper,
-		Infos:    make(infoMap),
-		NodeID:   nodeID,
-		NodeAddr: nodeAddr,
-		nodes:    map[int32]*Node{},
+		stopper:         stopper,
+		Infos:           make(infoMap),
+		NodeID:          nodeID,
+		NodeAddr:        nodeAddr,
+		highWaterStamps: map[roachpb.NodeID]int64{},
 	}
 }
 
@@ -152,7 +153,7 @@ func (is *infoStore) newInfo(val []byte, ttl time.Duration) *Info {
 func (is *infoStore) getInfo(key string) *Info {
 	if info, ok := is.Infos[key]; ok {
 		// Check TTL and discard if too old.
-		if info.expired(time.Now().UnixNano()) {
+		if info.expired(timeutil.Now().UnixNano()) {
 			delete(is.Infos, key)
 		} else {
 			return info
@@ -180,37 +181,28 @@ func (is *infoStore) addInfo(key string, i *Info) error {
 	if i.OrigStamp == 0 {
 		i.Value.InitChecksum([]byte(key))
 		i.OrigStamp = monotonicUnixNano()
-		if n, ok := is.nodes[int32(i.NodeID)]; ok && n.HighWaterStamp >= i.OrigStamp {
-			panic(util.Errorf("high water stamp %d >= %d", n.HighWaterStamp, i.OrigStamp))
+		if highWaterStamp, ok := is.highWaterStamps[i.NodeID]; ok && highWaterStamp >= i.OrigStamp {
+			panic(util.Errorf("high water stamp %d >= %d", highWaterStamp, i.OrigStamp))
 		}
 	}
 	// Update info map.
 	is.Infos[key] = i
 	// Update the high water timestamp & min hops for the originating node.
-	if nID := int32(i.NodeID); nID != 0 {
-		n, ok := is.nodes[nID]
-		if !ok {
-			is.nodes[nID] = &Node{i.OrigStamp, i.Hops}
-		} else {
-			if n.HighWaterStamp < i.OrigStamp {
-				n.HighWaterStamp = i.OrigStamp
-			}
-			if n.MinHops > i.Hops {
-				n.MinHops = i.Hops
-			}
+	if nID := i.NodeID; nID != 0 {
+		if hws := is.highWaterStamps[nID]; hws < i.OrigStamp {
+			is.highWaterStamps[nID] = i.OrigStamp
 		}
 	}
 	is.processCallbacks(key, i.Value)
 	return nil
 }
 
-// getNodes returns a copy of the nodes map of gossip peer info
-// maintained by this infostore.
-func (is *infoStore) getNodes() map[int32]*Node {
-	copy := make(map[int32]*Node, len(is.nodes))
-	for k, v := range is.nodes {
-		nodeCopy := *v
-		copy[k] = &nodeCopy
+// getHighWaterStamps returns a copy of the high water stamps map of
+// gossip peer info maintained by this infostore.
+func (is *infoStore) getHighWaterStamps() map[roachpb.NodeID]int64 {
+	copy := make(map[roachpb.NodeID]int64, len(is.highWaterStamps))
+	for k, hws := range is.highWaterStamps {
+		copy[k] = hws
 	}
 	return copy
 }
@@ -298,7 +290,7 @@ func (is *infoStore) runCallbacks(key string, content roachpb.Value, callbacks .
 // function against each info in turn. Be sure to skip over any expired
 // infos.
 func (is *infoStore) visitInfos(visitInfo func(string, *Info) error) error {
-	now := time.Now().UnixNano()
+	now := timeutil.Now().UnixNano()
 
 	if visitInfo != nil {
 		for k, i := range is.Infos {
@@ -338,17 +330,15 @@ func (is *infoStore) combine(infos map[string]*Info, nodeID roachpb.NodeID) (fre
 	return
 }
 
-// delta returns a map of infos which are newer or have fewer hops
-// than the values indicated by the supplied nodes map. The
-// supplied nodes map contains gossip node information from the
-// perspective of the peer asking for the delta. That is, the map
-// contains a record of the most recent info timestamp and min hops
-// which the requester has seen from each node in the network.
-func (is *infoStore) delta(nodes map[int32]*Node) map[string]*Info {
+// delta returns a map of infos which have originating timestamps
+// newer than the high water timestamps indicated by the supplied
+// map (which is taken from the perspective of the peer node we're
+// taking this delta for).
+func (is *infoStore) delta(highWaterTimestamps map[roachpb.NodeID]int64) map[string]*Info {
 	infos := make(map[string]*Info)
 	// Compute delta of infos.
 	if err := is.visitInfos(func(key string, i *Info) error {
-		if i.isFresh(nodes[int32(i.NodeID)]) {
+		if i.isFresh(highWaterTimestamps[i.NodeID]) {
 			infos[key] = i
 		}
 		return nil

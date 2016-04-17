@@ -26,7 +26,9 @@ module Models {
      */
     interface QueryInfo {
       name: string;
-      aggregator: Proto.QueryAggregator;
+      downsampler: Proto.QueryAggregator;
+      source_aggregator: Proto.QueryAggregator;
+      derivative: Proto.QueryDerivative;
     }
 
     /**
@@ -34,7 +36,12 @@ module Models {
      * server-side dataset referenced by the QueryInfo.
      */
     export function QueryInfoKey(qi: QueryInfo): string {
-      return Proto.QueryAggregator[qi.aggregator] + ":" + qi.name;
+      return [
+        Proto.QueryAggregator[qi.downsampler],
+        Proto.QueryAggregator[qi.source_aggregator],
+        Proto.QueryDerivative[qi.derivative],
+        qi.name,
+      ].join(":");
     }
 
     /**
@@ -98,77 +105,74 @@ module Models {
     export module Select {
 
       /**
-       * Selector is the common interface implemented by all Selector
-       * types. The is a read-only interface used by other components to
-       * extract relevant information from the selector.
+       * Selector is a class which describes a time series request. It describes
+       * the name of a series, along with a set of functions that will be used
+       * to process the data from the series: a downsampler, an aggregator and a
+       * derivative function.
        */
-      export interface Selector {
+      export class Selector {
         /**
-         * request returns a QueryRequest object based on this selector.
+         * Construct a new selector which requests data for the given time
+         * series, downsampling data using the provided aggregator.
          */
-        request(): Proto.QueryRequest;
-        /**
-         * series returns the series that is being queried.
-         */
-        series(): string;
+        constructor(private seriesName: string, private downsampler: Proto.QueryAggregator) {}
         /**
          * sources returns the data sources to which this query is restrained.
          */
-        sources(): string[];
+        sources: Utils.ChainProperty<string[], Selector> = Utils.ChainProp(this, []);
         /**
          * title returns a display-friendly title for this series.
          */
-        title(): string;
-      }
-
-      /**
-       * AvgSelector selects the average value of the supplied time series.
-       */
-      class AvgSelector implements Selector {
-        constructor(private seriesName: string) { }
-        title: Utils.ChainProperty<string, AvgSelector> = Utils.ChainProp(this, this.seriesName);
-        sources: Utils.ChainProperty<string[], AvgSelector> = Utils.ChainProp(this, []);
+        title: Utils.ChainProperty<string, Selector> = Utils.ChainProp(this, this.seriesName);
+        /**
+         * aggregator sets the source aggregator to be used for this query.
+         */
+        aggregator: Utils.ChainProperty<Proto.QueryAggregator, Selector> =
+          Utils.ChainProp( this, Proto.QueryAggregator.SUM);
+        /**
+         * derivative sets the derivative function to be applied to the results
+         * of this query.
+         */
+        derivative: Utils.ChainProperty<Proto.QueryDerivative, Selector> =
+          Utils.ChainProp( this, Proto.QueryDerivative.NONE);
+        /**
+         * series returns the series that is being queried.
+         */
         series: () => string = () => { return this.seriesName; };
+        /**
+         * rate is a convenience method to set the derivative function to
+         * 'Derivative'
+         */
+        rate: () => Selector = () => {
+          return this.derivative(Proto.QueryDerivative.DERIVATIVE);
+        };
+        /**
+         * nonNegativeRate is a convenience method to set the derivative function to
+         * 'Non_Negative_Derivative'
+         */
+        nonNegativeRate: () => Selector = () => {
+          return this.derivative(Proto.QueryDerivative.NON_NEGATIVE_DERIVATIVE);
+        };
+        /**
+         * request returns a QueryRequest object based on this selector.
+         */
         request: () => Proto.QueryRequest = (): Proto.QueryRequest => {
           return {
             name: this.seriesName,
             sources: this.sources(),
-            aggregator: Proto.QueryAggregator.AVG,
+            downsampler: this.downsampler,
+            source_aggregator: this.aggregator(),
+            derivative: this.derivative(),
           };
         };
       }
 
       /**
-       * AvgRateSelector selects the rate of change of the average value
-       * of the supplied time series.
+       * Avg instantiates a new selector for the supplied time series which
+       * downsamples by averaging.
        */
-      class AvgRateSelector implements Selector {
-        constructor(private seriesName: string) {}
-        title: Utils.ChainProperty<string, AvgRateSelector> = Utils.ChainProp(this, this.seriesName);
-        sources: Utils.ChainProperty<string[], AvgRateSelector> = Utils.ChainProp(this, []);
-        series: () => string = () => { return this.seriesName; };
-        request: () => Proto.QueryRequest = (): Proto.QueryRequest => {
-          return {
-            name: this.seriesName,
-            sources: this.sources(),
-            aggregator: Proto.QueryAggregator.AVG_RATE,
-          };
-        };
-      }
-
-      /**
-       * Avg instantiates a new AvgSelector for the supplied time series.
-       */
-      export function Avg(series: string): AvgSelector {
-        return new AvgSelector(series);
-      }
-
-      /**
-       * AvgRate instantiates a new AvgRateSelector for the supplied time
-       * series.
-       */
-      export function AvgRate(series: string): AvgRateSelector {
-        return new AvgRateSelector(series);
+      export function Avg(series: string): Selector {
+        return new Selector(series, Proto.QueryAggregator.AVG);
       }
     }
 
@@ -244,11 +248,33 @@ module Models {
        */
       stacked: Utils.ChainProperty<boolean, Axis> = Utils.ChainProp(this, false);
 
+      /**
+       *  legend forces the legend to be hidden (false) or visible (true)
+       */
+      legend: Utils.ChainProperty<boolean, Axis> = Utils.ChainProp(this, null);
+
+      /**
+       *  xAxis forces the xAxis to be hidden (false) or visible (true)
+       */
+      xAxis: Utils.ChainProperty<boolean, Axis> = Utils.ChainProp(this, true);
+
+      /**
+       *  yLow forces the the yAxis to extend down to the specified value, even if the min data value is higher
+       *  The default is 0 but to disable the behavior yLow can be set to null
+       */
+      yLow: Utils.ChainProperty<number, Axis> = Utils.ChainProp(this, 0);
+
+      /**
+       *  yHigh forces the yaxis to extend up to the specified value, even if the max data value is lower
+       *  The default is 1 but to disable the behavior yHigh can be set to null
+       */
+      yHigh: Utils.ChainProperty<number, Axis> = Utils.ChainProp(this, 1);
+
       // Stores the hard-coded title if one is set.
       private _title: string;
 
       /**
-       * Title returns an appropriate title for a chart displaying this
+       * title returns an appropriate title for a chart displaying this
        * axis. This is generated by combining the titles of all selectors
        * on the axis.
        */
@@ -305,6 +331,27 @@ module Models {
        */
       selectors: Utils.ChainProperty<Select.Selector[], Query> = Utils.ChainProp(this, []);
 
+      private static dispatch_query(q: Proto.QueryRequestSet): promise<QueryResultSet> {
+          return Utils.Http.Post("/ts/query", q)
+              .then((d: Proto.Results) => {
+                  // Populate missing collection fields with empty arrays.
+                  if (!d.results) {
+                      d.results = [];
+                  }
+                  let result: QueryInfoSet<Proto.QueryResult> = new QueryInfoSet<Proto.QueryResult>();
+                  d.results.forEach((r: Proto.Result) => {
+                      result.add({
+                        name: r.query.name,
+                        downsampler: r.query.downsampler,
+                        source_aggregator: r.query.source_aggregator,
+                        derivative: r.query.derivative,
+                        datapoints: r.datapoints || [],
+                      });
+                  });
+                  return result;
+              });
+      }
+
       /**
        * execute dispatches a query to the server and returns a promise
        * for the results.
@@ -328,24 +375,6 @@ module Models {
         });
         return Query.dispatch_query(req);
       };
-
-      private static dispatch_query(q: Proto.QueryRequestSet): promise<QueryResultSet> {
-        return Utils.Http.Post("/ts/query", q)
-          .then((d: Proto.QueryResultSet) => {
-            // Populate missing collection fields with empty arrays.
-            if (!d.results) {
-              d.results = [];
-            }
-            let result: QueryInfoSet<Proto.QueryResult> = new QueryInfoSet<Proto.QueryResult>();
-            d.results.forEach((r: Proto.QueryResult) => {
-              if (!r.datapoints) {
-                r.datapoints = [];
-              }
-              result.add(r);
-            });
-            return result;
-          });
-      }
     }
 
     /**
@@ -362,11 +391,11 @@ module Models {
      * execution.
      */
     export class Executor extends Utils.QueryCache<QueryResultSet> {
+      private _metricquery: Query;
+
       query: () => Query = () => {
         return this._metricquery;
       };
-
-      private _metricquery: Query;
 
       constructor(q: Query) {
         super(q.execute);

@@ -10,7 +10,6 @@
 
 	It has these top-level messages:
 		BootstrapInfo
-		Node
 		Request
 		Response
 		Info
@@ -33,6 +32,7 @@ import (
 	grpc "google.golang.org/grpc"
 )
 
+import github_com_gogo_protobuf_sortkeys "github.com/gogo/protobuf/sortkeys"
 import errors "errors"
 
 import io "io"
@@ -41,6 +41,10 @@ import io "io"
 var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+const _ = proto.GoGoProtoPackageIsVersion1
 
 // BootstrapInfo contains information necessary to bootstrapping the
 // gossip network from a cold start.
@@ -51,83 +55,76 @@ type BootstrapInfo struct {
 	Timestamp cockroach_roachpb1.Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
 }
 
-func (m *BootstrapInfo) Reset()         { *m = BootstrapInfo{} }
-func (m *BootstrapInfo) String() string { return proto.CompactTextString(m) }
-func (*BootstrapInfo) ProtoMessage()    {}
-
-// Node contains information about a gossip node.
-type Node struct {
-	// The most recent timestamp of any info which originated at this node.
-	HighWaterStamp int64 `protobuf:"varint,1,opt,name=high_water_stamp,proto3" json:"high_water_stamp,omitempty"`
-	// The minimum number of hops seen for any info which originated at this node.
-	MinHops uint32 `protobuf:"varint,2,opt,name=min_hops,proto3" json:"min_hops,omitempty"`
-}
-
-func (m *Node) Reset()         { *m = Node{} }
-func (m *Node) String() string { return proto.CompactTextString(m) }
-func (*Node) ProtoMessage()    {}
+func (m *BootstrapInfo) Reset()                    { *m = BootstrapInfo{} }
+func (m *BootstrapInfo) String() string            { return proto.CompactTextString(m) }
+func (*BootstrapInfo) ProtoMessage()               {}
+func (*BootstrapInfo) Descriptor() ([]byte, []int) { return fileDescriptorGossip, []int{0} }
 
 // Request is the request struct passed with the Gossip RPC.
 type Request struct {
 	// Requesting node's ID.
-	NodeID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,1,opt,name=node_id,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"node_id,omitempty"`
+	NodeID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,1,opt,name=node_id,json=nodeId,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"node_id,omitempty"`
 	// Address of the requesting client.
 	Addr cockroach_util.UnresolvedAddr `protobuf:"bytes,2,opt,name=addr" json:"addr"`
-	// Map of information about other nodes, as seen by the requester.
-	Nodes map[int32]*Node `protobuf:"bytes,3,rep,name=nodes" json:"nodes,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value"`
+	// Map of high water timestamps from infos originating at other
+	// nodes, as seen by the requester.
+	HighWaterStamps map[github_com_cockroachdb_cockroach_roachpb.NodeID]int64 `protobuf:"bytes,3,rep,name=high_water_stamps,json=highWaterStamps,castkey=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"high_water_stamps" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"varint,2,opt,name=value,proto3"`
 	// Delta of Infos originating at sender.
 	Delta map[string]*Info `protobuf:"bytes,4,rep,name=delta" json:"delta,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value"`
 }
 
-func (m *Request) Reset()         { *m = Request{} }
-func (m *Request) String() string { return proto.CompactTextString(m) }
-func (*Request) ProtoMessage()    {}
+func (m *Request) Reset()                    { *m = Request{} }
+func (m *Request) String() string            { return proto.CompactTextString(m) }
+func (*Request) ProtoMessage()               {}
+func (*Request) Descriptor() ([]byte, []int) { return fileDescriptorGossip, []int{1} }
 
 // Response is returned from the Gossip.Gossip RPC.
 // Delta will be nil in the event that Alternate is set.
 type Response struct {
 	// Responding Node's ID.
-	NodeID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,1,opt,name=node_id,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"node_id,omitempty"`
+	NodeID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,1,opt,name=node_id,json=nodeId,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"node_id,omitempty"`
 	// Address of the responding client.
 	Addr cockroach_util.UnresolvedAddr `protobuf:"bytes,2,opt,name=addr" json:"addr"`
 	// Non-nil means client should retry with this address.
-	AlternateAddr *cockroach_util.UnresolvedAddr `protobuf:"bytes,3,opt,name=alternate_addr" json:"alternate_addr,omitempty"`
+	AlternateAddr *cockroach_util.UnresolvedAddr `protobuf:"bytes,3,opt,name=alternate_addr,json=alternateAddr" json:"alternate_addr,omitempty"`
 	// Node ID of the alternate address, if alternate_addr is not nil.
-	AlternateNodeID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,4,opt,name=alternate_node_id,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"alternate_node_id,omitempty"`
+	AlternateNodeID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,4,opt,name=alternate_node_id,json=alternateNodeId,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"alternate_node_id,omitempty"`
 	// Delta of Infos which are fresh according to the map of Node info messages
 	// passed with the request.
 	Delta map[string]*Info `protobuf:"bytes,5,rep,name=delta" json:"delta,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value"`
-	// Map of information about other nodes, as seen by the responder.
-	Nodes map[int32]*Node `protobuf:"bytes,6,rep,name=nodes" json:"nodes,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value"`
+	// Map of high water timestamps from infos originating at other
+	// nodes, as seen by the responder.
+	HighWaterStamps map[github_com_cockroachdb_cockroach_roachpb.NodeID]int64 `protobuf:"bytes,6,rep,name=high_water_stamps,json=highWaterStamps,castkey=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"high_water_stamps" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"varint,2,opt,name=value,proto3"`
 }
 
-func (m *Response) Reset()         { *m = Response{} }
-func (m *Response) String() string { return proto.CompactTextString(m) }
-func (*Response) ProtoMessage()    {}
+func (m *Response) Reset()                    { *m = Response{} }
+func (m *Response) String() string            { return proto.CompactTextString(m) }
+func (*Response) ProtoMessage()               {}
+func (*Response) Descriptor() ([]byte, []int) { return fileDescriptorGossip, []int{2} }
 
 // Info is the basic unit of information traded over the
 // gossip network.
 type Info struct {
 	Value cockroach_roachpb1.Value `protobuf:"bytes,1,opt,name=value" json:"value"`
 	// Wall time of info when generated by originating node (Unix-nanos).
-	OrigStamp int64 `protobuf:"varint,2,opt,name=orig_stamp,proto3" json:"orig_stamp,omitempty"`
+	OrigStamp int64 `protobuf:"varint,2,opt,name=orig_stamp,json=origStamp,proto3" json:"orig_stamp,omitempty"`
 	// Wall time when info is to be discarded (Unix-nanos).
-	TTLStamp int64 `protobuf:"varint,3,opt,name=ttl_stamp,proto3" json:"ttl_stamp,omitempty"`
+	TTLStamp int64 `protobuf:"varint,3,opt,name=ttl_stamp,json=ttlStamp,proto3" json:"ttl_stamp,omitempty"`
 	// Number of hops from originator.
 	Hops uint32 `protobuf:"varint,4,opt,name=hops,proto3" json:"hops,omitempty"`
 	// Originating node's ID.
-	NodeID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,5,opt,name=node_id,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"node_id,omitempty"`
+	NodeID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,5,opt,name=node_id,json=nodeId,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"node_id,omitempty"`
 	// Peer node ID which passed this info.
-	PeerID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,6,opt,name=peer_id,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"peer_id,omitempty"`
+	PeerID github_com_cockroachdb_cockroach_roachpb.NodeID `protobuf:"varint,6,opt,name=peer_id,json=peerId,proto3,casttype=github.com/cockroachdb/cockroach/roachpb.NodeID" json:"peer_id,omitempty"`
 }
 
-func (m *Info) Reset()         { *m = Info{} }
-func (m *Info) String() string { return proto.CompactTextString(m) }
-func (*Info) ProtoMessage()    {}
+func (m *Info) Reset()                    { *m = Info{} }
+func (m *Info) String() string            { return proto.CompactTextString(m) }
+func (*Info) ProtoMessage()               {}
+func (*Info) Descriptor() ([]byte, []int) { return fileDescriptorGossip, []int{3} }
 
 func init() {
 	proto.RegisterType((*BootstrapInfo)(nil), "cockroach.gossip.BootstrapInfo")
-	proto.RegisterType((*Node)(nil), "cockroach.gossip.Node")
 	proto.RegisterType((*Request)(nil), "cockroach.gossip.Request")
 	proto.RegisterType((*Response)(nil), "cockroach.gossip.Response")
 	proto.RegisterType((*Info)(nil), "cockroach.gossip.Info")
@@ -270,34 +267,6 @@ func (m *BootstrapInfo) MarshalTo(data []byte) (int, error) {
 	return i, nil
 }
 
-func (m *Node) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *Node) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	if m.HighWaterStamp != 0 {
-		data[i] = 0x8
-		i++
-		i = encodeVarintGossip(data, i, uint64(m.HighWaterStamp))
-	}
-	if m.MinHops != 0 {
-		data[i] = 0x10
-		i++
-		i = encodeVarintGossip(data, i, uint64(m.MinHops))
-	}
-	return i, nil
-}
-
 func (m *Request) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
@@ -326,35 +295,36 @@ func (m *Request) MarshalTo(data []byte) (int, error) {
 		return 0, err
 	}
 	i += n2
-	if len(m.Nodes) > 0 {
-		for k := range m.Nodes {
+	if len(m.HighWaterStamps) > 0 {
+		keysForHighWaterStamps := make([]int32, 0, len(m.HighWaterStamps))
+		for k := range m.HighWaterStamps {
+			keysForHighWaterStamps = append(keysForHighWaterStamps, int32(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Int32s(keysForHighWaterStamps)
+		for _, k := range keysForHighWaterStamps {
 			data[i] = 0x1a
 			i++
-			v := m.Nodes[k]
-			if v == nil {
-				return 0, errors.New("proto: map has nil element")
-			}
-			msgSize := v.Size()
-			mapSize := 1 + sovGossip(uint64(k)) + 1 + msgSize + sovGossip(uint64(msgSize))
+			v := m.HighWaterStamps[github_com_cockroachdb_cockroach_roachpb.NodeID(k)]
+			mapSize := 1 + sovGossip(uint64(k)) + 1 + sovGossip(uint64(v))
 			i = encodeVarintGossip(data, i, uint64(mapSize))
 			data[i] = 0x8
 			i++
 			i = encodeVarintGossip(data, i, uint64(k))
-			data[i] = 0x12
+			data[i] = 0x10
 			i++
-			i = encodeVarintGossip(data, i, uint64(v.Size()))
-			n3, err := v.MarshalTo(data[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n3
+			i = encodeVarintGossip(data, i, uint64(v))
 		}
 	}
 	if len(m.Delta) > 0 {
+		keysForDelta := make([]string, 0, len(m.Delta))
 		for k := range m.Delta {
+			keysForDelta = append(keysForDelta, string(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Strings(keysForDelta)
+		for _, k := range keysForDelta {
 			data[i] = 0x22
 			i++
-			v := m.Delta[k]
+			v := m.Delta[string(k)]
 			if v == nil {
 				return 0, errors.New("proto: map has nil element")
 			}
@@ -368,11 +338,11 @@ func (m *Request) MarshalTo(data []byte) (int, error) {
 			data[i] = 0x12
 			i++
 			i = encodeVarintGossip(data, i, uint64(v.Size()))
-			n4, err := v.MarshalTo(data[i:])
+			n3, err := v.MarshalTo(data[i:])
 			if err != nil {
 				return 0, err
 			}
-			i += n4
+			i += n3
 		}
 	}
 	return i, nil
@@ -401,20 +371,20 @@ func (m *Response) MarshalTo(data []byte) (int, error) {
 	data[i] = 0x12
 	i++
 	i = encodeVarintGossip(data, i, uint64(m.Addr.Size()))
-	n5, err := m.Addr.MarshalTo(data[i:])
+	n4, err := m.Addr.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n5
+	i += n4
 	if m.AlternateAddr != nil {
 		data[i] = 0x1a
 		i++
 		i = encodeVarintGossip(data, i, uint64(m.AlternateAddr.Size()))
-		n6, err := m.AlternateAddr.MarshalTo(data[i:])
+		n5, err := m.AlternateAddr.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n6
+		i += n5
 	}
 	if m.AlternateNodeID != 0 {
 		data[i] = 0x20
@@ -422,10 +392,15 @@ func (m *Response) MarshalTo(data []byte) (int, error) {
 		i = encodeVarintGossip(data, i, uint64(m.AlternateNodeID))
 	}
 	if len(m.Delta) > 0 {
+		keysForDelta := make([]string, 0, len(m.Delta))
 		for k := range m.Delta {
+			keysForDelta = append(keysForDelta, string(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Strings(keysForDelta)
+		for _, k := range keysForDelta {
 			data[i] = 0x2a
 			i++
-			v := m.Delta[k]
+			v := m.Delta[string(k)]
 			if v == nil {
 				return 0, errors.New("proto: map has nil element")
 			}
@@ -439,35 +414,31 @@ func (m *Response) MarshalTo(data []byte) (int, error) {
 			data[i] = 0x12
 			i++
 			i = encodeVarintGossip(data, i, uint64(v.Size()))
-			n7, err := v.MarshalTo(data[i:])
+			n6, err := v.MarshalTo(data[i:])
 			if err != nil {
 				return 0, err
 			}
-			i += n7
+			i += n6
 		}
 	}
-	if len(m.Nodes) > 0 {
-		for k := range m.Nodes {
+	if len(m.HighWaterStamps) > 0 {
+		keysForHighWaterStamps := make([]int32, 0, len(m.HighWaterStamps))
+		for k := range m.HighWaterStamps {
+			keysForHighWaterStamps = append(keysForHighWaterStamps, int32(k))
+		}
+		github_com_gogo_protobuf_sortkeys.Int32s(keysForHighWaterStamps)
+		for _, k := range keysForHighWaterStamps {
 			data[i] = 0x32
 			i++
-			v := m.Nodes[k]
-			if v == nil {
-				return 0, errors.New("proto: map has nil element")
-			}
-			msgSize := v.Size()
-			mapSize := 1 + sovGossip(uint64(k)) + 1 + msgSize + sovGossip(uint64(msgSize))
+			v := m.HighWaterStamps[github_com_cockroachdb_cockroach_roachpb.NodeID(k)]
+			mapSize := 1 + sovGossip(uint64(k)) + 1 + sovGossip(uint64(v))
 			i = encodeVarintGossip(data, i, uint64(mapSize))
 			data[i] = 0x8
 			i++
 			i = encodeVarintGossip(data, i, uint64(k))
-			data[i] = 0x12
+			data[i] = 0x10
 			i++
-			i = encodeVarintGossip(data, i, uint64(v.Size()))
-			n8, err := v.MarshalTo(data[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n8
+			i = encodeVarintGossip(data, i, uint64(v))
 		}
 	}
 	return i, nil
@@ -491,11 +462,11 @@ func (m *Info) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintGossip(data, i, uint64(m.Value.Size()))
-	n9, err := m.Value.MarshalTo(data[i:])
+	n7, err := m.Value.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n9
+	i += n7
 	if m.OrigStamp != 0 {
 		data[i] = 0x10
 		i++
@@ -565,18 +536,6 @@ func (m *BootstrapInfo) Size() (n int) {
 	return n
 }
 
-func (m *Node) Size() (n int) {
-	var l int
-	_ = l
-	if m.HighWaterStamp != 0 {
-		n += 1 + sovGossip(uint64(m.HighWaterStamp))
-	}
-	if m.MinHops != 0 {
-		n += 1 + sovGossip(uint64(m.MinHops))
-	}
-	return n
-}
-
 func (m *Request) Size() (n int) {
 	var l int
 	_ = l
@@ -585,15 +544,11 @@ func (m *Request) Size() (n int) {
 	}
 	l = m.Addr.Size()
 	n += 1 + l + sovGossip(uint64(l))
-	if len(m.Nodes) > 0 {
-		for k, v := range m.Nodes {
+	if len(m.HighWaterStamps) > 0 {
+		for k, v := range m.HighWaterStamps {
 			_ = k
 			_ = v
-			l = 0
-			if v != nil {
-				l = v.Size()
-			}
-			mapEntrySize := 1 + sovGossip(uint64(k)) + 1 + l + sovGossip(uint64(l))
+			mapEntrySize := 1 + sovGossip(uint64(k)) + 1 + sovGossip(uint64(v))
 			n += mapEntrySize + 1 + sovGossip(uint64(mapEntrySize))
 		}
 	}
@@ -639,15 +594,11 @@ func (m *Response) Size() (n int) {
 			n += mapEntrySize + 1 + sovGossip(uint64(mapEntrySize))
 		}
 	}
-	if len(m.Nodes) > 0 {
-		for k, v := range m.Nodes {
+	if len(m.HighWaterStamps) > 0 {
+		for k, v := range m.HighWaterStamps {
 			_ = k
 			_ = v
-			l = 0
-			if v != nil {
-				l = v.Size()
-			}
-			mapEntrySize := 1 + sovGossip(uint64(k)) + 1 + l + sovGossip(uint64(l))
+			mapEntrySize := 1 + sovGossip(uint64(k)) + 1 + sovGossip(uint64(v))
 			n += mapEntrySize + 1 + sovGossip(uint64(mapEntrySize))
 		}
 	}
@@ -801,94 +752,6 @@ func (m *BootstrapInfo) Unmarshal(data []byte) error {
 	}
 	return nil
 }
-func (m *Node) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowGossip
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: Node: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: Node: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field HighWaterStamp", wireType)
-			}
-			m.HighWaterStamp = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowGossip
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.HighWaterStamp |= (int64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field MinHops", wireType)
-			}
-			m.MinHops = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowGossip
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.MinHops |= (uint32(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		default:
-			iNdEx = preIndex
-			skippy, err := skipGossip(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthGossip
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
 func (m *Request) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
@@ -969,7 +832,7 @@ func (m *Request) Unmarshal(data []byte) error {
 			iNdEx = postIndex
 		case 3:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Nodes", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field HighWaterStamps", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -1038,7 +901,7 @@ func (m *Request) Unmarshal(data []byte) error {
 					break
 				}
 			}
-			var mapmsglen int
+			var mapvalue int64
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowGossip
@@ -1048,30 +911,15 @@ func (m *Request) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				mapmsglen |= (int(b) & 0x7F) << shift
+				mapvalue |= (int64(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
-			if mapmsglen < 0 {
-				return ErrInvalidLengthGossip
+			if m.HighWaterStamps == nil {
+				m.HighWaterStamps = make(map[github_com_cockroachdb_cockroach_roachpb.NodeID]int64)
 			}
-			postmsgIndex := iNdEx + mapmsglen
-			if mapmsglen < 0 {
-				return ErrInvalidLengthGossip
-			}
-			if postmsgIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			mapvalue := &Node{}
-			if err := mapvalue.Unmarshal(data[iNdEx:postmsgIndex]); err != nil {
-				return err
-			}
-			iNdEx = postmsgIndex
-			if m.Nodes == nil {
-				m.Nodes = make(map[int32]*Node)
-			}
-			m.Nodes[mapkey] = mapvalue
+			m.HighWaterStamps[github_com_cockroachdb_cockroach_roachpb.NodeID(mapkey)] = mapvalue
 			iNdEx = postIndex
 		case 4:
 			if wireType != 2 {
@@ -1458,7 +1306,7 @@ func (m *Response) Unmarshal(data []byte) error {
 			iNdEx = postIndex
 		case 6:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Nodes", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field HighWaterStamps", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -1527,7 +1375,7 @@ func (m *Response) Unmarshal(data []byte) error {
 					break
 				}
 			}
-			var mapmsglen int
+			var mapvalue int64
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowGossip
@@ -1537,30 +1385,15 @@ func (m *Response) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				mapmsglen |= (int(b) & 0x7F) << shift
+				mapvalue |= (int64(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
-			if mapmsglen < 0 {
-				return ErrInvalidLengthGossip
+			if m.HighWaterStamps == nil {
+				m.HighWaterStamps = make(map[github_com_cockroachdb_cockroach_roachpb.NodeID]int64)
 			}
-			postmsgIndex := iNdEx + mapmsglen
-			if mapmsglen < 0 {
-				return ErrInvalidLengthGossip
-			}
-			if postmsgIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			mapvalue := &Node{}
-			if err := mapvalue.Unmarshal(data[iNdEx:postmsgIndex]); err != nil {
-				return err
-			}
-			iNdEx = postmsgIndex
-			if m.Nodes == nil {
-				m.Nodes = make(map[int32]*Node)
-			}
-			m.Nodes[mapkey] = mapvalue
+			m.HighWaterStamps[github_com_cockroachdb_cockroach_roachpb.NodeID(mapkey)] = mapvalue
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
@@ -1862,3 +1695,51 @@ var (
 	ErrInvalidLengthGossip = fmt.Errorf("proto: negative length found during unmarshaling")
 	ErrIntOverflowGossip   = fmt.Errorf("proto: integer overflow")
 )
+
+var fileDescriptorGossip = []byte{
+	// 693 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xcc, 0x55, 0x4f, 0x4f, 0xd4, 0x4e,
+	0x18, 0xde, 0xd2, 0x6e, 0x61, 0x87, 0x1f, 0x3f, 0x60, 0x42, 0xcc, 0xba, 0x81, 0x65, 0xb3, 0xc1,
+	0x04, 0x13, 0xd3, 0x1a, 0x34, 0x91, 0x60, 0x4c, 0xa4, 0x01, 0x75, 0x13, 0xa3, 0xa4, 0x22, 0x1a,
+	0x2f, 0x9b, 0x59, 0x3a, 0xb6, 0x0d, 0xdd, 0x4e, 0x6d, 0x67, 0x31, 0x5c, 0xf5, 0x0b, 0x98, 0xa8,
+	0x1f, 0xc8, 0x1b, 0xf1, 0xe4, 0xd1, 0x13, 0x2a, 0x7e, 0x0b, 0x4f, 0xce, 0x9f, 0x76, 0x5b, 0xdc,
+	0xc5, 0x20, 0x59, 0x13, 0x0f, 0x85, 0x99, 0x79, 0x9f, 0xe7, 0x99, 0xf7, 0x7d, 0xe7, 0x99, 0x59,
+	0xb0, 0xb0, 0x4b, 0x76, 0xf7, 0x62, 0x82, 0x76, 0x3d, 0xd3, 0x25, 0x49, 0xe2, 0x47, 0xe9, 0x3f,
+	0x23, 0x8a, 0x09, 0x25, 0x70, 0xa6, 0x1f, 0x36, 0xe4, 0x7a, 0x6d, 0x3e, 0x27, 0x88, 0xbf, 0x51,
+	0xc7, 0x74, 0x10, 0x45, 0x12, 0x5f, 0x6b, 0x0c, 0x46, 0xbb, 0x98, 0xa2, 0x02, 0x62, 0x29, 0x47,
+	0xf4, 0xa8, 0x1f, 0x98, 0xbd, 0x30, 0xc6, 0x09, 0x09, 0xf6, 0xb1, 0xd3, 0x46, 0x8e, 0x13, 0xa7,
+	0xa8, 0x39, 0x97, 0xb8, 0x44, 0x0c, 0x4d, 0x3e, 0x92, 0xab, 0xcd, 0xf7, 0x0a, 0x98, 0xb2, 0x08,
+	0xa1, 0x09, 0x8d, 0x51, 0xd4, 0x0a, 0x9f, 0x13, 0x68, 0x81, 0x0a, 0x67, 0xe1, 0x24, 0xc1, 0x49,
+	0x55, 0x69, 0xa8, 0xcb, 0x93, 0x2b, 0x75, 0x23, 0xcf, 0x99, 0xef, 0x60, 0x3c, 0xee, 0xef, 0xb0,
+	0xce, 0xa0, 0x96, 0x76, 0x78, 0xb4, 0x58, 0xb2, 0x73, 0x1a, 0xbc, 0x0d, 0x2a, 0xd4, 0xef, 0xe2,
+	0x84, 0xa2, 0x6e, 0x54, 0x1d, 0x6b, 0x28, 0x4c, 0x63, 0xbe, 0xa0, 0x91, 0xd6, 0x61, 0x6c, 0x67,
+	0x98, 0x4c, 0xa1, 0x4f, 0x6a, 0xbe, 0xd6, 0xc0, 0xb8, 0x8d, 0x5f, 0xf4, 0xd8, 0x14, 0xee, 0x80,
+	0xf1, 0x90, 0x38, 0xb8, 0xed, 0x3b, 0x2c, 0x1f, 0x65, 0xb9, 0x6c, 0xdd, 0x3a, 0x3e, 0x5a, 0xd4,
+	0x1f, 0xb0, 0xa5, 0xd6, 0xc6, 0x8f, 0xa3, 0x45, 0xd3, 0xf5, 0xa9, 0xd7, 0xeb, 0x30, 0xfd, 0xae,
+	0xd9, 0xdf, 0xc3, 0xe9, 0x98, 0x03, 0x7d, 0x33, 0x24, 0xc5, 0xd6, 0xb9, 0x5a, 0xcb, 0x81, 0xab,
+	0x40, 0xe3, 0x29, 0xa7, 0x09, 0x9e, 0xad, 0x48, 0xc1, 0x80, 0x6f, 0x15, 0x30, 0xeb, 0xf9, 0xae,
+	0xd7, 0x7e, 0x89, 0x28, 0x8e, 0xdb, 0x22, 0xe5, 0xa4, 0xaa, 0x8a, 0x66, 0x19, 0xc6, 0xaf, 0x07,
+	0x6c, 0xa4, 0x85, 0x18, 0xf7, 0x18, 0xe5, 0x09, 0x67, 0x3c, 0x12, 0x84, 0xcd, 0x90, 0xc6, 0x07,
+	0xd6, 0x0d, 0xae, 0xfb, 0xea, 0xcb, 0x9f, 0x97, 0x31, 0xed, 0x9d, 0x94, 0x83, 0x6b, 0xa0, 0xec,
+	0xe0, 0x80, 0xa2, 0xaa, 0x26, 0x12, 0x59, 0x3a, 0x3d, 0x91, 0x0d, 0x0e, 0x13, 0xdb, 0xdb, 0x92,
+	0x52, 0xb3, 0xc0, 0xdc, 0xb0, 0xec, 0xe0, 0x0c, 0x50, 0xf7, 0xf0, 0x81, 0xec, 0xbb, 0xcd, 0x87,
+	0x70, 0x0e, 0x94, 0xf7, 0x51, 0xd0, 0xc3, 0xa2, 0x6d, 0xaa, 0x2d, 0x27, 0x6b, 0x63, 0xab, 0x4a,
+	0x6d, 0x0b, 0x80, 0x5c, 0xb8, 0xc8, 0xac, 0x48, 0xe6, 0x95, 0x22, 0x73, 0x72, 0xe5, 0xc2, 0x60,
+	0x7e, 0xdc, 0x80, 0x05, 0xc5, 0xe6, 0x87, 0x32, 0x98, 0xb0, 0x71, 0x12, 0x91, 0x30, 0xc1, 0xff,
+	0xa0, 0x0d, 0x36, 0xc1, 0xff, 0x28, 0x60, 0x0d, 0x0b, 0x59, 0xd7, 0xc4, 0x55, 0x63, 0x16, 0x38,
+	0x83, 0x86, 0x3d, 0xd5, 0x67, 0xf1, 0x29, 0x8c, 0xc1, 0x6c, 0x2e, 0x93, 0x95, 0xa8, 0x89, 0x12,
+	0xef, 0xb0, 0x12, 0xa7, 0xd7, 0xb3, 0xe0, 0xf9, 0x6b, 0x9d, 0x46, 0x27, 0x34, 0x1c, 0x78, 0x33,
+	0xf3, 0x4a, 0x59, 0x78, 0xe5, 0xd2, 0x30, 0xaf, 0xc8, 0xbe, 0x0f, 0x9a, 0x05, 0xbe, 0x1b, 0x6a,
+	0x7f, 0x5d, 0x28, 0x99, 0xbf, 0x51, 0xfa, 0xbb, 0xfe, 0x1f, 0xbd, 0xff, 0x46, 0x71, 0x2b, 0x9a,
+	0x1f, 0xc7, 0x80, 0x26, 0x1e, 0xd6, 0xeb, 0x19, 0x44, 0x11, 0xdb, 0x57, 0x87, 0x3c, 0x88, 0x3b,
+	0x3c, 0x9e, 0x5a, 0x4c, 0x82, 0xe1, 0x02, 0x00, 0x24, 0xf6, 0xdd, 0x76, 0xfe, 0x96, 0xaa, 0x76,
+	0x85, 0xaf, 0x88, 0x7c, 0xe0, 0x65, 0xf6, 0xd2, 0xd2, 0x20, 0x8d, 0x72, 0xf7, 0xa9, 0xd6, 0x7f,
+	0xcc, 0x33, 0x13, 0xdb, 0xdb, 0xf7, 0x05, 0xc0, 0x9e, 0x60, 0x61, 0x09, 0x85, 0x40, 0xf3, 0x08,
+	0x3b, 0x27, 0xee, 0xac, 0x29, 0x5b, 0x8c, 0x8b, 0x77, 0xaa, 0x3c, 0xca, 0x3b, 0xc5, 0x74, 0x23,
+	0xcc, 0xac, 0xc1, 0x74, 0xf5, 0x5c, 0x77, 0x8b, 0x2d, 0x9d, 0x53, 0x97, 0xab, 0xb5, 0x9c, 0x95,
+	0x87, 0x40, 0xbf, 0x2b, 0x8e, 0x8a, 0xdd, 0xbd, 0x6c, 0x74, 0xf1, 0xd4, 0x77, 0xae, 0x56, 0x3b,
+	0xdd, 0x8c, 0xcd, 0xd2, 0xb2, 0x72, 0x55, 0xb1, 0x1a, 0x87, 0xdf, 0xea, 0xa5, 0xc3, 0xe3, 0xba,
+	0xf2, 0x89, 0x7d, 0x9f, 0xd9, 0xf7, 0x95, 0x7d, 0x6f, 0xbe, 0xd7, 0x4b, 0xcf, 0x74, 0x49, 0x78,
+	0xaa, 0x76, 0x74, 0xf1, 0x53, 0x79, 0xed, 0x67, 0x00, 0x00, 0x00, 0xff, 0xff, 0xf1, 0xcd, 0x76,
+	0xa8, 0xd9, 0x07, 0x00, 0x00,
+}

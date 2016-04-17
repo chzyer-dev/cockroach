@@ -14,8 +14,6 @@
 //
 // Author: Marc Berhault (marc@cockroachlabs.com)
 
-// +build acceptance
-
 package acceptance
 
 import (
@@ -41,7 +39,7 @@ func countRangeReplicas(db *client.DB) (int, error) {
 
 func checkRangeReplication(t *testing.T, c cluster.Cluster, d time.Duration) {
 	// Always talk to node 0.
-	client, dbStopper := makeClient(t, c.ConnString(0))
+	client, dbStopper := c.NewClient(t, 0)
 	defer dbStopper.Stop()
 
 	wantedReplicas := 3
@@ -51,7 +49,7 @@ func checkRangeReplication(t *testing.T, c cluster.Cluster, d time.Duration) {
 
 	log.Infof("waiting for first range to have %d replicas", wantedReplicas)
 
-	util.SucceedsWithin(t, d, func() error {
+	util.SucceedsSoon(t, func() error {
 		select {
 		case <-stopper:
 			t.Fatalf("interrupted")
@@ -72,4 +70,6 @@ func checkRangeReplication(t *testing.T, c cluster.Cluster, d time.Duration) {
 		}
 		return fmt.Errorf("expected %d replicas, only found %d", wantedReplicas, foundReplicas)
 	})
+
+	log.Infof("found %d replicas", wantedReplicas)
 }

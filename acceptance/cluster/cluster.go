@@ -17,8 +17,11 @@
 package cluster
 
 import (
-	"net"
 	"testing"
+
+	"github.com/cockroachdb/cockroach/client"
+	"github.com/cockroachdb/cockroach/keys"
+	"github.com/cockroachdb/cockroach/util/stop"
 )
 
 // A Cluster is an abstraction away from a concrete cluster deployment (i.e.
@@ -27,12 +30,10 @@ import (
 type Cluster interface {
 	// NumNodes returns the number of nodes in the cluster, running or not.
 	NumNodes() int
-	// ConnString returns a connection string for the given node.
-	ConnString(int) string
+	// NewClient returns a kv client for the given node.
+	NewClient(*testing.T, int) (*client.DB, *stop.Stopper)
 	// PGUrl returns a URL string for the given node postgres server.
 	PGUrl(int) string
-	// PGAddr returns the Postgres address for the given node.
-	PGAddr(i int) *net.TCPAddr
 	// Assert verifies that the cluster state is as expected (i.e. no unexpected
 	// restarts or node deaths occurred). Tests can call this periodically to
 	// ascertain cluster health.
@@ -49,4 +50,22 @@ type Cluster interface {
 	Restart(int) error
 	// URL returns the HTTP(s) endpoint.
 	URL(int) string
+	// Addr returns the host and port from the node in the format HOST:PORT.
+	Addr(int) string
+}
+
+// Consistent performs a replication consistency check on all the ranges
+// in the cluster. It depends on a majority of the nodes being up.
+func Consistent(t *testing.T, c Cluster) {
+	if c.NumNodes() <= 0 {
+		return
+	}
+	// Always connect to the first node in the cluster.
+	kvClient, kvStopper := c.NewClient(t, 0)
+	defer kvStopper.Stop()
+	// Set withDiff to false because any failure results in a second consistency check
+	// being called with withDiff=true.
+	if pErr := kvClient.CheckConsistency(keys.LocalMax, keys.MaxKey, false /* withDiff*/); pErr != nil {
+		t.Fatal(pErr)
+	}
 }

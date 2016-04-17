@@ -43,10 +43,13 @@ func runGetUser(cmd *cobra.Command, args []string) {
 		mustUsage(cmd)
 		return
 	}
-	db, _ := makeSQLClient()
-	defer func() { _ = db.Close() }()
-	err := runPrettyQuery(db, os.Stdout,
-		`SELECT * FROM system.users WHERE username=$1`, args[0])
+	conn, err := makeSQLClient()
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	err = runPrettyQuery(conn, os.Stdout,
+		makeQuery(`SELECT * FROM system.users WHERE username=$1`, args[0]))
 	if err != nil {
 		panic(err)
 	}
@@ -68,9 +71,13 @@ func runLsUsers(cmd *cobra.Command, args []string) {
 		mustUsage(cmd)
 		return
 	}
-	db, _ := makeSQLClient()
-	defer func() { _ = db.Close() }()
-	err := runPrettyQuery(db, os.Stdout, `SELECT username FROM system.users`)
+	conn, err := makeSQLClient()
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	err = runPrettyQuery(conn, os.Stdout,
+		makeQuery(`SELECT username FROM system.users`))
 	if err != nil {
 		panic(err)
 	}
@@ -92,10 +99,13 @@ func runRmUser(cmd *cobra.Command, args []string) {
 		mustUsage(cmd)
 		return
 	}
-	db, _ := makeSQLClient()
-	defer func() { _ = db.Close() }()
-	err := runPrettyQuery(db, os.Stdout,
-		`DELETE FROM system.users WHERE username=$1`, args[0])
+	conn, err := makeSQLClient()
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	err = runPrettyQuery(conn, os.Stdout,
+		makeQuery(`DELETE FROM system.users WHERE username=$1`, args[0]))
 	if err != nil {
 		panic(err)
 	}
@@ -160,11 +170,14 @@ func runSetUser(cmd *cobra.Command, args []string) {
 			panic(err)
 		}
 	}
-	db, _ := makeSQLClient()
-	defer func() { _ = db.Close() }()
+	conn, err := makeSQLClient()
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
 	// TODO(marc): switch to UPSERT.
-	err = runPrettyQuery(db, os.Stdout,
-		`INSERT INTO system.users VALUES ($1, $2)`, args[0], hashed)
+	err = runPrettyQuery(conn, os.Stdout,
+		makeQuery(`INSERT INTO system.users VALUES ($1, $2)`, args[0], hashed))
 	if err != nil {
 		panic(err)
 	}

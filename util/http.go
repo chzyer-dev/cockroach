@@ -27,8 +27,9 @@ import (
 	"strings"
 
 	"github.com/gogo/protobuf/proto"
-
 	"gopkg.in/yaml.v1"
+
+	"github.com/cockroachdb/cockroach/util/protoutil"
 )
 
 const (
@@ -217,7 +218,7 @@ func MarshalResponse(r *http.Request, value interface{}, allowed []EncodingType)
 	if protoIdx < jsonIdx && protoIdx < yamlIdx {
 		// Protobuf-encode the config.
 		contentType = ProtoContentType
-		if body, err = proto.Marshal(value.(proto.Message)); err != nil {
+		if body, err = protoutil.Marshal(value.(proto.Message)); err != nil {
 			err = Errorf("unable to marshal %+v to protobuf: %s", value, err)
 		}
 	} else if yamlIdx < jsonIdx && yamlIdx < protoIdx {
@@ -244,6 +245,8 @@ func MarshalResponse(r *http.Request, value interface{}, allowed []EncodingType)
 
 // GetJSON uses the supplied client to retrieve the URL specified by the parameters and
 // unmarshals the result into the supplied interface.
+//
+// TODO(cdo): Refactor the *JSON methods to handle more encodings.
 func GetJSON(httpClient *http.Client, scheme, hostport, path string, v interface{}) error {
 	url := fmt.Sprintf("%s://%s%s", scheme, hostport, path)
 	resp, err := httpClient.Get(url)
@@ -254,6 +257,29 @@ func GetJSON(httpClient *http.Client, scheme, hostport, path string, v interface
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return Errorf("status: %s, error: %s", resp.Status, b)
+	}
+	return json.Unmarshal(b, v)
+}
+
+// PostJSON uses the supplied client to perform a POST to the URL specified
+// by the parameters and unmarshals the result into the supplied interface.
+// This function assumes that the body is also JSON.
+func PostJSON(httpClient *http.Client, scheme, hostport, path, body string, v interface{}) error {
+	url := fmt.Sprintf("%s://%s%s", scheme, hostport, path)
+	resp, err := httpClient.Post(url, JSONContentType, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return Errorf("status: %s, error: %s", resp.Status, b)
 	}
 	return json.Unmarshal(b, v)
 }

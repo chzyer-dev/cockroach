@@ -32,7 +32,7 @@ $viz-sides = 62px
   flex-direction column
   justify-content space-between
   align-items stretch
-  width 323px
+  width 316px
   height 289px
   position relative
 
@@ -48,6 +48,9 @@ $viz-sides = 62px
   float right
   margin 10px 15px 0 0
   color $secondary-gray-5
+  
+  .icon-warning
+    color $secondary-gold
 
 .viz-bottom
   height $viz-bottom
@@ -55,7 +58,8 @@ $viz-sides = 62px
   .viz-title
     width 100%
     text-align center
-    font-family Lato-Bold
+    font-family Lato-Heavy
+    font-size 11px
     text-transform uppercase
     letter-spacing 2px
     color $secondary-light-gray
@@ -79,6 +83,18 @@ $viz-sides = 62px
   opacity .6
   font-size 10px
 
-.half
+.small
   .visualization-wrapper
-    height 145px
+    width 253px
+    height 250px
+  &.half
+    .visualization-wrapper
+      height 180px
+      .linegraph
+        height 105px
+
+.viz-faded
+  .visualization .number
+  .nv-group
+  .nv-areaWrap
+    opacity .2

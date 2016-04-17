@@ -16,6 +16,9 @@ two four
 statement ok
 CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
 
+query error syntax error at or near \"FROM\"
+SELECT FROM abc
+
 query error argument of WHERE must be type bool, not type string
 SELECT * FROM abc WHERE 'hello'
 
@@ -162,11 +165,23 @@ CREATE TABLE xyzw (
 statement ok
 INSERT INTO xyzw VALUES (4, 5, 6, 7), (1, 2, 3, 4);
 
-query error argument of LIMIT must not contain variables
-SELECT * FROM xyzw LIMIT a
+query error qualified name \"x\" not found
+SELECT * FROM xyzw LIMIT x
 
-query error argument of OFFSET must not contain variables
-SELECT * FROM xyzw OFFSET a
+query error qualified name \"y\" not found
+SELECT * FROM xyzw OFFSET 1 + y
+
+query error argument of LIMIT must be type int, not type string
+SELECT * FROM xyzw LIMIT '1'
+
+query error argument of OFFSET must be type int, not type float
+SELECT * FROM xyzw OFFSET 1.5
+
+query error negative value for LIMIT
+SELECT * FROM xyzw LIMIT -100
+
+query error negative value for OFFSET
+SELECT * FROM xyzw OFFSET -100
 
 query error unsupported binary operator: <int> \+ <float>
 SELECT * FROM xyzw OFFSET 1 + 0.0
@@ -193,8 +208,11 @@ query IIII
 SELECT * FROM xyzw LIMIT (RANDOM() * 0.0)::int OFFSET (RANDOM() * 0.0)::int
 ----
 
+query error multiple LIMIT clauses not allowed
+((SELECT a FROM t LIMIT 1)) LIMIT 1
+
 query II
-SELECT * FROM xyzw@foo
+SELECT z, y FROM xyzw@foo
 ----
 3 2
 6 5
@@ -205,7 +223,7 @@ SELECT z FROM test.xyzw@foo WHERE y = 5
 6
 
 query I
-SELECT foo.y FROM test.xyzw@foo WHERE z = 3
+SELECT xyzw.y FROM test.xyzw@foo WHERE z = 3
 ----
 2
 
@@ -215,8 +233,10 @@ SELECT z FROM test.unknown@foo WHERE y = 5
 query error index "unknown" not found
 SELECT z FROM test.xyzw@unknown WHERE y = 5
 
-query error qualified name "foo.w" not found
+query I
 SELECT w FROM test.xyzw@foo WHERE y = 5
+----
+7
 
 statement ok
 CREATE TABLE boolean_table (

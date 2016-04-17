@@ -7,7 +7,16 @@ CREATE TABLE kv (
 )
 
 statement ok
+CREATE TABLE unindexed (
+  k INT PRIMARY KEY,
+  v INT
+)
+
+statement ok
 INSERT INTO kv VALUES (1, 2), (3, 4), (5, 6), (7, 8)
+
+statement ok
+INSERT INTO unindexed VALUES (1, 2), (3, 4), (5, 6), (7, 8)
 
 query II
 SELECT * FROM kv
@@ -26,8 +35,11 @@ SELECT * FROM kv
 1 2
 7 8
 
-statement ok
-DELETE FROM kv
+query II
+DELETE FROM kv RETURNING k, v
+----
+1 2
+7 8
 
 query II
 SELECT * FROM kv
@@ -45,5 +57,67 @@ query TTTT
 EXPLAIN (DEBUG) SELECT * FROM kv@bar
 ----
 
-statement error qualified name "kv.nonexistent" not found
+statement error qualified name "nonexistent" not found
 DELETE FROM kv WHERE nonexistent = 1
+
+statement ok
+DELETE FROM unindexed WHERE k=3 OR v=6
+
+query II
+SELECT * FROM unindexed
+----
+1 2
+7 8
+
+query II
+DELETE FROM unindexed RETURNING k, v
+----
+1 2
+7 8
+
+query II
+SELECT * FROM unindexed
+----
+
+statement ok
+INSERT INTO unindexed VALUES (1, 2), (3, 4), (5, 6), (7, 8)
+
+query II colnames
+DELETE FROM unindexed WHERE k=3 or v=6 RETURNING *
+----
+k v
+3 4
+5 6
+
+query II colnames
+DELETE FROM unindexed RETURNING unindexed.*
+----
+k v
+1 2
+7 8
+
+statement ok
+INSERT INTO unindexed VALUES (1, 2), (3, 4), (5, 6), (7, 8)
+
+query II colnames
+SELECT k, v FROM unindexed
+----
+k v
+1 2
+3 4
+5 6
+7 8
+
+statement ok
+DELETE FROM unindexed
+
+query II colnames
+SELECT k, v FROM unindexed
+----
+k v
+
+statement ok
+CREATE TABLE indexed (id int primary key, value int, other int, index (value));
+
+statement ok
+DELETE FROM indexed WHERE value = 5;

@@ -60,12 +60,20 @@ const (
 type Parser struct {
 	scanner          scanner
 	parserImpl       sqlParserImpl
-	argVisitor       argVisitor
 	normalizeVisitor normalizeVisitor
 }
 
 // Parse parses the sql and returns a list of statements.
-func (p *Parser) Parse(sql string, syntax Syntax) (StatementList, error) {
+func (p *Parser) Parse(sql string, syntax Syntax) (stmts StatementList, err error) {
+	defer func() {
+		switch r := recover(); r {
+		case nil:
+		case errUnimplemented:
+			err = errUnimplemented
+		default:
+			panic(r)
+		}
+	}()
 	p.scanner.init(sql, syntax)
 	if p.parserImpl.Parse(&p.scanner) != 0 {
 		return nil, errors.New(p.scanner.lastError)
@@ -73,31 +81,12 @@ func (p *Parser) Parse(sql string, syntax Syntax) (StatementList, error) {
 	return p.scanner.stmts, nil
 }
 
-// FillArgs replaces any placeholder nodes in the expression with arguments
-// supplied with the query.
-func (p *Parser) FillArgs(stmt Statement, args Args) error {
-	p.argVisitor = argVisitor{args: args}
-	WalkStmt(&p.argVisitor, stmt)
-	return p.argVisitor.err
-}
-
 // NormalizeExpr is wrapper around ctx.NormalizeExpr which avoids allocation of
 // a normalizeVisitor.
 func (p *Parser) NormalizeExpr(ctx EvalContext, expr Expr) (Expr, error) {
 	p.normalizeVisitor = normalizeVisitor{ctx: ctx}
-	expr = WalkExpr(&p.normalizeVisitor, expr)
+	expr, _ = WalkExpr(&p.normalizeVisitor, expr)
 	return expr, p.normalizeVisitor.err
-}
-
-// TypeCheckAndNormalizeExpr is a combination of TypeCheck() and
-// NormalizeExpr(). It returns an error if either of TypeCheck() or
-// NormalizeExpr() return one, and otherwise returns the Expr returned by
-// NormalizeExpr().
-func (p *Parser) TypeCheckAndNormalizeExpr(ctx EvalContext, expr Expr) (Expr, error) {
-	if _, err := expr.TypeCheck(ctx.Args); err != nil {
-		return nil, err
-	}
-	return p.NormalizeExpr(ctx, expr)
 }
 
 // parse parses the sql and returns a list of statements.
@@ -111,8 +100,8 @@ func parseTraditional(sql string) (StatementList, error) {
 	return parse(sql, Traditional)
 }
 
-// parseOne parses a sql statement.
-func parseOne(sql string, syntax Syntax) (Statement, error) {
+// ParseOne parses a sql statement.
+func ParseOne(sql string, syntax Syntax) (Statement, error) {
 	stmts, err := parse(sql, syntax)
 	if err != nil {
 		return nil, err
@@ -123,14 +112,14 @@ func parseOne(sql string, syntax Syntax) (Statement, error) {
 	return stmts[0], nil
 }
 
-// ParseOneTraditional is short-hand for parseOne(sql, Traditional)
+// ParseOneTraditional is short-hand for ParseOne(sql, Traditional)
 func ParseOneTraditional(sql string) (Statement, error) {
-	return parseOne(sql, Traditional)
+	return ParseOne(sql, Traditional)
 }
 
 // parseExpr parses a sql expression.
 func parseExpr(expr string, syntax Syntax) (Expr, error) {
-	stmt, err := parseOne(`SELECT `+expr, syntax)
+	stmt, err := ParseOne(`SELECT `+expr, syntax)
 	if err != nil {
 		return nil, err
 	}
@@ -138,10 +127,14 @@ func parseExpr(expr string, syntax Syntax) (Expr, error) {
 	if !ok {
 		return nil, util.Errorf("expected a SELECT statement, but found %T", stmt)
 	}
-	if n := len(sel.Exprs); n != 1 {
+	selClause, ok := sel.Select.(*SelectClause)
+	if !ok {
+		return nil, util.Errorf("expected a SELECT statement, but found %T", sel.Select)
+	}
+	if n := len(selClause.Exprs); n != 1 {
 		return nil, util.Errorf("expected 1 expression, but found %d", n)
 	}
-	return sel.Exprs[0].Expr, nil
+	return selClause.Exprs[0].Expr, nil
 }
 
 // ParseExprTraditional is a short-hand for parseExpr(sql, Traditional)

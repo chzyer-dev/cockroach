@@ -18,43 +18,55 @@ package util
 
 import (
 	"crypto/tls"
-	"log"
+	"io"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
+
+	"google.golang.org/grpc"
 
 	"golang.org/x/net/http2"
 
+	"github.com/cockroachdb/cmux"
+	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
-// Listen delegates to `net.Listen` and, if tlsConfig is not nil, to `tls.NewListener`.
-// The returned listener's Addr() method will return an address with the hostname unresovled,
-// which means it can be used to initiate TLS connections.
-func Listen(addr net.Addr, tlsConfig *tls.Config) (net.Listener, error) {
+// ListenAndServeGRPC creates a listener and serves the specified grpc Server
+// on it, closing the listener when signalled by the stopper.
+func ListenAndServeGRPC(stopper *stop.Stopper, server *grpc.Server,
+	addr net.Addr) (net.Listener, error) {
 	ln, err := net.Listen(addr.Network(), addr.String())
-	if err == nil && tlsConfig != nil {
-		ln = tls.NewListener(ln, tlsConfig)
+	if err != nil {
+		return ln, err
 	}
 
-	return ln, err
+	stopper.RunWorker(func() {
+		<-stopper.ShouldDrain()
+		server.Stop()
+	})
+
+	stopper.RunWorker(func() {
+		FatalIfUnexpected(server.Serve(ln))
+	})
+	return ln, nil
 }
 
-// ListenAndServe creates a listener and serves handler on it, closing
-// the listener when signalled by the stopper.
-func ListenAndServe(stopper *stop.Stopper, handler http.Handler, addr net.Addr, tlsConfig *tls.Config) (net.Listener, error) {
-	ln, err := Listen(addr, tlsConfig)
-	if err != nil {
-		return nil, err
-	}
-
+// ServeHandler serves the handler on the listener and returns a function that
+// serves an additional listener using a function that takes a connection. The
+// returned function can be called multiple times.
+func ServeHandler(
+	stopper *stop.Stopper, handler http.Handler, ln net.Listener, tlsConfig *tls.Config,
+) func(net.Listener, func(net.Conn)) error {
 	var mu sync.Mutex
 	activeConns := make(map[net.Conn]struct{})
 
+	logger := log.NewStdLogger(log.ErrorLog)
 	httpServer := http.Server{
-		TLSConfig: tlsConfig,
 		Handler:   handler,
+		TLSConfig: tlsConfig,
 		ConnState: func(conn net.Conn, state http.ConnState) {
 			mu.Lock()
 			switch state {
@@ -65,18 +77,19 @@ func ListenAndServe(stopper *stop.Stopper, handler http.Handler, addr net.Addr, 
 			}
 			mu.Unlock()
 		},
+		ErrorLog: logger,
 	}
+
+	// net/http.(*Server).Serve/http2.ConfigureServer are not thread safe with
+	// respect to net/http.(*Server).TLSConfig, so we call it synchronously here.
 	if err := http2.ConfigureServer(&httpServer, nil); err != nil {
-		return nil, err
+		log.Fatal(err)
 	}
 
 	stopper.RunWorker(func() {
-		if err := httpServer.Serve(ln); err != nil && !IsClosedConnection(err) {
-			log.Fatal(err)
-		}
+		FatalIfUnexpected(httpServer.Serve(ln))
 
 		<-stopper.ShouldStop()
-
 		mu.Lock()
 		for conn := range activeConns {
 			conn.Close()
@@ -84,19 +97,51 @@ func ListenAndServe(stopper *stop.Stopper, handler http.Handler, addr net.Addr, 
 		mu.Unlock()
 	})
 
-	stopper.RunWorker(func() {
-		<-stopper.ShouldDrain()
-		// Some unit tests manually close `ln`, so it may already be closed
-		// when we get here.
-		if err := ln.Close(); err != nil && !IsClosedConnection(err) {
-			log.Fatal(err)
+	logFn := logger.Printf
+	return func(l net.Listener, serveConn func(net.Conn)) error {
+		// Inspired by net/http.(*Server).Serve
+		var tempDelay time.Duration // how long to sleep on accept failure
+		for {
+			rw, e := l.Accept()
+			if e != nil {
+				if ne, ok := e.(net.Error); ok && ne.Temporary() {
+					if tempDelay == 0 {
+						tempDelay = 5 * time.Millisecond
+					} else {
+						tempDelay *= 2
+					}
+					if max := 1 * time.Second; tempDelay > max {
+						tempDelay = max
+					}
+					logFn("http: Accept error: %v; retrying in %v", e, tempDelay)
+					time.Sleep(tempDelay)
+					continue
+				}
+				return e
+			}
+			tempDelay = 0
+			go func() {
+				httpServer.ConnState(rw, http.StateNew) // before Serve can return
+				serveConn(rw)
+				httpServer.ConnState(rw, http.StateClosed)
+			}()
 		}
-	})
-
-	return ln, nil
+	}
 }
 
-// IsClosedConnection returns true if err is the net package's errClosed.
+// IsClosedConnection returns true if err is cmux.ErrListenerClosed,
+// grpc.ErrServerStopped, io.EOF, or the net package's errClosed.
 func IsClosedConnection(err error) bool {
-	return strings.Contains(err.Error(), "use of closed network connection")
+	return err == cmux.ErrListenerClosed ||
+		err == grpc.ErrServerStopped ||
+		err == io.EOF ||
+		strings.Contains(err.Error(), "use of closed network connection")
+}
+
+// FatalIfUnexpected calls Log.Fatal(err) unless err is nil,
+// cmux.ErrListenerClosed, or the net package's errClosed.
+func FatalIfUnexpected(err error) {
+	if err != nil && !IsClosedConnection(err) {
+		log.Fatal(err)
+	}
 }

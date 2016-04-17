@@ -10,6 +10,7 @@
 		cockroach/roachpb/data.proto
 		cockroach/roachpb/errors.proto
 		cockroach/roachpb/internal.proto
+		cockroach/roachpb/internal_raft.proto
 		cockroach/roachpb/metadata.proto
 
 	It has these top-level messages:
@@ -30,6 +31,8 @@
 		ScanResponse
 		ReverseScanRequest
 		ReverseScanResponse
+		CheckConsistencyRequest
+		CheckConsistencyResponse
 		BeginTransactionRequest
 		BeginTransactionResponse
 		EndTransactionRequest
@@ -58,11 +61,16 @@
 		TruncateLogResponse
 		LeaderLeaseRequest
 		LeaderLeaseResponse
+		ComputeChecksumRequest
+		ComputeChecksumResponse
+		VerifyChecksumRequest
+		VerifyChecksumResponse
 		RequestUnion
 		ResponseUnion
 		Header
 		BatchRequest
 		BatchResponse
+		RaftCommand
 		Span
 		Timestamp
 		Value
@@ -73,12 +81,11 @@
 		ChangeReplicasTrigger
 		ModifiedSpanTrigger
 		InternalCommitTrigger
-		NodeList
 		TxnMeta
 		Transaction
 		Intent
 		Lease
-		SequenceCacheEntry
+		AbortCacheEntry
 		NotLeaderError
 		NodeUnavailableError
 		RangeNotFoundError
@@ -87,6 +94,7 @@
 		TransactionAbortedError
 		TransactionPushError
 		TransactionRetryError
+		TransactionReplayError
 		TransactionStatusError
 		WriteIntentError
 		WriteTooOldError
@@ -98,12 +106,11 @@
 		ReplicaCorruptionError
 		LeaseVersionChangedError
 		DidntUpdateDescriptorError
-		SqlTransactionAbortedError
 		ExistingSchemaChangeLeaseError
+		ErrorWithPGCode
 		ErrorDetail
 		ErrPosition
 		Error
-		RaftCommand
 		InternalTimeSeriesData
 		InternalTimeSeriesSample
 		RaftTruncatedState
@@ -112,8 +119,6 @@
 		Attributes
 		ReplicaDescriptor
 		RangeDescriptor
-		RangeTree
-		RangeTreeNode
 		StoreCapacity
 		NodeDescriptor
 		StoreDescriptor
@@ -123,8 +128,16 @@ package roachpb
 import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
+import cockroach_util_tracing "github.com/cockroachdb/cockroach/util/tracing"
 
 // skipping weak import gogoproto "github.com/cockroachdb/gogoproto"
+
+import github_com_cockroachdb_cockroach_util_uuid "github.com/cockroachdb/cockroach/util/uuid"
+
+import (
+	context "golang.org/x/net/context"
+	grpc "google.golang.org/grpc"
+)
 
 import io "io"
 
@@ -132,6 +145,10 @@ import io "io"
 var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+const _ = proto.GoGoProtoPackageIsVersion1
 
 // ReadConsistencyType specifies what type of consistency is observed
 // during read operations.
@@ -179,6 +196,7 @@ func (x *ReadConsistencyType) UnmarshalJSON(data []byte) error {
 	*x = ReadConsistencyType(value)
 	return nil
 }
+func (ReadConsistencyType) EnumDescriptor() ([]byte, []int) { return fileDescriptorApi, []int{0} }
 
 // TxnPushType determines what action to take when pushing a transaction.
 type PushTxnType int32
@@ -191,17 +209,22 @@ const (
 	// Abort the transaction if it's abandoned, but don't attempt to mutate it
 	// otherwise.
 	PUSH_TOUCH PushTxnType = 2
+	// Query and return the latest transaction record if available. If no record
+	// is persisted, returns a zero Pushee.
+	PUSH_QUERY PushTxnType = 3
 )
 
 var PushTxnType_name = map[int32]string{
 	0: "PUSH_TIMESTAMP",
 	1: "PUSH_ABORT",
 	2: "PUSH_TOUCH",
+	3: "PUSH_QUERY",
 }
 var PushTxnType_value = map[string]int32{
 	"PUSH_TIMESTAMP": 0,
 	"PUSH_ABORT":     1,
 	"PUSH_TOUCH":     2,
+	"PUSH_QUERY":     3,
 }
 
 func (x PushTxnType) Enum() *PushTxnType {
@@ -220,35 +243,30 @@ func (x *PushTxnType) UnmarshalJSON(data []byte) error {
 	*x = PushTxnType(value)
 	return nil
 }
+func (PushTxnType) EnumDescriptor() ([]byte, []int) { return fileDescriptorApi, []int{1} }
 
 // ResponseHeader is returned with every storage node response.
 type ResponseHeader struct {
-	// timestamp specifies time at which read or write actually was
-	// performed. In the case of both reads and writes, if the timestamp
-	// supplied to the request was 0, the wall time of the node
-	// servicing the request will be set here. Additionally, in the case
-	// of writes, this value may be increased from the timestamp passed
-	// with the Span if the key being written was either read
-	// or written more recently.
-	Timestamp Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
 	// txn is non-nil if the request specified a non-nil transaction.
 	// The transaction timestamp and/or priority may have been updated,
 	// depending on the outcome of the request.
 	Txn *Transaction `protobuf:"bytes,3,opt,name=txn" json:"txn,omitempty"`
 }
 
-func (m *ResponseHeader) Reset()         { *m = ResponseHeader{} }
-func (m *ResponseHeader) String() string { return proto.CompactTextString(m) }
-func (*ResponseHeader) ProtoMessage()    {}
+func (m *ResponseHeader) Reset()                    { *m = ResponseHeader{} }
+func (m *ResponseHeader) String() string            { return proto.CompactTextString(m) }
+func (*ResponseHeader) ProtoMessage()               {}
+func (*ResponseHeader) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{0} }
 
 // A GetRequest is the argument for the Get() method.
 type GetRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *GetRequest) Reset()         { *m = GetRequest{} }
-func (m *GetRequest) String() string { return proto.CompactTextString(m) }
-func (*GetRequest) ProtoMessage()    {}
+func (m *GetRequest) Reset()                    { *m = GetRequest{} }
+func (m *GetRequest) String() string            { return proto.CompactTextString(m) }
+func (*GetRequest) ProtoMessage()               {}
+func (*GetRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{1} }
 
 // A GetResponse is the return value from the Get() method.
 // If the key doesn't exist, returns nil for Value.Bytes.
@@ -257,28 +275,35 @@ type GetResponse struct {
 	Value          *Value `protobuf:"bytes,2,opt,name=value" json:"value,omitempty"`
 }
 
-func (m *GetResponse) Reset()         { *m = GetResponse{} }
-func (m *GetResponse) String() string { return proto.CompactTextString(m) }
-func (*GetResponse) ProtoMessage()    {}
+func (m *GetResponse) Reset()                    { *m = GetResponse{} }
+func (m *GetResponse) String() string            { return proto.CompactTextString(m) }
+func (*GetResponse) ProtoMessage()               {}
+func (*GetResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{2} }
 
 // A PutRequest is the argument to the Put() method.
 type PutRequest struct {
 	Span  `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	Value Value `protobuf:"bytes,2,opt,name=value" json:"value"`
+	// Specify as true to put the value without a corresponding
+	// timestamp. This option should be used with care as it precludes
+	// the use of this value with transactions.
+	Inline bool `protobuf:"varint,3,opt,name=inline" json:"inline"`
 }
 
-func (m *PutRequest) Reset()         { *m = PutRequest{} }
-func (m *PutRequest) String() string { return proto.CompactTextString(m) }
-func (*PutRequest) ProtoMessage()    {}
+func (m *PutRequest) Reset()                    { *m = PutRequest{} }
+func (m *PutRequest) String() string            { return proto.CompactTextString(m) }
+func (*PutRequest) ProtoMessage()               {}
+func (*PutRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{3} }
 
 // A PutResponse is the return value from the Put() method.
 type PutResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *PutResponse) Reset()         { *m = PutResponse{} }
-func (m *PutResponse) String() string { return proto.CompactTextString(m) }
-func (*PutResponse) ProtoMessage()    {}
+func (m *PutResponse) Reset()                    { *m = PutResponse{} }
+func (m *PutResponse) String() string            { return proto.CompactTextString(m) }
+func (*PutResponse) ProtoMessage()               {}
+func (*PutResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{4} }
 
 // A ConditionalPutRequest is the argument to the ConditionalPut() method.
 //
@@ -293,12 +318,13 @@ type ConditionalPutRequest struct {
 	// Set exp_value.bytes empty to test for non-existence. Specify as nil
 	// to indicate there should be no existing entry. This is different
 	// from the expectation that the value exists but is empty.
-	ExpValue *Value `protobuf:"bytes,3,opt,name=exp_value" json:"exp_value,omitempty"`
+	ExpValue *Value `protobuf:"bytes,3,opt,name=exp_value,json=expValue" json:"exp_value,omitempty"`
 }
 
-func (m *ConditionalPutRequest) Reset()         { *m = ConditionalPutRequest{} }
-func (m *ConditionalPutRequest) String() string { return proto.CompactTextString(m) }
-func (*ConditionalPutRequest) ProtoMessage()    {}
+func (m *ConditionalPutRequest) Reset()                    { *m = ConditionalPutRequest{} }
+func (m *ConditionalPutRequest) String() string            { return proto.CompactTextString(m) }
+func (*ConditionalPutRequest) ProtoMessage()               {}
+func (*ConditionalPutRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{5} }
 
 // A ConditionalPutResponse is the return value from the
 // ConditionalPut() method.
@@ -306,9 +332,10 @@ type ConditionalPutResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *ConditionalPutResponse) Reset()         { *m = ConditionalPutResponse{} }
-func (m *ConditionalPutResponse) String() string { return proto.CompactTextString(m) }
-func (*ConditionalPutResponse) ProtoMessage()    {}
+func (m *ConditionalPutResponse) Reset()                    { *m = ConditionalPutResponse{} }
+func (m *ConditionalPutResponse) String() string            { return proto.CompactTextString(m) }
+func (*ConditionalPutResponse) ProtoMessage()               {}
+func (*ConditionalPutResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{6} }
 
 // An IncrementRequest is the argument to the Increment() method. It
 // increments the value for key, and returns the new value. If no
@@ -321,39 +348,43 @@ type IncrementRequest struct {
 	Increment int64 `protobuf:"varint,2,opt,name=increment" json:"increment"`
 }
 
-func (m *IncrementRequest) Reset()         { *m = IncrementRequest{} }
-func (m *IncrementRequest) String() string { return proto.CompactTextString(m) }
-func (*IncrementRequest) ProtoMessage()    {}
+func (m *IncrementRequest) Reset()                    { *m = IncrementRequest{} }
+func (m *IncrementRequest) String() string            { return proto.CompactTextString(m) }
+func (*IncrementRequest) ProtoMessage()               {}
+func (*IncrementRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{7} }
 
 // An IncrementResponse is the return value from the Increment
 // method. The new value after increment is specified in NewValue. If
 // the value could not be decoded as specified, Error will be set.
 type IncrementResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	NewValue       int64 `protobuf:"varint,2,opt,name=new_value" json:"new_value"`
+	NewValue       int64 `protobuf:"varint,2,opt,name=new_value,json=newValue" json:"new_value"`
 }
 
-func (m *IncrementResponse) Reset()         { *m = IncrementResponse{} }
-func (m *IncrementResponse) String() string { return proto.CompactTextString(m) }
-func (*IncrementResponse) ProtoMessage()    {}
+func (m *IncrementResponse) Reset()                    { *m = IncrementResponse{} }
+func (m *IncrementResponse) String() string            { return proto.CompactTextString(m) }
+func (*IncrementResponse) ProtoMessage()               {}
+func (*IncrementResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{8} }
 
 // A DeleteRequest is the argument to the Delete() method.
 type DeleteRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *DeleteRequest) Reset()         { *m = DeleteRequest{} }
-func (m *DeleteRequest) String() string { return proto.CompactTextString(m) }
-func (*DeleteRequest) ProtoMessage()    {}
+func (m *DeleteRequest) Reset()                    { *m = DeleteRequest{} }
+func (m *DeleteRequest) String() string            { return proto.CompactTextString(m) }
+func (*DeleteRequest) ProtoMessage()               {}
+func (*DeleteRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{9} }
 
 // A DeleteResponse is the return value from the Delete() method.
 type DeleteResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *DeleteResponse) Reset()         { *m = DeleteResponse{} }
-func (m *DeleteResponse) String() string { return proto.CompactTextString(m) }
-func (*DeleteResponse) ProtoMessage()    {}
+func (m *DeleteResponse) Reset()                    { *m = DeleteResponse{} }
+func (m *DeleteResponse) String() string            { return proto.CompactTextString(m) }
+func (*DeleteResponse) ProtoMessage()               {}
+func (*DeleteResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{10} }
 
 // A DeleteRangeRequest is the argument to the DeleteRange() method. It
 // specifies the range of keys to delete.
@@ -361,24 +392,27 @@ type DeleteRangeRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// If 0, *all* entries between key (inclusive) and end_key
 	// (exclusive) are deleted. Must be >= 0.
-	MaxEntriesToDelete int64 `protobuf:"varint,2,opt,name=max_entries_to_delete" json:"max_entries_to_delete"`
+	MaxEntriesToDelete int64 `protobuf:"varint,2,opt,name=max_entries_to_delete,json=maxEntriesToDelete" json:"max_entries_to_delete"`
+	ReturnKeys         bool  `protobuf:"varint,3,opt,name=return_keys,json=returnKeys" json:"return_keys"`
 }
 
-func (m *DeleteRangeRequest) Reset()         { *m = DeleteRangeRequest{} }
-func (m *DeleteRangeRequest) String() string { return proto.CompactTextString(m) }
-func (*DeleteRangeRequest) ProtoMessage()    {}
+func (m *DeleteRangeRequest) Reset()                    { *m = DeleteRangeRequest{} }
+func (m *DeleteRangeRequest) String() string            { return proto.CompactTextString(m) }
+func (*DeleteRangeRequest) ProtoMessage()               {}
+func (*DeleteRangeRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{11} }
 
 // A DeleteRangeResponse is the return value from the DeleteRange()
 // method.
 type DeleteRangeResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// Number of entries removed.
-	NumDeleted int64 `protobuf:"varint,2,opt,name=num_deleted" json:"num_deleted"`
+	Keys []Key `protobuf:"bytes,2,rep,name=keys,casttype=Key" json:"keys,omitempty"`
 }
 
-func (m *DeleteRangeResponse) Reset()         { *m = DeleteRangeResponse{} }
-func (m *DeleteRangeResponse) String() string { return proto.CompactTextString(m) }
-func (*DeleteRangeResponse) ProtoMessage()    {}
+func (m *DeleteRangeResponse) Reset()                    { *m = DeleteRangeResponse{} }
+func (m *DeleteRangeResponse) String() string            { return proto.CompactTextString(m) }
+func (*DeleteRangeResponse) ProtoMessage()               {}
+func (*DeleteRangeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{12} }
 
 // A ScanRequest is the argument to the Scan() method. It specifies the
 // start and end keys for an ascending scan of [start,end) and the maximum
@@ -386,12 +420,13 @@ func (*DeleteRangeResponse) ProtoMessage()    {}
 type ScanRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// If 0, there is no limit on the number of retrieved entries. Must be >= 0.
-	MaxResults int64 `protobuf:"varint,2,opt,name=max_results" json:"max_results"`
+	MaxResults int64 `protobuf:"varint,2,opt,name=max_results,json=maxResults" json:"max_results"`
 }
 
-func (m *ScanRequest) Reset()         { *m = ScanRequest{} }
-func (m *ScanRequest) String() string { return proto.CompactTextString(m) }
-func (*ScanRequest) ProtoMessage()    {}
+func (m *ScanRequest) Reset()                    { *m = ScanRequest{} }
+func (m *ScanRequest) String() string            { return proto.CompactTextString(m) }
+func (*ScanRequest) ProtoMessage()               {}
+func (*ScanRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{13} }
 
 // A ScanResponse is the return value from the Scan() method.
 type ScanResponse struct {
@@ -400,9 +435,10 @@ type ScanResponse struct {
 	Rows []KeyValue `protobuf:"bytes,2,rep,name=rows" json:"rows"`
 }
 
-func (m *ScanResponse) Reset()         { *m = ScanResponse{} }
-func (m *ScanResponse) String() string { return proto.CompactTextString(m) }
-func (*ScanResponse) ProtoMessage()    {}
+func (m *ScanResponse) Reset()                    { *m = ScanResponse{} }
+func (m *ScanResponse) String() string            { return proto.CompactTextString(m) }
+func (*ScanResponse) ProtoMessage()               {}
+func (*ScanResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{14} }
 
 // A ReverseScanRequest is the argument to the ReverseScan() method. It specifies the
 // start and end keys for a descending scan of [start,end) and the maximum
@@ -410,12 +446,13 @@ func (*ScanResponse) ProtoMessage()    {}
 type ReverseScanRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// If 0, there is no limit on the number of retrieved entries. Must be >= 0.
-	MaxResults int64 `protobuf:"varint,2,opt,name=max_results" json:"max_results"`
+	MaxResults int64 `protobuf:"varint,2,opt,name=max_results,json=maxResults" json:"max_results"`
 }
 
-func (m *ReverseScanRequest) Reset()         { *m = ReverseScanRequest{} }
-func (m *ReverseScanRequest) String() string { return proto.CompactTextString(m) }
-func (*ReverseScanRequest) ProtoMessage()    {}
+func (m *ReverseScanRequest) Reset()                    { *m = ReverseScanRequest{} }
+func (m *ReverseScanRequest) String() string            { return proto.CompactTextString(m) }
+func (*ReverseScanRequest) ProtoMessage()               {}
+func (*ReverseScanRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{15} }
 
 // A ReverseScanResponse is the return value from the ReverseScan() method.
 type ReverseScanResponse struct {
@@ -424,27 +461,56 @@ type ReverseScanResponse struct {
 	Rows []KeyValue `protobuf:"bytes,2,rep,name=rows" json:"rows"`
 }
 
-func (m *ReverseScanResponse) Reset()         { *m = ReverseScanResponse{} }
-func (m *ReverseScanResponse) String() string { return proto.CompactTextString(m) }
-func (*ReverseScanResponse) ProtoMessage()    {}
+func (m *ReverseScanResponse) Reset()                    { *m = ReverseScanResponse{} }
+func (m *ReverseScanResponse) String() string            { return proto.CompactTextString(m) }
+func (*ReverseScanResponse) ProtoMessage()               {}
+func (*ReverseScanResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{16} }
+
+// A CheckConsistencyRequest is the argument to the CheckConsistency() method.
+// It specifies the start and end keys for a span of ranges to which a consistency
+// check should be applied. A consistency check on a range involves running a
+// ComputeChecksum on the range followed by a VerifyChecksum.
+type CheckConsistencyRequest struct {
+	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	// log a diff of inconsistencies if such inconsistencies are found.
+	WithDiff bool `protobuf:"varint,2,opt,name=with_diff,json=withDiff" json:"with_diff"`
+}
+
+func (m *CheckConsistencyRequest) Reset()                    { *m = CheckConsistencyRequest{} }
+func (m *CheckConsistencyRequest) String() string            { return proto.CompactTextString(m) }
+func (*CheckConsistencyRequest) ProtoMessage()               {}
+func (*CheckConsistencyRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{17} }
+
+// A CheckConsistencyResponse is the return value from the CheckConsistency() method.
+// If a replica finds itself to be inconsistent with its leader it will panic.
+type CheckConsistencyResponse struct {
+	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+}
+
+func (m *CheckConsistencyResponse) Reset()                    { *m = CheckConsistencyResponse{} }
+func (m *CheckConsistencyResponse) String() string            { return proto.CompactTextString(m) }
+func (*CheckConsistencyResponse) ProtoMessage()               {}
+func (*CheckConsistencyResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{18} }
 
 // A BeginTransactionRequest is the argument to the BeginTransaction() method.
 type BeginTransactionRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *BeginTransactionRequest) Reset()         { *m = BeginTransactionRequest{} }
-func (m *BeginTransactionRequest) String() string { return proto.CompactTextString(m) }
-func (*BeginTransactionRequest) ProtoMessage()    {}
+func (m *BeginTransactionRequest) Reset()                    { *m = BeginTransactionRequest{} }
+func (m *BeginTransactionRequest) String() string            { return proto.CompactTextString(m) }
+func (*BeginTransactionRequest) ProtoMessage()               {}
+func (*BeginTransactionRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{19} }
 
 // A BeginTransactionResponse is the return value from the BeginTransaction() method.
 type BeginTransactionResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *BeginTransactionResponse) Reset()         { *m = BeginTransactionResponse{} }
-func (m *BeginTransactionResponse) String() string { return proto.CompactTextString(m) }
-func (*BeginTransactionResponse) ProtoMessage()    {}
+func (m *BeginTransactionResponse) Reset()                    { *m = BeginTransactionResponse{} }
+func (m *BeginTransactionResponse) String() string            { return proto.CompactTextString(m) }
+func (*BeginTransactionResponse) ProtoMessage()               {}
+func (*BeginTransactionResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{20} }
 
 // An EndTransactionRequest is the argument to the EndTransaction() method. It
 // specifies whether to commit or roll back an extant transaction.
@@ -457,14 +523,15 @@ type EndTransactionRequest struct {
 	// Optional commit triggers. Note that commit triggers are for
 	// internal use only and will cause an error if requested through the
 	// external-facing KV API.
-	InternalCommitTrigger *InternalCommitTrigger `protobuf:"bytes,4,opt,name=internal_commit_trigger" json:"internal_commit_trigger,omitempty"`
+	InternalCommitTrigger *InternalCommitTrigger `protobuf:"bytes,4,opt,name=internal_commit_trigger,json=internalCommitTrigger" json:"internal_commit_trigger,omitempty"`
 	// List of intents written by the transaction.
-	IntentSpans []Span `protobuf:"bytes,5,rep,name=intent_spans" json:"intent_spans"`
+	IntentSpans []Span `protobuf:"bytes,5,rep,name=intent_spans,json=intentSpans" json:"intent_spans"`
 }
 
-func (m *EndTransactionRequest) Reset()         { *m = EndTransactionRequest{} }
-func (m *EndTransactionRequest) String() string { return proto.CompactTextString(m) }
-func (*EndTransactionRequest) ProtoMessage()    {}
+func (m *EndTransactionRequest) Reset()                    { *m = EndTransactionRequest{} }
+func (m *EndTransactionRequest) String() string            { return proto.CompactTextString(m) }
+func (*EndTransactionRequest) ProtoMessage()               {}
+func (*EndTransactionRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{21} }
 
 // An EndTransactionResponse is the return value from the
 // EndTransaction() method. The final transaction record is returned
@@ -479,14 +546,19 @@ func (*EndTransactionRequest) ProtoMessage()    {}
 type EndTransactionResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// Remaining time (ns).
-	CommitWait int64 `protobuf:"varint,2,opt,name=commit_wait" json:"commit_wait"`
-	// List of intents resolved by EndTransaction call.
-	Resolved []Key `protobuf:"bytes,3,rep,name=resolved,casttype=Key" json:"resolved,omitempty"`
+	CommitWait int64 `protobuf:"varint,2,opt,name=commit_wait,json=commitWait" json:"commit_wait"`
+	// Obsolete tag. Removed in #5966.
+	DEPRECATEDResolved [][]byte `protobuf:"bytes,3,rep,name=DEPRECATED_resolved,json=dEPRECATEDResolved" json:"DEPRECATED_resolved,omitempty"`
+	// True if the transaction committed on the one phase commit path.
+	// This means that all writes which were part of the transaction
+	// were written as a single, atomic write batch to just one range.
+	OnePhaseCommit bool `protobuf:"varint,4,opt,name=one_phase_commit,json=onePhaseCommit" json:"one_phase_commit"`
 }
 
-func (m *EndTransactionResponse) Reset()         { *m = EndTransactionResponse{} }
-func (m *EndTransactionResponse) String() string { return proto.CompactTextString(m) }
-func (*EndTransactionResponse) ProtoMessage()    {}
+func (m *EndTransactionResponse) Reset()                    { *m = EndTransactionResponse{} }
+func (m *EndTransactionResponse) String() string            { return proto.CompactTextString(m) }
+func (*EndTransactionResponse) ProtoMessage()               {}
+func (*EndTransactionResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{22} }
 
 // An AdminSplitRequest is the argument to the AdminSplit() method. The
 // existing range which contains header.key is split by
@@ -510,12 +582,13 @@ func (*EndTransactionResponse) ProtoMessage()    {}
 // recomputed).
 type AdminSplitRequest struct {
 	Span     `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	SplitKey Key `protobuf:"bytes,2,opt,name=split_key,casttype=Key" json:"split_key,omitempty"`
+	SplitKey Key `protobuf:"bytes,2,opt,name=split_key,json=splitKey,casttype=Key" json:"split_key,omitempty"`
 }
 
-func (m *AdminSplitRequest) Reset()         { *m = AdminSplitRequest{} }
-func (m *AdminSplitRequest) String() string { return proto.CompactTextString(m) }
-func (*AdminSplitRequest) ProtoMessage()    {}
+func (m *AdminSplitRequest) Reset()                    { *m = AdminSplitRequest{} }
+func (m *AdminSplitRequest) String() string            { return proto.CompactTextString(m) }
+func (*AdminSplitRequest) ProtoMessage()               {}
+func (*AdminSplitRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{23} }
 
 // An AdminSplitResponse is the return value from the AdminSplit()
 // method.
@@ -523,9 +596,10 @@ type AdminSplitResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *AdminSplitResponse) Reset()         { *m = AdminSplitResponse{} }
-func (m *AdminSplitResponse) String() string { return proto.CompactTextString(m) }
-func (*AdminSplitResponse) ProtoMessage()    {}
+func (m *AdminSplitResponse) Reset()                    { *m = AdminSplitResponse{} }
+func (m *AdminSplitResponse) String() string            { return proto.CompactTextString(m) }
+func (*AdminSplitResponse) ProtoMessage()               {}
+func (*AdminSplitResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{24} }
 
 // An AdminMergeRequest is the argument to the AdminMerge() method. A
 // merge is performed by calling AdminMerge on the left-hand range of
@@ -540,9 +614,10 @@ type AdminMergeRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *AdminMergeRequest) Reset()         { *m = AdminMergeRequest{} }
-func (m *AdminMergeRequest) String() string { return proto.CompactTextString(m) }
-func (*AdminMergeRequest) ProtoMessage()    {}
+func (m *AdminMergeRequest) Reset()                    { *m = AdminMergeRequest{} }
+func (m *AdminMergeRequest) String() string            { return proto.CompactTextString(m) }
+func (*AdminMergeRequest) ProtoMessage()               {}
+func (*AdminMergeRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{25} }
 
 // An AdminMergeResponse is the return value from the AdminMerge()
 // method.
@@ -550,9 +625,10 @@ type AdminMergeResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *AdminMergeResponse) Reset()         { *m = AdminMergeResponse{} }
-func (m *AdminMergeResponse) String() string { return proto.CompactTextString(m) }
-func (*AdminMergeResponse) ProtoMessage()    {}
+func (m *AdminMergeResponse) Reset()                    { *m = AdminMergeResponse{} }
+func (m *AdminMergeResponse) String() string            { return proto.CompactTextString(m) }
+func (*AdminMergeResponse) ProtoMessage()               {}
+func (*AdminMergeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{26} }
 
 // A RangeLookupRequest is arguments to the RangeLookup() method. A
 // forward lookup request returns a range containing the requested
@@ -567,20 +643,21 @@ func (*AdminMergeResponse) ProtoMessage()    {}
 // direction as lookup (forward v.s. reverse).
 type RangeLookupRequest struct {
 	Span      `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	MaxRanges int32 `protobuf:"varint,2,opt,name=max_ranges" json:"max_ranges"`
+	MaxRanges int32 `protobuf:"varint,2,opt,name=max_ranges,json=maxRanges" json:"max_ranges"`
 	// consider_intents indicates whether or not intents encountered
-	// while looking up the range info should randomly be returned
-	// to the caller. This is intended to be used when retrying due
-	// to range addressing errors.
-	ConsiderIntents bool `protobuf:"varint,3,opt,name=consider_intents" json:"consider_intents"`
+	// while looking up the range info should be returned to the caller.
+	// This is intended to be used when retrying due to range addressing
+	// errors.
+	ConsiderIntents bool `protobuf:"varint,3,opt,name=consider_intents,json=considerIntents" json:"consider_intents"`
 	// Use a reverse scan to pre-fill the range descriptor cache instead
 	// of an ascending scan.
 	Reverse bool `protobuf:"varint,4,opt,name=reverse" json:"reverse"`
 }
 
-func (m *RangeLookupRequest) Reset()         { *m = RangeLookupRequest{} }
-func (m *RangeLookupRequest) String() string { return proto.CompactTextString(m) }
-func (*RangeLookupRequest) ProtoMessage()    {}
+func (m *RangeLookupRequest) Reset()                    { *m = RangeLookupRequest{} }
+func (m *RangeLookupRequest) String() string            { return proto.CompactTextString(m) }
+func (*RangeLookupRequest) ProtoMessage()               {}
+func (*RangeLookupRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{27} }
 
 // A RangeLookupResponse is the return value from the RangeLookup()
 // method. It returns metadata for the range containing the requested
@@ -588,13 +665,15 @@ func (*RangeLookupRequest) ProtoMessage()    {}
 // ranges beyond the requested range to pre-fill the range descriptor
 // cache.
 type RangeLookupResponse struct {
-	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
-	Ranges         []RangeDescriptor `protobuf:"bytes,2,rep,name=ranges" json:"ranges"`
+	ResponseHeader   `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	Ranges           []RangeDescriptor `protobuf:"bytes,2,rep,name=ranges" json:"ranges"`
+	PrefetchedRanges []RangeDescriptor `protobuf:"bytes,3,rep,name=prefetched_ranges,json=prefetchedRanges" json:"prefetched_ranges"`
 }
 
-func (m *RangeLookupResponse) Reset()         { *m = RangeLookupResponse{} }
-func (m *RangeLookupResponse) String() string { return proto.CompactTextString(m) }
-func (*RangeLookupResponse) ProtoMessage()    {}
+func (m *RangeLookupResponse) Reset()                    { *m = RangeLookupResponse{} }
+func (m *RangeLookupResponse) String() string            { return proto.CompactTextString(m) }
+func (*RangeLookupResponse) ProtoMessage()               {}
+func (*RangeLookupResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{28} }
 
 // A HeartbeatTxnRequest is arguments to the HeartbeatTxn()
 // method. It's sent by transaction coordinators to let the system
@@ -603,11 +682,13 @@ func (*RangeLookupResponse) ProtoMessage()    {}
 // gossip protocol.
 type HeartbeatTxnRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	Now  Timestamp `protobuf:"bytes,2,opt,name=now" json:"now"`
 }
 
-func (m *HeartbeatTxnRequest) Reset()         { *m = HeartbeatTxnRequest{} }
-func (m *HeartbeatTxnRequest) String() string { return proto.CompactTextString(m) }
-func (*HeartbeatTxnRequest) ProtoMessage()    {}
+func (m *HeartbeatTxnRequest) Reset()                    { *m = HeartbeatTxnRequest{} }
+func (m *HeartbeatTxnRequest) String() string            { return proto.CompactTextString(m) }
+func (*HeartbeatTxnRequest) ProtoMessage()               {}
+func (*HeartbeatTxnRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{29} }
 
 // A HeartbeatTxnResponse is the return value from the HeartbeatTxn()
 // method. It returns the transaction info in the response header. The
@@ -617,9 +698,10 @@ type HeartbeatTxnResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *HeartbeatTxnResponse) Reset()         { *m = HeartbeatTxnResponse{} }
-func (m *HeartbeatTxnResponse) String() string { return proto.CompactTextString(m) }
-func (*HeartbeatTxnResponse) ProtoMessage()    {}
+func (m *HeartbeatTxnResponse) Reset()                    { *m = HeartbeatTxnResponse{} }
+func (m *HeartbeatTxnResponse) String() string            { return proto.CompactTextString(m) }
+func (*HeartbeatTxnResponse) ProtoMessage()               {}
+func (*HeartbeatTxnResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{30} }
 
 // A GCRequest is arguments to the GC() method. It's sent by range
 // leaders after scanning range data to find expired MVCC values.
@@ -628,27 +710,30 @@ type GCRequest struct {
 	Keys []GCRequest_GCKey `protobuf:"bytes,3,rep,name=keys" json:"keys"`
 }
 
-func (m *GCRequest) Reset()         { *m = GCRequest{} }
-func (m *GCRequest) String() string { return proto.CompactTextString(m) }
-func (*GCRequest) ProtoMessage()    {}
+func (m *GCRequest) Reset()                    { *m = GCRequest{} }
+func (m *GCRequest) String() string            { return proto.CompactTextString(m) }
+func (*GCRequest) ProtoMessage()               {}
+func (*GCRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{31} }
 
 type GCRequest_GCKey struct {
 	Key       Key       `protobuf:"bytes,1,opt,name=key,casttype=Key" json:"key,omitempty"`
 	Timestamp Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
 }
 
-func (m *GCRequest_GCKey) Reset()         { *m = GCRequest_GCKey{} }
-func (m *GCRequest_GCKey) String() string { return proto.CompactTextString(m) }
-func (*GCRequest_GCKey) ProtoMessage()    {}
+func (m *GCRequest_GCKey) Reset()                    { *m = GCRequest_GCKey{} }
+func (m *GCRequest_GCKey) String() string            { return proto.CompactTextString(m) }
+func (*GCRequest_GCKey) ProtoMessage()               {}
+func (*GCRequest_GCKey) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{31, 0} }
 
 // A GCResponse is the return value from the GC() method.
 type GCResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *GCResponse) Reset()         { *m = GCResponse{} }
-func (m *GCResponse) String() string { return proto.CompactTextString(m) }
-func (*GCResponse) ProtoMessage()    {}
+func (m *GCResponse) Reset()                    { *m = GCResponse{} }
+func (m *GCResponse) String() string            { return proto.CompactTextString(m) }
+func (*GCResponse) ProtoMessage()               {}
+func (*GCResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{32} }
 
 // A PushTxnRequest is arguments to the PushTxn() method. It's sent by
 // readers or writers which have encountered an "intent" laid down by
@@ -669,16 +754,16 @@ type PushTxnRequest struct {
 	// Transaction which encountered the intent, if applicable. For a
 	// non-transactional operation, pusher_txn will be nil. Used to
 	// compare priorities and timestamps if priorities are equal.
-	PusherTxn Transaction `protobuf:"bytes,2,opt,name=pusher_txn" json:"pusher_txn"`
+	PusherTxn Transaction `protobuf:"bytes,2,opt,name=pusher_txn,json=pusherTxn" json:"pusher_txn"`
 	// Transaction to be pushed, as specified at the intent which led to
 	// the push transaction request. Note that this may not be the most
 	// up-to-date value of the transaction record, but will be set or
 	// merged as appropriate.
-	PusheeTxn TxnMeta `protobuf:"bytes,3,opt,name=pushee_txn" json:"pushee_txn"`
+	PusheeTxn TxnMeta `protobuf:"bytes,3,opt,name=pushee_txn,json=pusheeTxn" json:"pushee_txn"`
 	// PushTo is the timestamp just after which PusheeTxn is attempted to be
 	// pushed. During conflict resolution, it should be set to the timestamp
 	// of the its conflicting write.
-	PushTo Timestamp `protobuf:"bytes,4,opt,name=push_to" json:"push_to"`
+	PushTo Timestamp `protobuf:"bytes,4,opt,name=push_to,json=pushTo" json:"push_to"`
 	// Now holds the timestamp used to compare the last heartbeat of the pushee
 	// against. This is necessary since the request header's timestamp does not
 	// necessarily advance with the node clock across retries and hence cannot
@@ -689,12 +774,13 @@ type PushTxnRequest struct {
 	// that pushee_txn be aborted if possible. Inconsistent readers set
 	// this to PUSH_TOUCH to determine whether the pushee can be aborted
 	// due to inactivity (based on the now field).
-	PushType PushTxnType `protobuf:"varint,6,opt,name=push_type,enum=cockroach.roachpb.PushTxnType" json:"push_type"`
+	PushType PushTxnType `protobuf:"varint,6,opt,name=push_type,json=pushType,enum=cockroach.roachpb.PushTxnType" json:"push_type"`
 }
 
-func (m *PushTxnRequest) Reset()         { *m = PushTxnRequest{} }
-func (m *PushTxnRequest) String() string { return proto.CompactTextString(m) }
-func (*PushTxnRequest) ProtoMessage()    {}
+func (m *PushTxnRequest) Reset()                    { *m = PushTxnRequest{} }
+func (m *PushTxnRequest) String() string            { return proto.CompactTextString(m) }
+func (*PushTxnRequest) ProtoMessage()               {}
+func (*PushTxnRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{33} }
 
 // A PushTxnResponse is the return value from the PushTxn() method. It
 // returns success and the resulting state of PusheeTxn if the
@@ -707,12 +793,13 @@ type PushTxnResponse struct {
 	// the current value of the transaction.
 	// TODO(tschottdorf): Maybe this can be a TxnMeta instead; probably requires
 	// factoring out the new Priority.
-	PusheeTxn Transaction `protobuf:"bytes,2,opt,name=pushee_txn" json:"pushee_txn"`
+	PusheeTxn Transaction `protobuf:"bytes,2,opt,name=pushee_txn,json=pusheeTxn" json:"pushee_txn"`
 }
 
-func (m *PushTxnResponse) Reset()         { *m = PushTxnResponse{} }
-func (m *PushTxnResponse) String() string { return proto.CompactTextString(m) }
-func (*PushTxnResponse) ProtoMessage()    {}
+func (m *PushTxnResponse) Reset()                    { *m = PushTxnResponse{} }
+func (m *PushTxnResponse) String() string            { return proto.CompactTextString(m) }
+func (*PushTxnResponse) ProtoMessage()               {}
+func (*PushTxnResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{34} }
 
 // A ResolveIntentRequest is arguments to the ResolveIntent()
 // method. It is sent by transaction coordinators after success
@@ -721,7 +808,7 @@ func (*PushTxnResponse) ProtoMessage()    {}
 type ResolveIntentRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// The transaction whose intent is being resolved.
-	IntentTxn TxnMeta `protobuf:"bytes,2,opt,name=intent_txn" json:"intent_txn"`
+	IntentTxn TxnMeta `protobuf:"bytes,2,opt,name=intent_txn,json=intentTxn" json:"intent_txn"`
 	// The status of the transaction.
 	Status TransactionStatus `protobuf:"varint,3,opt,name=status,enum=cockroach.roachpb.TransactionStatus" json:"status"`
 	// Optionally poison the sequence cache for the transaction the intent's
@@ -729,9 +816,10 @@ type ResolveIntentRequest struct {
 	Poison bool `protobuf:"varint,4,opt,name=poison" json:"poison"`
 }
 
-func (m *ResolveIntentRequest) Reset()         { *m = ResolveIntentRequest{} }
-func (m *ResolveIntentRequest) String() string { return proto.CompactTextString(m) }
-func (*ResolveIntentRequest) ProtoMessage()    {}
+func (m *ResolveIntentRequest) Reset()                    { *m = ResolveIntentRequest{} }
+func (m *ResolveIntentRequest) String() string            { return proto.CompactTextString(m) }
+func (*ResolveIntentRequest) ProtoMessage()               {}
+func (*ResolveIntentRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{35} }
 
 // A ResolveIntentResponse is the return value from the
 // ResolveIntent() method.
@@ -739,9 +827,10 @@ type ResolveIntentResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *ResolveIntentResponse) Reset()         { *m = ResolveIntentResponse{} }
-func (m *ResolveIntentResponse) String() string { return proto.CompactTextString(m) }
-func (*ResolveIntentResponse) ProtoMessage()    {}
+func (m *ResolveIntentResponse) Reset()                    { *m = ResolveIntentResponse{} }
+func (m *ResolveIntentResponse) String() string            { return proto.CompactTextString(m) }
+func (*ResolveIntentResponse) ProtoMessage()               {}
+func (*ResolveIntentResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{36} }
 
 // A ResolveIntentRangeRequest is arguments to the ResolveIntentRange() method.
 // It is sent by transaction coordinators after success calling PushTxn to
@@ -750,7 +839,7 @@ func (*ResolveIntentResponse) ProtoMessage()    {}
 type ResolveIntentRangeRequest struct {
 	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	// The transaction whose intents are being resolved.
-	IntentTxn TxnMeta `protobuf:"bytes,2,opt,name=intent_txn" json:"intent_txn"`
+	IntentTxn TxnMeta `protobuf:"bytes,2,opt,name=intent_txn,json=intentTxn" json:"intent_txn"`
 	// The status of the transaction.
 	Status TransactionStatus `protobuf:"varint,3,opt,name=status,enum=cockroach.roachpb.TransactionStatus" json:"status"`
 	// Optionally poison the sequence cache for the transaction on all ranges
@@ -758,27 +847,28 @@ type ResolveIntentRangeRequest struct {
 	Poison bool `protobuf:"varint,4,opt,name=poison" json:"poison"`
 }
 
-func (m *ResolveIntentRangeRequest) Reset()         { *m = ResolveIntentRangeRequest{} }
-func (m *ResolveIntentRangeRequest) String() string { return proto.CompactTextString(m) }
-func (*ResolveIntentRangeRequest) ProtoMessage()    {}
+func (m *ResolveIntentRangeRequest) Reset()                    { *m = ResolveIntentRangeRequest{} }
+func (m *ResolveIntentRangeRequest) String() string            { return proto.CompactTextString(m) }
+func (*ResolveIntentRangeRequest) ProtoMessage()               {}
+func (*ResolveIntentRangeRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{37} }
 
 // A NoopResponse is the return value from a no-op operation.
 type NoopResponse struct {
-	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *NoopResponse) Reset()         { *m = NoopResponse{} }
-func (m *NoopResponse) String() string { return proto.CompactTextString(m) }
-func (*NoopResponse) ProtoMessage()    {}
+func (m *NoopResponse) Reset()                    { *m = NoopResponse{} }
+func (m *NoopResponse) String() string            { return proto.CompactTextString(m) }
+func (*NoopResponse) ProtoMessage()               {}
+func (*NoopResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{38} }
 
 // A NoopRequest is a no-op.
 type NoopRequest struct {
-	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *NoopRequest) Reset()         { *m = NoopRequest{} }
-func (m *NoopRequest) String() string { return proto.CompactTextString(m) }
-func (*NoopRequest) ProtoMessage()    {}
+func (m *NoopRequest) Reset()                    { *m = NoopRequest{} }
+func (m *NoopRequest) String() string            { return proto.CompactTextString(m) }
+func (*NoopRequest) ProtoMessage()               {}
+func (*NoopRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{39} }
 
 // A ResolveIntentRangeResponse is the return value from the
 // ResolveIntent() method.
@@ -786,9 +876,10 @@ type ResolveIntentRangeResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *ResolveIntentRangeResponse) Reset()         { *m = ResolveIntentRangeResponse{} }
-func (m *ResolveIntentRangeResponse) String() string { return proto.CompactTextString(m) }
-func (*ResolveIntentRangeResponse) ProtoMessage()    {}
+func (m *ResolveIntentRangeResponse) Reset()                    { *m = ResolveIntentRangeResponse{} }
+func (m *ResolveIntentRangeResponse) String() string            { return proto.CompactTextString(m) }
+func (*ResolveIntentRangeResponse) ProtoMessage()               {}
+func (*ResolveIntentRangeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{40} }
 
 // A MergeRequest contains arguments to the Merge() method. It
 // specifies a key and a value which should be merged into the
@@ -798,18 +889,20 @@ type MergeRequest struct {
 	Value Value `protobuf:"bytes,2,opt,name=value" json:"value"`
 }
 
-func (m *MergeRequest) Reset()         { *m = MergeRequest{} }
-func (m *MergeRequest) String() string { return proto.CompactTextString(m) }
-func (*MergeRequest) ProtoMessage()    {}
+func (m *MergeRequest) Reset()                    { *m = MergeRequest{} }
+func (m *MergeRequest) String() string            { return proto.CompactTextString(m) }
+func (*MergeRequest) ProtoMessage()               {}
+func (*MergeRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{41} }
 
 // MergeResponse is the response to a Merge() operation.
 type MergeResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *MergeResponse) Reset()         { *m = MergeResponse{} }
-func (m *MergeResponse) String() string { return proto.CompactTextString(m) }
-func (*MergeResponse) ProtoMessage()    {}
+func (m *MergeResponse) Reset()                    { *m = MergeResponse{} }
+func (m *MergeResponse) String() string            { return proto.CompactTextString(m) }
+func (*MergeResponse) ProtoMessage()               {}
+func (*MergeResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{42} }
 
 // TruncateLogRequest is used to remove a prefix of the raft log. While there
 // is no requirement for correctness that the raft log truncation be synchronized across
@@ -824,21 +917,23 @@ type TruncateLogRequest struct {
 	// The header specifies a span, start and end keys, but not the range id
 	// itself. The range may have changed from the one specified in the header
 	// in the case of a merge.
-	RangeID RangeID `protobuf:"varint,3,opt,name=range_id,casttype=RangeID" json:"range_id"`
+	RangeID RangeID `protobuf:"varint,3,opt,name=range_id,json=rangeId,casttype=RangeID" json:"range_id"`
 }
 
-func (m *TruncateLogRequest) Reset()         { *m = TruncateLogRequest{} }
-func (m *TruncateLogRequest) String() string { return proto.CompactTextString(m) }
-func (*TruncateLogRequest) ProtoMessage()    {}
+func (m *TruncateLogRequest) Reset()                    { *m = TruncateLogRequest{} }
+func (m *TruncateLogRequest) String() string            { return proto.CompactTextString(m) }
+func (*TruncateLogRequest) ProtoMessage()               {}
+func (*TruncateLogRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{43} }
 
 // TruncateLogResponse is the response to a TruncateLog() operation.
 type TruncateLogResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *TruncateLogResponse) Reset()         { *m = TruncateLogResponse{} }
-func (m *TruncateLogResponse) String() string { return proto.CompactTextString(m) }
-func (*TruncateLogResponse) ProtoMessage()    {}
+func (m *TruncateLogResponse) Reset()                    { *m = TruncateLogResponse{} }
+func (m *TruncateLogResponse) String() string            { return proto.CompactTextString(m) }
+func (*TruncateLogResponse) ProtoMessage()               {}
+func (*TruncateLogResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{44} }
 
 // A LeaderLeaseRequest is arguments to the LeaderLease()
 // method. It is sent by the store on behalf of one of its ranges upon receipt
@@ -848,9 +943,10 @@ type LeaderLeaseRequest struct {
 	Lease Lease `protobuf:"bytes,2,opt,name=lease" json:"lease"`
 }
 
-func (m *LeaderLeaseRequest) Reset()         { *m = LeaderLeaseRequest{} }
-func (m *LeaderLeaseRequest) String() string { return proto.CompactTextString(m) }
-func (*LeaderLeaseRequest) ProtoMessage()    {}
+func (m *LeaderLeaseRequest) Reset()                    { *m = LeaderLeaseRequest{} }
+func (m *LeaderLeaseRequest) String() string            { return proto.CompactTextString(m) }
+func (*LeaderLeaseRequest) ProtoMessage()               {}
+func (*LeaderLeaseRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{45} }
 
 // A LeaderLeaseResponse is the response to a LeaderLease()
 // operation.
@@ -858,71 +954,141 @@ type LeaderLeaseResponse struct {
 	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 }
 
-func (m *LeaderLeaseResponse) Reset()         { *m = LeaderLeaseResponse{} }
-func (m *LeaderLeaseResponse) String() string { return proto.CompactTextString(m) }
-func (*LeaderLeaseResponse) ProtoMessage()    {}
+func (m *LeaderLeaseResponse) Reset()                    { *m = LeaderLeaseResponse{} }
+func (m *LeaderLeaseResponse) String() string            { return proto.CompactTextString(m) }
+func (*LeaderLeaseResponse) ProtoMessage()               {}
+func (*LeaderLeaseResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{46} }
+
+// A ComputeChecksumRequest is arguments to the ComputeChecksum() method, to
+// start computing the checksum for the specified range at the snapshot for
+// this request command. A response is returned without the checksum.
+// The computed checksum is later compared to the one supplied
+// through a VerifyChecksumRequest.
+type ComputeChecksumRequest struct {
+	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	// The version used to pick the checksum method. It allows us to use a
+	// consistent checksumming method across replicas.
+	Version uint32 `protobuf:"varint,2,opt,name=version" json:"version"`
+	// A unique identifier to match a future VerifyChecksumRequest with this request.
+	ChecksumID github_com_cockroachdb_cockroach_util_uuid.UUID `protobuf:"bytes,3,opt,name=checksum_id,json=checksumId,customtype=github.com/cockroachdb/cockroach/util/uuid.UUID" json:"checksum_id"`
+	// Compute a checksum along with a snapshot of the entire range, that will
+	// be used in logging a diff during checksum verification.
+	Snapshot bool `protobuf:"varint,4,opt,name=snapshot" json:"snapshot"`
+}
+
+func (m *ComputeChecksumRequest) Reset()                    { *m = ComputeChecksumRequest{} }
+func (m *ComputeChecksumRequest) String() string            { return proto.CompactTextString(m) }
+func (*ComputeChecksumRequest) ProtoMessage()               {}
+func (*ComputeChecksumRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{47} }
+
+// A ComputeChecksumResponse is the response to a ComputeChecksum() operation.
+type ComputeChecksumResponse struct {
+	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+}
+
+func (m *ComputeChecksumResponse) Reset()                    { *m = ComputeChecksumResponse{} }
+func (m *ComputeChecksumResponse) String() string            { return proto.CompactTextString(m) }
+func (*ComputeChecksumResponse) ProtoMessage()               {}
+func (*ComputeChecksumResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{48} }
+
+// A VerifyChecksumRequest is arguments to the VerifyChecksum() method, to
+// verify the checksum computed on the leader against the one requested
+// earlier through a ComputeChecksumRequest with the same checksum_id.
+type VerifyChecksumRequest struct {
+	Span `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+	// The version used to pick the checksum method. It allows us to use a
+	// consistent checksumming method across replicas.
+	Version    uint32                                          `protobuf:"varint,2,opt,name=version" json:"version"`
+	ChecksumID github_com_cockroachdb_cockroach_util_uuid.UUID `protobuf:"bytes,3,opt,name=checksum_id,json=checksumId,customtype=github.com/cockroachdb/cockroach/util/uuid.UUID" json:"checksum_id"`
+	Checksum   []byte                                          `protobuf:"bytes,4,opt,name=checksum" json:"checksum,omitempty"`
+	// Used when a diff is requested on observing a checksum mismatch.
+	Snapshot *RaftSnapshotData `protobuf:"bytes,5,opt,name=snapshot" json:"snapshot,omitempty"`
+}
+
+func (m *VerifyChecksumRequest) Reset()                    { *m = VerifyChecksumRequest{} }
+func (m *VerifyChecksumRequest) String() string            { return proto.CompactTextString(m) }
+func (*VerifyChecksumRequest) ProtoMessage()               {}
+func (*VerifyChecksumRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{49} }
+
+// A VerifyChecksumResponse is the response to a VerifyChecksum() operation.
+type VerifyChecksumResponse struct {
+	ResponseHeader `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
+}
+
+func (m *VerifyChecksumResponse) Reset()                    { *m = VerifyChecksumResponse{} }
+func (m *VerifyChecksumResponse) String() string            { return proto.CompactTextString(m) }
+func (*VerifyChecksumResponse) ProtoMessage()               {}
+func (*VerifyChecksumResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{50} }
 
 // A RequestUnion contains exactly one of the optional requests.
 // The values added here must match those in ResponseUnion.
 type RequestUnion struct {
 	Get                *GetRequest                `protobuf:"bytes,1,opt,name=get" json:"get,omitempty"`
 	Put                *PutRequest                `protobuf:"bytes,2,opt,name=put" json:"put,omitempty"`
-	ConditionalPut     *ConditionalPutRequest     `protobuf:"bytes,3,opt,name=conditional_put" json:"conditional_put,omitempty"`
+	ConditionalPut     *ConditionalPutRequest     `protobuf:"bytes,3,opt,name=conditional_put,json=conditionalPut" json:"conditional_put,omitempty"`
 	Increment          *IncrementRequest          `protobuf:"bytes,4,opt,name=increment" json:"increment,omitempty"`
 	Delete             *DeleteRequest             `protobuf:"bytes,5,opt,name=delete" json:"delete,omitempty"`
-	DeleteRange        *DeleteRangeRequest        `protobuf:"bytes,6,opt,name=delete_range" json:"delete_range,omitempty"`
+	DeleteRange        *DeleteRangeRequest        `protobuf:"bytes,6,opt,name=delete_range,json=deleteRange" json:"delete_range,omitempty"`
 	Scan               *ScanRequest               `protobuf:"bytes,7,opt,name=scan" json:"scan,omitempty"`
-	BeginTransaction   *BeginTransactionRequest   `protobuf:"bytes,8,opt,name=begin_transaction" json:"begin_transaction,omitempty"`
-	EndTransaction     *EndTransactionRequest     `protobuf:"bytes,9,opt,name=end_transaction" json:"end_transaction,omitempty"`
-	AdminSplit         *AdminSplitRequest         `protobuf:"bytes,10,opt,name=admin_split" json:"admin_split,omitempty"`
-	AdminMerge         *AdminMergeRequest         `protobuf:"bytes,11,opt,name=admin_merge" json:"admin_merge,omitempty"`
-	HeartbeatTxn       *HeartbeatTxnRequest       `protobuf:"bytes,12,opt,name=heartbeat_txn" json:"heartbeat_txn,omitempty"`
+	BeginTransaction   *BeginTransactionRequest   `protobuf:"bytes,8,opt,name=begin_transaction,json=beginTransaction" json:"begin_transaction,omitempty"`
+	EndTransaction     *EndTransactionRequest     `protobuf:"bytes,9,opt,name=end_transaction,json=endTransaction" json:"end_transaction,omitempty"`
+	AdminSplit         *AdminSplitRequest         `protobuf:"bytes,10,opt,name=admin_split,json=adminSplit" json:"admin_split,omitempty"`
+	AdminMerge         *AdminMergeRequest         `protobuf:"bytes,11,opt,name=admin_merge,json=adminMerge" json:"admin_merge,omitempty"`
+	HeartbeatTxn       *HeartbeatTxnRequest       `protobuf:"bytes,12,opt,name=heartbeat_txn,json=heartbeatTxn" json:"heartbeat_txn,omitempty"`
 	Gc                 *GCRequest                 `protobuf:"bytes,13,opt,name=gc" json:"gc,omitempty"`
-	PushTxn            *PushTxnRequest            `protobuf:"bytes,14,opt,name=push_txn" json:"push_txn,omitempty"`
-	RangeLookup        *RangeLookupRequest        `protobuf:"bytes,15,opt,name=range_lookup" json:"range_lookup,omitempty"`
-	ResolveIntent      *ResolveIntentRequest      `protobuf:"bytes,16,opt,name=resolve_intent" json:"resolve_intent,omitempty"`
-	ResolveIntentRange *ResolveIntentRangeRequest `protobuf:"bytes,17,opt,name=resolve_intent_range" json:"resolve_intent_range,omitempty"`
+	PushTxn            *PushTxnRequest            `protobuf:"bytes,14,opt,name=push_txn,json=pushTxn" json:"push_txn,omitempty"`
+	RangeLookup        *RangeLookupRequest        `protobuf:"bytes,15,opt,name=range_lookup,json=rangeLookup" json:"range_lookup,omitempty"`
+	ResolveIntent      *ResolveIntentRequest      `protobuf:"bytes,16,opt,name=resolve_intent,json=resolveIntent" json:"resolve_intent,omitempty"`
+	ResolveIntentRange *ResolveIntentRangeRequest `protobuf:"bytes,17,opt,name=resolve_intent_range,json=resolveIntentRange" json:"resolve_intent_range,omitempty"`
 	Merge              *MergeRequest              `protobuf:"bytes,18,opt,name=merge" json:"merge,omitempty"`
-	TruncateLog        *TruncateLogRequest        `protobuf:"bytes,19,opt,name=truncate_log" json:"truncate_log,omitempty"`
-	LeaderLease        *LeaderLeaseRequest        `protobuf:"bytes,20,opt,name=leader_lease" json:"leader_lease,omitempty"`
-	ReverseScan        *ReverseScanRequest        `protobuf:"bytes,21,opt,name=reverse_scan" json:"reverse_scan,omitempty"`
-	Noop               *NoopRequest               `protobuf:"bytes,22,opt,name=noop" json:"noop,omitempty"`
+	TruncateLog        *TruncateLogRequest        `protobuf:"bytes,19,opt,name=truncate_log,json=truncateLog" json:"truncate_log,omitempty"`
+	LeaderLease        *LeaderLeaseRequest        `protobuf:"bytes,20,opt,name=leader_lease,json=leaderLease" json:"leader_lease,omitempty"`
+	ReverseScan        *ReverseScanRequest        `protobuf:"bytes,21,opt,name=reverse_scan,json=reverseScan" json:"reverse_scan,omitempty"`
+	ComputeChecksum    *ComputeChecksumRequest    `protobuf:"bytes,22,opt,name=compute_checksum,json=computeChecksum" json:"compute_checksum,omitempty"`
+	VerifyChecksum     *VerifyChecksumRequest     `protobuf:"bytes,23,opt,name=verify_checksum,json=verifyChecksum" json:"verify_checksum,omitempty"`
+	CheckConsistency   *CheckConsistencyRequest   `protobuf:"bytes,24,opt,name=check_consistency,json=checkConsistency" json:"check_consistency,omitempty"`
+	Noop               *NoopRequest               `protobuf:"bytes,25,opt,name=noop" json:"noop,omitempty"`
 }
 
-func (m *RequestUnion) Reset()         { *m = RequestUnion{} }
-func (m *RequestUnion) String() string { return proto.CompactTextString(m) }
-func (*RequestUnion) ProtoMessage()    {}
+func (m *RequestUnion) Reset()                    { *m = RequestUnion{} }
+func (m *RequestUnion) String() string            { return proto.CompactTextString(m) }
+func (*RequestUnion) ProtoMessage()               {}
+func (*RequestUnion) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{51} }
 
 // A ResponseUnion contains exactly one of the optional responses.
 // The values added here must match those in RequestUnion.
 type ResponseUnion struct {
 	Get                *GetResponse                `protobuf:"bytes,1,opt,name=get" json:"get,omitempty"`
 	Put                *PutResponse                `protobuf:"bytes,2,opt,name=put" json:"put,omitempty"`
-	ConditionalPut     *ConditionalPutResponse     `protobuf:"bytes,3,opt,name=conditional_put" json:"conditional_put,omitempty"`
+	ConditionalPut     *ConditionalPutResponse     `protobuf:"bytes,3,opt,name=conditional_put,json=conditionalPut" json:"conditional_put,omitempty"`
 	Increment          *IncrementResponse          `protobuf:"bytes,4,opt,name=increment" json:"increment,omitempty"`
 	Delete             *DeleteResponse             `protobuf:"bytes,5,opt,name=delete" json:"delete,omitempty"`
-	DeleteRange        *DeleteRangeResponse        `protobuf:"bytes,6,opt,name=delete_range" json:"delete_range,omitempty"`
+	DeleteRange        *DeleteRangeResponse        `protobuf:"bytes,6,opt,name=delete_range,json=deleteRange" json:"delete_range,omitempty"`
 	Scan               *ScanResponse               `protobuf:"bytes,7,opt,name=scan" json:"scan,omitempty"`
-	BeginTransaction   *BeginTransactionResponse   `protobuf:"bytes,8,opt,name=begin_transaction" json:"begin_transaction,omitempty"`
-	EndTransaction     *EndTransactionResponse     `protobuf:"bytes,9,opt,name=end_transaction" json:"end_transaction,omitempty"`
-	AdminSplit         *AdminSplitResponse         `protobuf:"bytes,10,opt,name=admin_split" json:"admin_split,omitempty"`
-	AdminMerge         *AdminMergeResponse         `protobuf:"bytes,11,opt,name=admin_merge" json:"admin_merge,omitempty"`
-	HeartbeatTxn       *HeartbeatTxnResponse       `protobuf:"bytes,12,opt,name=heartbeat_txn" json:"heartbeat_txn,omitempty"`
+	BeginTransaction   *BeginTransactionResponse   `protobuf:"bytes,8,opt,name=begin_transaction,json=beginTransaction" json:"begin_transaction,omitempty"`
+	EndTransaction     *EndTransactionResponse     `protobuf:"bytes,9,opt,name=end_transaction,json=endTransaction" json:"end_transaction,omitempty"`
+	AdminSplit         *AdminSplitResponse         `protobuf:"bytes,10,opt,name=admin_split,json=adminSplit" json:"admin_split,omitempty"`
+	AdminMerge         *AdminMergeResponse         `protobuf:"bytes,11,opt,name=admin_merge,json=adminMerge" json:"admin_merge,omitempty"`
+	HeartbeatTxn       *HeartbeatTxnResponse       `protobuf:"bytes,12,opt,name=heartbeat_txn,json=heartbeatTxn" json:"heartbeat_txn,omitempty"`
 	Gc                 *GCResponse                 `protobuf:"bytes,13,opt,name=gc" json:"gc,omitempty"`
-	PushTxn            *PushTxnResponse            `protobuf:"bytes,14,opt,name=push_txn" json:"push_txn,omitempty"`
-	RangeLookup        *RangeLookupResponse        `protobuf:"bytes,15,opt,name=range_lookup" json:"range_lookup,omitempty"`
-	ResolveIntent      *ResolveIntentResponse      `protobuf:"bytes,16,opt,name=resolve_intent" json:"resolve_intent,omitempty"`
-	ResolveIntentRange *ResolveIntentRangeResponse `protobuf:"bytes,17,opt,name=resolve_intent_range" json:"resolve_intent_range,omitempty"`
+	PushTxn            *PushTxnResponse            `protobuf:"bytes,14,opt,name=push_txn,json=pushTxn" json:"push_txn,omitempty"`
+	RangeLookup        *RangeLookupResponse        `protobuf:"bytes,15,opt,name=range_lookup,json=rangeLookup" json:"range_lookup,omitempty"`
+	ResolveIntent      *ResolveIntentResponse      `protobuf:"bytes,16,opt,name=resolve_intent,json=resolveIntent" json:"resolve_intent,omitempty"`
+	ResolveIntentRange *ResolveIntentRangeResponse `protobuf:"bytes,17,opt,name=resolve_intent_range,json=resolveIntentRange" json:"resolve_intent_range,omitempty"`
 	Merge              *MergeResponse              `protobuf:"bytes,18,opt,name=merge" json:"merge,omitempty"`
-	TruncateLog        *TruncateLogResponse        `protobuf:"bytes,19,opt,name=truncate_log" json:"truncate_log,omitempty"`
-	LeaderLease        *LeaderLeaseResponse        `protobuf:"bytes,20,opt,name=leader_lease" json:"leader_lease,omitempty"`
-	ReverseScan        *ReverseScanResponse        `protobuf:"bytes,21,opt,name=reverse_scan" json:"reverse_scan,omitempty"`
-	Noop               *NoopResponse               `protobuf:"bytes,22,opt,name=noop" json:"noop,omitempty"`
+	TruncateLog        *TruncateLogResponse        `protobuf:"bytes,19,opt,name=truncate_log,json=truncateLog" json:"truncate_log,omitempty"`
+	LeaderLease        *LeaderLeaseResponse        `protobuf:"bytes,20,opt,name=leader_lease,json=leaderLease" json:"leader_lease,omitempty"`
+	ReverseScan        *ReverseScanResponse        `protobuf:"bytes,21,opt,name=reverse_scan,json=reverseScan" json:"reverse_scan,omitempty"`
+	ComputeChecksum    *ComputeChecksumResponse    `protobuf:"bytes,22,opt,name=compute_checksum,json=computeChecksum" json:"compute_checksum,omitempty"`
+	VerifyChecksum     *VerifyChecksumResponse     `protobuf:"bytes,23,opt,name=verify_checksum,json=verifyChecksum" json:"verify_checksum,omitempty"`
+	CheckConsistency   *CheckConsistencyResponse   `protobuf:"bytes,24,opt,name=check_consistency,json=checkConsistency" json:"check_consistency,omitempty"`
+	Noop               *NoopResponse               `protobuf:"bytes,25,opt,name=noop" json:"noop,omitempty"`
 }
 
-func (m *ResponseUnion) Reset()         { *m = ResponseUnion{} }
-func (m *ResponseUnion) String() string { return proto.CompactTextString(m) }
-func (*ResponseUnion) ProtoMessage()    {}
+func (m *ResponseUnion) Reset()                    { *m = ResponseUnion{} }
+func (m *ResponseUnion) String() string            { return proto.CompactTextString(m) }
+func (*ResponseUnion) ProtoMessage()               {}
+func (*ResponseUnion) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{52} }
 
 // A Header is attached to a BatchRequest, encapsulating routing and auxiliary
 // information required for executing it.
@@ -936,7 +1102,7 @@ type Header struct {
 	// range_id specifies the ID of the Raft consensus group which the key
 	// range belongs to. This is used by the receiving node to route the
 	// request to the correct range.
-	RangeID RangeID `protobuf:"varint,3,opt,name=range_id,casttype=RangeID" json:"range_id"`
+	RangeID RangeID `protobuf:"varint,3,opt,name=range_id,json=rangeId,casttype=RangeID" json:"range_id"`
 	// user_priority allows any command's priority to be biased from the
 	// default random priority. It specifies a multiple. If set to 0.5,
 	// the chosen priority will be 1/2x as likely to beat any default
@@ -946,7 +1112,7 @@ type Header struct {
 	// priority is treated the same as 1. This value is ignored if txn
 	// is specified. The min and max user priorities are set via
 	// MinUserPriority and MaxUserPriority in data.go.
-	UserPriority UserPriority `protobuf:"fixed64,4,opt,name=user_priority,casttype=UserPriority" json:"user_priority"`
+	UserPriority UserPriority `protobuf:"fixed64,4,opt,name=user_priority,json=userPriority,casttype=UserPriority" json:"user_priority"`
 	// txn is set non-nil if a transaction is underway. To start a txn,
 	// the first request should set this field to non-nil with name and
 	// isolation level set as desired. The response will contain the
@@ -956,28 +1122,30 @@ type Header struct {
 	// read_consistency specifies the consistency for read
 	// operations. The default is CONSISTENT. This value is ignored for
 	// write operations.
-	ReadConsistency ReadConsistencyType `protobuf:"varint,6,opt,name=read_consistency,enum=cockroach.roachpb.ReadConsistencyType" json:"read_consistency"`
+	ReadConsistency ReadConsistencyType `protobuf:"varint,6,opt,name=read_consistency,json=readConsistency,enum=cockroach.roachpb.ReadConsistencyType" json:"read_consistency"`
+	// trace, if set, is the active span of an OpenTracing distributed trace.
+	Trace *cockroach_util_tracing.Span `protobuf:"bytes,7,opt,name=trace" json:"trace,omitempty"`
+	// if set to a non-zero value, limits the total number of results for
+	// Scan/ReverseScan requests in the batch.
+	MaxScanResults int64 `protobuf:"varint,8,opt,name=max_scan_results,json=maxScanResults" json:"max_scan_results"`
 }
 
-func (m *Header) Reset()         { *m = Header{} }
-func (m *Header) String() string { return proto.CompactTextString(m) }
-func (*Header) ProtoMessage()    {}
+func (m *Header) Reset()                    { *m = Header{} }
+func (m *Header) String() string            { return proto.CompactTextString(m) }
+func (*Header) ProtoMessage()               {}
+func (*Header) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{53} }
 
 // A BatchRequest contains one or more requests to be executed in
 // parallel, or if applicable (based on write-only commands and
 // range-locality), as a single update.
-//
-// The Span should contain the Key of the first request
-// in the batch. It also contains the transaction itself; individual
-// calls must not have transactions specified. The same applies to
-// the User and UserPriority fields.
 type BatchRequest struct {
 	Header   `protobuf:"bytes,1,opt,name=header,embedded=header" json:"header"`
 	Requests []RequestUnion `protobuf:"bytes,2,rep,name=requests" json:"requests"`
 }
 
-func (m *BatchRequest) Reset()      { *m = BatchRequest{} }
-func (*BatchRequest) ProtoMessage() {}
+func (m *BatchRequest) Reset()                    { *m = BatchRequest{} }
+func (*BatchRequest) ProtoMessage()               {}
+func (*BatchRequest) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{54} }
 
 // A BatchResponse contains one or more responses, one per request
 // corresponding to the requests in the matching BatchRequest. The
@@ -988,29 +1156,46 @@ type BatchResponse struct {
 	Responses            []ResponseUnion `protobuf:"bytes,2,rep,name=responses" json:"responses"`
 }
 
-func (m *BatchResponse) Reset()      { *m = BatchResponse{} }
-func (*BatchResponse) ProtoMessage() {}
+func (m *BatchResponse) Reset()                    { *m = BatchResponse{} }
+func (*BatchResponse) ProtoMessage()               {}
+func (*BatchResponse) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{55} }
 
 type BatchResponse_Header struct {
 	// error is non-nil if an error occurred.
 	Error *Error `protobuf:"bytes,1,opt,name=error" json:"error,omitempty"`
-	// timestamp specifies time at which read or write actually was
-	// performed. In the case of both reads and writes, if the timestamp
-	// supplied to the request was 0, the wall time of the node
-	// servicing the request will be set here. Additionally, in the case
-	// of writes, this value may be increased from the timestamp passed
-	// with the Span if the key being written was either read
-	// or written more recently.
-	Timestamp Timestamp `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp"`
+	// timestamp is set only for non-transactional responses and denotes the
+	// highest timestamp at which a command from the batch executed. At the
+	// time of writing, it is used solely for informational purposes and tests.
+	Timestamp Timestamp `protobuf:"bytes,2,opt,name=Timestamp,json=timestamp" json:"Timestamp"`
 	// txn is non-nil if the request specified a non-nil
 	// transaction. The transaction timestamp and/or priority may have
 	// been updated, depending on the outcome of the request.
 	Txn *Transaction `protobuf:"bytes,3,opt,name=txn" json:"txn,omitempty"`
+	// collected_spans is a binary representation of the trace spans
+	// generated during the execution of this request.
+	CollectedSpans [][]byte `protobuf:"bytes,4,rep,name=collected_spans,json=collectedSpans" json:"collected_spans,omitempty"`
+	// now is the current time at the node sending the response,
+	// which can be used by the receiver to update its local HLC.
+	Now Timestamp `protobuf:"bytes,5,opt,name=now" json:"now"`
 }
 
-func (m *BatchResponse_Header) Reset()         { *m = BatchResponse_Header{} }
-func (m *BatchResponse_Header) String() string { return proto.CompactTextString(m) }
-func (*BatchResponse_Header) ProtoMessage()    {}
+func (m *BatchResponse_Header) Reset()                    { *m = BatchResponse_Header{} }
+func (m *BatchResponse_Header) String() string            { return proto.CompactTextString(m) }
+func (*BatchResponse_Header) ProtoMessage()               {}
+func (*BatchResponse_Header) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{55, 0} }
+
+// A RaftCommand is a command which can be serialized and sent via
+// raft.
+type RaftCommand struct {
+	RangeID       RangeID           `protobuf:"varint,1,opt,name=range_id,json=rangeId,casttype=RangeID" json:"range_id"`
+	OriginReplica ReplicaDescriptor `protobuf:"bytes,2,opt,name=origin_replica,json=originReplica" json:"origin_replica"`
+	Cmd           BatchRequest      `protobuf:"bytes,3,opt,name=cmd" json:"cmd"`
+}
+
+func (m *RaftCommand) Reset()                    { *m = RaftCommand{} }
+func (m *RaftCommand) String() string            { return proto.CompactTextString(m) }
+func (*RaftCommand) ProtoMessage()               {}
+func (*RaftCommand) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{56} }
 
 func init() {
 	proto.RegisterType((*ResponseHeader)(nil), "cockroach.roachpb.ResponseHeader")
@@ -1030,6 +1215,8 @@ func init() {
 	proto.RegisterType((*ScanResponse)(nil), "cockroach.roachpb.ScanResponse")
 	proto.RegisterType((*ReverseScanRequest)(nil), "cockroach.roachpb.ReverseScanRequest")
 	proto.RegisterType((*ReverseScanResponse)(nil), "cockroach.roachpb.ReverseScanResponse")
+	proto.RegisterType((*CheckConsistencyRequest)(nil), "cockroach.roachpb.CheckConsistencyRequest")
+	proto.RegisterType((*CheckConsistencyResponse)(nil), "cockroach.roachpb.CheckConsistencyResponse")
 	proto.RegisterType((*BeginTransactionRequest)(nil), "cockroach.roachpb.BeginTransactionRequest")
 	proto.RegisterType((*BeginTransactionResponse)(nil), "cockroach.roachpb.BeginTransactionResponse")
 	proto.RegisterType((*EndTransactionRequest)(nil), "cockroach.roachpb.EndTransactionRequest")
@@ -1059,15 +1246,139 @@ func init() {
 	proto.RegisterType((*TruncateLogResponse)(nil), "cockroach.roachpb.TruncateLogResponse")
 	proto.RegisterType((*LeaderLeaseRequest)(nil), "cockroach.roachpb.LeaderLeaseRequest")
 	proto.RegisterType((*LeaderLeaseResponse)(nil), "cockroach.roachpb.LeaderLeaseResponse")
+	proto.RegisterType((*ComputeChecksumRequest)(nil), "cockroach.roachpb.ComputeChecksumRequest")
+	proto.RegisterType((*ComputeChecksumResponse)(nil), "cockroach.roachpb.ComputeChecksumResponse")
+	proto.RegisterType((*VerifyChecksumRequest)(nil), "cockroach.roachpb.VerifyChecksumRequest")
+	proto.RegisterType((*VerifyChecksumResponse)(nil), "cockroach.roachpb.VerifyChecksumResponse")
 	proto.RegisterType((*RequestUnion)(nil), "cockroach.roachpb.RequestUnion")
 	proto.RegisterType((*ResponseUnion)(nil), "cockroach.roachpb.ResponseUnion")
 	proto.RegisterType((*Header)(nil), "cockroach.roachpb.Header")
 	proto.RegisterType((*BatchRequest)(nil), "cockroach.roachpb.BatchRequest")
 	proto.RegisterType((*BatchResponse)(nil), "cockroach.roachpb.BatchResponse")
 	proto.RegisterType((*BatchResponse_Header)(nil), "cockroach.roachpb.BatchResponse.Header")
+	proto.RegisterType((*RaftCommand)(nil), "cockroach.roachpb.RaftCommand")
 	proto.RegisterEnum("cockroach.roachpb.ReadConsistencyType", ReadConsistencyType_name, ReadConsistencyType_value)
 	proto.RegisterEnum("cockroach.roachpb.PushTxnType", PushTxnType_name, PushTxnType_value)
 }
+
+// Reference imports to suppress errors if they are not otherwise used.
+var _ context.Context
+var _ grpc.ClientConn
+
+// Client API for Internal service
+
+type InternalClient interface {
+	Batch(ctx context.Context, in *BatchRequest, opts ...grpc.CallOption) (*BatchResponse, error)
+}
+
+type internalClient struct {
+	cc *grpc.ClientConn
+}
+
+func NewInternalClient(cc *grpc.ClientConn) InternalClient {
+	return &internalClient{cc}
+}
+
+func (c *internalClient) Batch(ctx context.Context, in *BatchRequest, opts ...grpc.CallOption) (*BatchResponse, error) {
+	out := new(BatchResponse)
+	err := grpc.Invoke(ctx, "/cockroach.roachpb.Internal/Batch", in, out, c.cc, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Server API for Internal service
+
+type InternalServer interface {
+	Batch(context.Context, *BatchRequest) (*BatchResponse, error)
+}
+
+func RegisterInternalServer(s *grpc.Server, srv InternalServer) {
+	s.RegisterService(&_Internal_serviceDesc, srv)
+}
+
+func _Internal_Batch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error) (interface{}, error) {
+	in := new(BatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	out, err := srv.(InternalServer).Batch(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+var _Internal_serviceDesc = grpc.ServiceDesc{
+	ServiceName: "cockroach.roachpb.Internal",
+	HandlerType: (*InternalServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Batch",
+			Handler:    _Internal_Batch_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{},
+}
+
+// Client API for External service
+
+type ExternalClient interface {
+	Batch(ctx context.Context, in *BatchRequest, opts ...grpc.CallOption) (*BatchResponse, error)
+}
+
+type externalClient struct {
+	cc *grpc.ClientConn
+}
+
+func NewExternalClient(cc *grpc.ClientConn) ExternalClient {
+	return &externalClient{cc}
+}
+
+func (c *externalClient) Batch(ctx context.Context, in *BatchRequest, opts ...grpc.CallOption) (*BatchResponse, error) {
+	out := new(BatchResponse)
+	err := grpc.Invoke(ctx, "/cockroach.roachpb.External/Batch", in, out, c.cc, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Server API for External service
+
+type ExternalServer interface {
+	Batch(context.Context, *BatchRequest) (*BatchResponse, error)
+}
+
+func RegisterExternalServer(s *grpc.Server, srv ExternalServer) {
+	s.RegisterService(&_External_serviceDesc, srv)
+}
+
+func _External_Batch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error) (interface{}, error) {
+	in := new(BatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	out, err := srv.(ExternalServer).Batch(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+var _External_serviceDesc = grpc.ServiceDesc{
+	ServiceName: "cockroach.roachpb.External",
+	HandlerType: (*ExternalServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Batch",
+			Handler:    _External_Batch_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{},
+}
+
 func (m *ResponseHeader) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
@@ -1083,23 +1394,15 @@ func (m *ResponseHeader) MarshalTo(data []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	data[i] = 0x12
-	i++
-	i = encodeVarintApi(data, i, uint64(m.Timestamp.Size()))
-	n1, err := m.Timestamp.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n1
 	if m.Txn != nil {
 		data[i] = 0x1a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Txn.Size()))
-		n2, err := m.Txn.MarshalTo(data[i:])
+		n1, err := m.Txn.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n2
+		i += n1
 	}
 	return i, nil
 }
@@ -1122,11 +1425,11 @@ func (m *GetRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n3, err := m.Span.MarshalTo(data[i:])
+	n2, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n3
+	i += n2
 	return i, nil
 }
 
@@ -1148,20 +1451,20 @@ func (m *GetResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n4, err := m.ResponseHeader.MarshalTo(data[i:])
+	n3, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n4
+	i += n3
 	if m.Value != nil {
 		data[i] = 0x12
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Value.Size()))
-		n5, err := m.Value.MarshalTo(data[i:])
+		n4, err := m.Value.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n5
+		i += n4
 	}
 	return i, nil
 }
@@ -1184,19 +1487,27 @@ func (m *PutRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n6, err := m.Span.MarshalTo(data[i:])
+	n5, err := m.Span.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n5
+	data[i] = 0x12
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Value.Size()))
+	n6, err := m.Value.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n6
-	data[i] = 0x12
+	data[i] = 0x18
 	i++
-	i = encodeVarintApi(data, i, uint64(m.Value.Size()))
-	n7, err := m.Value.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
+	if m.Inline {
+		data[i] = 1
+	} else {
+		data[i] = 0
 	}
-	i += n7
+	i++
 	return i, nil
 }
 
@@ -1218,11 +1529,11 @@ func (m *PutResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n8, err := m.ResponseHeader.MarshalTo(data[i:])
+	n7, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n8
+	i += n7
 	return i, nil
 }
 
@@ -1244,28 +1555,28 @@ func (m *ConditionalPutRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n9, err := m.Span.MarshalTo(data[i:])
+	n8, err := m.Span.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n8
+	data[i] = 0x12
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Value.Size()))
+	n9, err := m.Value.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n9
-	data[i] = 0x12
-	i++
-	i = encodeVarintApi(data, i, uint64(m.Value.Size()))
-	n10, err := m.Value.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n10
 	if m.ExpValue != nil {
 		data[i] = 0x1a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ExpValue.Size()))
-		n11, err := m.ExpValue.MarshalTo(data[i:])
+		n10, err := m.ExpValue.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n11
+		i += n10
 	}
 	return i, nil
 }
@@ -1288,11 +1599,11 @@ func (m *ConditionalPutResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n12, err := m.ResponseHeader.MarshalTo(data[i:])
+	n11, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n12
+	i += n11
 	return i, nil
 }
 
@@ -1314,11 +1625,11 @@ func (m *IncrementRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n13, err := m.Span.MarshalTo(data[i:])
+	n12, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n13
+	i += n12
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Increment))
@@ -1343,11 +1654,11 @@ func (m *IncrementResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n14, err := m.ResponseHeader.MarshalTo(data[i:])
+	n13, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n14
+	i += n13
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.NewValue))
@@ -1372,11 +1683,11 @@ func (m *DeleteRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n15, err := m.Span.MarshalTo(data[i:])
+	n14, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n15
+	i += n14
 	return i, nil
 }
 
@@ -1398,11 +1709,11 @@ func (m *DeleteResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n16, err := m.ResponseHeader.MarshalTo(data[i:])
+	n15, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n16
+	i += n15
 	return i, nil
 }
 
@@ -1424,14 +1735,22 @@ func (m *DeleteRangeRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n17, err := m.Span.MarshalTo(data[i:])
+	n16, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n17
+	i += n16
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.MaxEntriesToDelete))
+	data[i] = 0x18
+	i++
+	if m.ReturnKeys {
+		data[i] = 1
+	} else {
+		data[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -1453,14 +1772,19 @@ func (m *DeleteRangeResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n18, err := m.ResponseHeader.MarshalTo(data[i:])
+	n17, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n18
-	data[i] = 0x10
-	i++
-	i = encodeVarintApi(data, i, uint64(m.NumDeleted))
+	i += n17
+	if len(m.Keys) > 0 {
+		for _, b := range m.Keys {
+			data[i] = 0x12
+			i++
+			i = encodeVarintApi(data, i, uint64(len(b)))
+			i += copy(data[i:], b)
+		}
+	}
 	return i, nil
 }
 
@@ -1482,11 +1806,11 @@ func (m *ScanRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n19, err := m.Span.MarshalTo(data[i:])
+	n18, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n19
+	i += n18
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.MaxResults))
@@ -1511,11 +1835,11 @@ func (m *ScanResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n20, err := m.ResponseHeader.MarshalTo(data[i:])
+	n19, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n20
+	i += n19
 	if len(m.Rows) > 0 {
 		for _, msg := range m.Rows {
 			data[i] = 0x12
@@ -1549,11 +1873,11 @@ func (m *ReverseScanRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n21, err := m.Span.MarshalTo(data[i:])
+	n20, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n21
+	i += n20
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.MaxResults))
@@ -1578,11 +1902,11 @@ func (m *ReverseScanResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n22, err := m.ResponseHeader.MarshalTo(data[i:])
+	n21, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n22
+	i += n21
 	if len(m.Rows) > 0 {
 		for _, msg := range m.Rows {
 			data[i] = 0x12
@@ -1595,6 +1919,66 @@ func (m *ReverseScanResponse) MarshalTo(data []byte) (int, error) {
 			i += n
 		}
 	}
+	return i, nil
+}
+
+func (m *CheckConsistencyRequest) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *CheckConsistencyRequest) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
+	n22, err := m.Span.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n22
+	data[i] = 0x10
+	i++
+	if m.WithDiff {
+		data[i] = 1
+	} else {
+		data[i] = 0
+	}
+	i++
+	return i, nil
+}
+
+func (m *CheckConsistencyResponse) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *CheckConsistencyResponse) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
+	n23, err := m.ResponseHeader.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n23
 	return i, nil
 }
 
@@ -1616,11 +2000,11 @@ func (m *BeginTransactionRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n23, err := m.Span.MarshalTo(data[i:])
+	n24, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n23
+	i += n24
 	return i, nil
 }
 
@@ -1642,11 +2026,11 @@ func (m *BeginTransactionResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n24, err := m.ResponseHeader.MarshalTo(data[i:])
+	n25, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n24
+	i += n25
 	return i, nil
 }
 
@@ -1668,11 +2052,11 @@ func (m *EndTransactionRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n25, err := m.Span.MarshalTo(data[i:])
+	n26, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n25
+	i += n26
 	data[i] = 0x10
 	i++
 	if m.Commit {
@@ -1685,21 +2069,21 @@ func (m *EndTransactionRequest) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Deadline.Size()))
-		n26, err := m.Deadline.MarshalTo(data[i:])
+		n27, err := m.Deadline.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n26
+		i += n27
 	}
 	if m.InternalCommitTrigger != nil {
 		data[i] = 0x22
 		i++
 		i = encodeVarintApi(data, i, uint64(m.InternalCommitTrigger.Size()))
-		n27, err := m.InternalCommitTrigger.MarshalTo(data[i:])
+		n28, err := m.InternalCommitTrigger.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n27
+		i += n28
 	}
 	if len(m.IntentSpans) > 0 {
 		for _, msg := range m.IntentSpans {
@@ -1734,22 +2118,30 @@ func (m *EndTransactionResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n28, err := m.ResponseHeader.MarshalTo(data[i:])
+	n29, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n28
+	i += n29
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.CommitWait))
-	if len(m.Resolved) > 0 {
-		for _, b := range m.Resolved {
+	if len(m.DEPRECATEDResolved) > 0 {
+		for _, b := range m.DEPRECATEDResolved {
 			data[i] = 0x1a
 			i++
 			i = encodeVarintApi(data, i, uint64(len(b)))
 			i += copy(data[i:], b)
 		}
 	}
+	data[i] = 0x20
+	i++
+	if m.OnePhaseCommit {
+		data[i] = 1
+	} else {
+		data[i] = 0
+	}
+	i++
 	return i, nil
 }
 
@@ -1771,11 +2163,11 @@ func (m *AdminSplitRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n29, err := m.Span.MarshalTo(data[i:])
+	n30, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n29
+	i += n30
 	if m.SplitKey != nil {
 		data[i] = 0x12
 		i++
@@ -1803,11 +2195,11 @@ func (m *AdminSplitResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n30, err := m.ResponseHeader.MarshalTo(data[i:])
+	n31, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n30
+	i += n31
 	return i, nil
 }
 
@@ -1829,11 +2221,11 @@ func (m *AdminMergeRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n31, err := m.Span.MarshalTo(data[i:])
+	n32, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n31
+	i += n32
 	return i, nil
 }
 
@@ -1855,11 +2247,11 @@ func (m *AdminMergeResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n32, err := m.ResponseHeader.MarshalTo(data[i:])
+	n33, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n32
+	i += n33
 	return i, nil
 }
 
@@ -1881,11 +2273,11 @@ func (m *RangeLookupRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n33, err := m.Span.MarshalTo(data[i:])
+	n34, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n33
+	i += n34
 	data[i] = 0x10
 	i++
 	i = encodeVarintApi(data, i, uint64(m.MaxRanges))
@@ -1926,14 +2318,26 @@ func (m *RangeLookupResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n34, err := m.ResponseHeader.MarshalTo(data[i:])
+	n35, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n34
+	i += n35
 	if len(m.Ranges) > 0 {
 		for _, msg := range m.Ranges {
 			data[i] = 0x12
+			i++
+			i = encodeVarintApi(data, i, uint64(msg.Size()))
+			n, err := msg.MarshalTo(data[i:])
+			if err != nil {
+				return 0, err
+			}
+			i += n
+		}
+	}
+	if len(m.PrefetchedRanges) > 0 {
+		for _, msg := range m.PrefetchedRanges {
+			data[i] = 0x1a
 			i++
 			i = encodeVarintApi(data, i, uint64(msg.Size()))
 			n, err := msg.MarshalTo(data[i:])
@@ -1964,11 +2368,19 @@ func (m *HeartbeatTxnRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n35, err := m.Span.MarshalTo(data[i:])
+	n36, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n35
+	i += n36
+	data[i] = 0x12
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Now.Size()))
+	n37, err := m.Now.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n37
 	return i, nil
 }
 
@@ -1990,11 +2402,11 @@ func (m *HeartbeatTxnResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n36, err := m.ResponseHeader.MarshalTo(data[i:])
+	n38, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n36
+	i += n38
 	return i, nil
 }
 
@@ -2016,11 +2428,11 @@ func (m *GCRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n37, err := m.Span.MarshalTo(data[i:])
+	n39, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n37
+	i += n39
 	if len(m.Keys) > 0 {
 		for _, msg := range m.Keys {
 			data[i] = 0x1a
@@ -2060,11 +2472,11 @@ func (m *GCRequest_GCKey) MarshalTo(data []byte) (int, error) {
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Timestamp.Size()))
-	n38, err := m.Timestamp.MarshalTo(data[i:])
+	n40, err := m.Timestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n38
+	i += n40
 	return i, nil
 }
 
@@ -2086,11 +2498,11 @@ func (m *GCResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n39, err := m.ResponseHeader.MarshalTo(data[i:])
+	n41, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n39
+	i += n41
 	return i, nil
 }
 
@@ -2112,43 +2524,43 @@ func (m *PushTxnRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n40, err := m.Span.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n40
-	data[i] = 0x12
-	i++
-	i = encodeVarintApi(data, i, uint64(m.PusherTxn.Size()))
-	n41, err := m.PusherTxn.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n41
-	data[i] = 0x1a
-	i++
-	i = encodeVarintApi(data, i, uint64(m.PusheeTxn.Size()))
-	n42, err := m.PusheeTxn.MarshalTo(data[i:])
+	n42, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n42
-	data[i] = 0x22
+	data[i] = 0x12
 	i++
-	i = encodeVarintApi(data, i, uint64(m.PushTo.Size()))
-	n43, err := m.PushTo.MarshalTo(data[i:])
+	i = encodeVarintApi(data, i, uint64(m.PusherTxn.Size()))
+	n43, err := m.PusherTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n43
-	data[i] = 0x2a
+	data[i] = 0x1a
 	i++
-	i = encodeVarintApi(data, i, uint64(m.Now.Size()))
-	n44, err := m.Now.MarshalTo(data[i:])
+	i = encodeVarintApi(data, i, uint64(m.PusheeTxn.Size()))
+	n44, err := m.PusheeTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
 	i += n44
+	data[i] = 0x22
+	i++
+	i = encodeVarintApi(data, i, uint64(m.PushTo.Size()))
+	n45, err := m.PushTo.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n45
+	data[i] = 0x2a
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Now.Size()))
+	n46, err := m.Now.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n46
 	data[i] = 0x30
 	i++
 	i = encodeVarintApi(data, i, uint64(m.PushType))
@@ -2173,19 +2585,19 @@ func (m *PushTxnResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n45, err := m.ResponseHeader.MarshalTo(data[i:])
+	n47, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n45
+	i += n47
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.PusheeTxn.Size()))
-	n46, err := m.PusheeTxn.MarshalTo(data[i:])
+	n48, err := m.PusheeTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n46
+	i += n48
 	return i, nil
 }
 
@@ -2207,19 +2619,19 @@ func (m *ResolveIntentRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n47, err := m.Span.MarshalTo(data[i:])
+	n49, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n47
+	i += n49
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.IntentTxn.Size()))
-	n48, err := m.IntentTxn.MarshalTo(data[i:])
+	n50, err := m.IntentTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n48
+	i += n50
 	data[i] = 0x18
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Status))
@@ -2252,11 +2664,11 @@ func (m *ResolveIntentResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n49, err := m.ResponseHeader.MarshalTo(data[i:])
+	n51, err := m.ResponseHeader.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n49
+	i += n51
 	return i, nil
 }
 
@@ -2278,19 +2690,19 @@ func (m *ResolveIntentRangeRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n50, err := m.Span.MarshalTo(data[i:])
+	n52, err := m.Span.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n50
+	i += n52
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.IntentTxn.Size()))
-	n51, err := m.IntentTxn.MarshalTo(data[i:])
+	n53, err := m.IntentTxn.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n51
+	i += n53
 	data[i] = 0x18
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Status))
@@ -2320,14 +2732,6 @@ func (m *NoopResponse) MarshalTo(data []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	data[i] = 0xa
-	i++
-	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
-	n52, err := m.ResponseHeader.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n52
 	return i, nil
 }
 
@@ -2346,14 +2750,6 @@ func (m *NoopRequest) MarshalTo(data []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
-	data[i] = 0xa
-	i++
-	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
-	n53, err := m.Span.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n53
 	return i, nil
 }
 
@@ -2561,6 +2957,156 @@ func (m *LeaderLeaseResponse) MarshalTo(data []byte) (int, error) {
 	return i, nil
 }
 
+func (m *ComputeChecksumRequest) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *ComputeChecksumRequest) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
+	n63, err := m.Span.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n63
+	data[i] = 0x10
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Version))
+	data[i] = 0x1a
+	i++
+	i = encodeVarintApi(data, i, uint64(m.ChecksumID.Size()))
+	n64, err := m.ChecksumID.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n64
+	data[i] = 0x20
+	i++
+	if m.Snapshot {
+		data[i] = 1
+	} else {
+		data[i] = 0
+	}
+	i++
+	return i, nil
+}
+
+func (m *ComputeChecksumResponse) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *ComputeChecksumResponse) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
+	n65, err := m.ResponseHeader.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n65
+	return i, nil
+}
+
+func (m *VerifyChecksumRequest) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *VerifyChecksumRequest) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Span.Size()))
+	n66, err := m.Span.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n66
+	data[i] = 0x10
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Version))
+	data[i] = 0x1a
+	i++
+	i = encodeVarintApi(data, i, uint64(m.ChecksumID.Size()))
+	n67, err := m.ChecksumID.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n67
+	if m.Checksum != nil {
+		data[i] = 0x22
+		i++
+		i = encodeVarintApi(data, i, uint64(len(m.Checksum)))
+		i += copy(data[i:], m.Checksum)
+	}
+	if m.Snapshot != nil {
+		data[i] = 0x2a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Snapshot.Size()))
+		n68, err := m.Snapshot.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n68
+	}
+	return i, nil
+}
+
+func (m *VerifyChecksumResponse) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *VerifyChecksumResponse) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintApi(data, i, uint64(m.ResponseHeader.Size()))
+	n69, err := m.ResponseHeader.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n69
+	return i, nil
+}
+
 func (m *RequestUnion) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
@@ -2580,151 +3126,151 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0xa
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Get.Size()))
-		n63, err := m.Get.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n63
-	}
-	if m.Put != nil {
-		data[i] = 0x12
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Put.Size()))
-		n64, err := m.Put.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n64
-	}
-	if m.ConditionalPut != nil {
-		data[i] = 0x1a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.ConditionalPut.Size()))
-		n65, err := m.ConditionalPut.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n65
-	}
-	if m.Increment != nil {
-		data[i] = 0x22
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Increment.Size()))
-		n66, err := m.Increment.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n66
-	}
-	if m.Delete != nil {
-		data[i] = 0x2a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Delete.Size()))
-		n67, err := m.Delete.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n67
-	}
-	if m.DeleteRange != nil {
-		data[i] = 0x32
-		i++
-		i = encodeVarintApi(data, i, uint64(m.DeleteRange.Size()))
-		n68, err := m.DeleteRange.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n68
-	}
-	if m.Scan != nil {
-		data[i] = 0x3a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Scan.Size()))
-		n69, err := m.Scan.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n69
-	}
-	if m.BeginTransaction != nil {
-		data[i] = 0x42
-		i++
-		i = encodeVarintApi(data, i, uint64(m.BeginTransaction.Size()))
-		n70, err := m.BeginTransaction.MarshalTo(data[i:])
+		n70, err := m.Get.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n70
 	}
-	if m.EndTransaction != nil {
-		data[i] = 0x4a
+	if m.Put != nil {
+		data[i] = 0x12
 		i++
-		i = encodeVarintApi(data, i, uint64(m.EndTransaction.Size()))
-		n71, err := m.EndTransaction.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Put.Size()))
+		n71, err := m.Put.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n71
 	}
-	if m.AdminSplit != nil {
-		data[i] = 0x52
+	if m.ConditionalPut != nil {
+		data[i] = 0x1a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.AdminSplit.Size()))
-		n72, err := m.AdminSplit.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.ConditionalPut.Size()))
+		n72, err := m.ConditionalPut.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n72
 	}
-	if m.AdminMerge != nil {
-		data[i] = 0x5a
+	if m.Increment != nil {
+		data[i] = 0x22
 		i++
-		i = encodeVarintApi(data, i, uint64(m.AdminMerge.Size()))
-		n73, err := m.AdminMerge.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Increment.Size()))
+		n73, err := m.Increment.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n73
 	}
-	if m.HeartbeatTxn != nil {
-		data[i] = 0x62
+	if m.Delete != nil {
+		data[i] = 0x2a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.HeartbeatTxn.Size()))
-		n74, err := m.HeartbeatTxn.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Delete.Size()))
+		n74, err := m.Delete.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n74
 	}
-	if m.Gc != nil {
-		data[i] = 0x6a
+	if m.DeleteRange != nil {
+		data[i] = 0x32
 		i++
-		i = encodeVarintApi(data, i, uint64(m.Gc.Size()))
-		n75, err := m.Gc.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.DeleteRange.Size()))
+		n75, err := m.DeleteRange.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n75
 	}
-	if m.PushTxn != nil {
-		data[i] = 0x72
+	if m.Scan != nil {
+		data[i] = 0x3a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.PushTxn.Size()))
-		n76, err := m.PushTxn.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Scan.Size()))
+		n76, err := m.Scan.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n76
 	}
-	if m.RangeLookup != nil {
-		data[i] = 0x7a
+	if m.BeginTransaction != nil {
+		data[i] = 0x42
 		i++
-		i = encodeVarintApi(data, i, uint64(m.RangeLookup.Size()))
-		n77, err := m.RangeLookup.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.BeginTransaction.Size()))
+		n77, err := m.BeginTransaction.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n77
+	}
+	if m.EndTransaction != nil {
+		data[i] = 0x4a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.EndTransaction.Size()))
+		n78, err := m.EndTransaction.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n78
+	}
+	if m.AdminSplit != nil {
+		data[i] = 0x52
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminSplit.Size()))
+		n79, err := m.AdminSplit.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n79
+	}
+	if m.AdminMerge != nil {
+		data[i] = 0x5a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminMerge.Size()))
+		n80, err := m.AdminMerge.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n80
+	}
+	if m.HeartbeatTxn != nil {
+		data[i] = 0x62
+		i++
+		i = encodeVarintApi(data, i, uint64(m.HeartbeatTxn.Size()))
+		n81, err := m.HeartbeatTxn.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n81
+	}
+	if m.Gc != nil {
+		data[i] = 0x6a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Gc.Size()))
+		n82, err := m.Gc.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n82
+	}
+	if m.PushTxn != nil {
+		data[i] = 0x72
+		i++
+		i = encodeVarintApi(data, i, uint64(m.PushTxn.Size()))
+		n83, err := m.PushTxn.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n83
+	}
+	if m.RangeLookup != nil {
+		data[i] = 0x7a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.RangeLookup.Size()))
+		n84, err := m.RangeLookup.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n84
 	}
 	if m.ResolveIntent != nil {
 		data[i] = 0x82
@@ -2732,11 +3278,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ResolveIntent.Size()))
-		n78, err := m.ResolveIntent.MarshalTo(data[i:])
+		n85, err := m.ResolveIntent.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n78
+		i += n85
 	}
 	if m.ResolveIntentRange != nil {
 		data[i] = 0x8a
@@ -2744,11 +3290,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ResolveIntentRange.Size()))
-		n79, err := m.ResolveIntentRange.MarshalTo(data[i:])
+		n86, err := m.ResolveIntentRange.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n79
+		i += n86
 	}
 	if m.Merge != nil {
 		data[i] = 0x92
@@ -2756,11 +3302,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Merge.Size()))
-		n80, err := m.Merge.MarshalTo(data[i:])
+		n87, err := m.Merge.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n80
+		i += n87
 	}
 	if m.TruncateLog != nil {
 		data[i] = 0x9a
@@ -2768,11 +3314,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.TruncateLog.Size()))
-		n81, err := m.TruncateLog.MarshalTo(data[i:])
+		n88, err := m.TruncateLog.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n81
+		i += n88
 	}
 	if m.LeaderLease != nil {
 		data[i] = 0xa2
@@ -2780,11 +3326,11 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.LeaderLease.Size()))
-		n82, err := m.LeaderLease.MarshalTo(data[i:])
+		n89, err := m.LeaderLease.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n82
+		i += n89
 	}
 	if m.ReverseScan != nil {
 		data[i] = 0xaa
@@ -2792,23 +3338,59 @@ func (m *RequestUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ReverseScan.Size()))
-		n83, err := m.ReverseScan.MarshalTo(data[i:])
+		n90, err := m.ReverseScan.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n83
+		i += n90
 	}
-	if m.Noop != nil {
+	if m.ComputeChecksum != nil {
 		data[i] = 0xb2
 		i++
 		data[i] = 0x1
 		i++
-		i = encodeVarintApi(data, i, uint64(m.Noop.Size()))
-		n84, err := m.Noop.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.ComputeChecksum.Size()))
+		n91, err := m.ComputeChecksum.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n84
+		i += n91
+	}
+	if m.VerifyChecksum != nil {
+		data[i] = 0xba
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.VerifyChecksum.Size()))
+		n92, err := m.VerifyChecksum.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n92
+	}
+	if m.CheckConsistency != nil {
+		data[i] = 0xc2
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.CheckConsistency.Size()))
+		n93, err := m.CheckConsistency.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n93
+	}
+	if m.Noop != nil {
+		data[i] = 0xca
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Noop.Size()))
+		n94, err := m.Noop.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n94
 	}
 	return i, nil
 }
@@ -2832,151 +3414,151 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0xa
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Get.Size()))
-		n85, err := m.Get.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n85
-	}
-	if m.Put != nil {
-		data[i] = 0x12
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Put.Size()))
-		n86, err := m.Put.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n86
-	}
-	if m.ConditionalPut != nil {
-		data[i] = 0x1a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.ConditionalPut.Size()))
-		n87, err := m.ConditionalPut.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n87
-	}
-	if m.Increment != nil {
-		data[i] = 0x22
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Increment.Size()))
-		n88, err := m.Increment.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n88
-	}
-	if m.Delete != nil {
-		data[i] = 0x2a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Delete.Size()))
-		n89, err := m.Delete.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n89
-	}
-	if m.DeleteRange != nil {
-		data[i] = 0x32
-		i++
-		i = encodeVarintApi(data, i, uint64(m.DeleteRange.Size()))
-		n90, err := m.DeleteRange.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n90
-	}
-	if m.Scan != nil {
-		data[i] = 0x3a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.Scan.Size()))
-		n91, err := m.Scan.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n91
-	}
-	if m.BeginTransaction != nil {
-		data[i] = 0x42
-		i++
-		i = encodeVarintApi(data, i, uint64(m.BeginTransaction.Size()))
-		n92, err := m.BeginTransaction.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n92
-	}
-	if m.EndTransaction != nil {
-		data[i] = 0x4a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.EndTransaction.Size()))
-		n93, err := m.EndTransaction.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n93
-	}
-	if m.AdminSplit != nil {
-		data[i] = 0x52
-		i++
-		i = encodeVarintApi(data, i, uint64(m.AdminSplit.Size()))
-		n94, err := m.AdminSplit.MarshalTo(data[i:])
-		if err != nil {
-			return 0, err
-		}
-		i += n94
-	}
-	if m.AdminMerge != nil {
-		data[i] = 0x5a
-		i++
-		i = encodeVarintApi(data, i, uint64(m.AdminMerge.Size()))
-		n95, err := m.AdminMerge.MarshalTo(data[i:])
+		n95, err := m.Get.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n95
 	}
-	if m.HeartbeatTxn != nil {
-		data[i] = 0x62
+	if m.Put != nil {
+		data[i] = 0x12
 		i++
-		i = encodeVarintApi(data, i, uint64(m.HeartbeatTxn.Size()))
-		n96, err := m.HeartbeatTxn.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Put.Size()))
+		n96, err := m.Put.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n96
 	}
-	if m.Gc != nil {
-		data[i] = 0x6a
+	if m.ConditionalPut != nil {
+		data[i] = 0x1a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.Gc.Size()))
-		n97, err := m.Gc.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.ConditionalPut.Size()))
+		n97, err := m.ConditionalPut.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n97
 	}
-	if m.PushTxn != nil {
-		data[i] = 0x72
+	if m.Increment != nil {
+		data[i] = 0x22
 		i++
-		i = encodeVarintApi(data, i, uint64(m.PushTxn.Size()))
-		n98, err := m.PushTxn.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Increment.Size()))
+		n98, err := m.Increment.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n98
 	}
-	if m.RangeLookup != nil {
-		data[i] = 0x7a
+	if m.Delete != nil {
+		data[i] = 0x2a
 		i++
-		i = encodeVarintApi(data, i, uint64(m.RangeLookup.Size()))
-		n99, err := m.RangeLookup.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.Delete.Size()))
+		n99, err := m.Delete.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
 		i += n99
+	}
+	if m.DeleteRange != nil {
+		data[i] = 0x32
+		i++
+		i = encodeVarintApi(data, i, uint64(m.DeleteRange.Size()))
+		n100, err := m.DeleteRange.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n100
+	}
+	if m.Scan != nil {
+		data[i] = 0x3a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Scan.Size()))
+		n101, err := m.Scan.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n101
+	}
+	if m.BeginTransaction != nil {
+		data[i] = 0x42
+		i++
+		i = encodeVarintApi(data, i, uint64(m.BeginTransaction.Size()))
+		n102, err := m.BeginTransaction.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n102
+	}
+	if m.EndTransaction != nil {
+		data[i] = 0x4a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.EndTransaction.Size()))
+		n103, err := m.EndTransaction.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n103
+	}
+	if m.AdminSplit != nil {
+		data[i] = 0x52
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminSplit.Size()))
+		n104, err := m.AdminSplit.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n104
+	}
+	if m.AdminMerge != nil {
+		data[i] = 0x5a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.AdminMerge.Size()))
+		n105, err := m.AdminMerge.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n105
+	}
+	if m.HeartbeatTxn != nil {
+		data[i] = 0x62
+		i++
+		i = encodeVarintApi(data, i, uint64(m.HeartbeatTxn.Size()))
+		n106, err := m.HeartbeatTxn.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n106
+	}
+	if m.Gc != nil {
+		data[i] = 0x6a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Gc.Size()))
+		n107, err := m.Gc.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n107
+	}
+	if m.PushTxn != nil {
+		data[i] = 0x72
+		i++
+		i = encodeVarintApi(data, i, uint64(m.PushTxn.Size()))
+		n108, err := m.PushTxn.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n108
+	}
+	if m.RangeLookup != nil {
+		data[i] = 0x7a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.RangeLookup.Size()))
+		n109, err := m.RangeLookup.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n109
 	}
 	if m.ResolveIntent != nil {
 		data[i] = 0x82
@@ -2984,11 +3566,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ResolveIntent.Size()))
-		n100, err := m.ResolveIntent.MarshalTo(data[i:])
+		n110, err := m.ResolveIntent.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n100
+		i += n110
 	}
 	if m.ResolveIntentRange != nil {
 		data[i] = 0x8a
@@ -2996,11 +3578,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ResolveIntentRange.Size()))
-		n101, err := m.ResolveIntentRange.MarshalTo(data[i:])
+		n111, err := m.ResolveIntentRange.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n101
+		i += n111
 	}
 	if m.Merge != nil {
 		data[i] = 0x92
@@ -3008,11 +3590,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Merge.Size()))
-		n102, err := m.Merge.MarshalTo(data[i:])
+		n112, err := m.Merge.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n102
+		i += n112
 	}
 	if m.TruncateLog != nil {
 		data[i] = 0x9a
@@ -3020,11 +3602,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.TruncateLog.Size()))
-		n103, err := m.TruncateLog.MarshalTo(data[i:])
+		n113, err := m.TruncateLog.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n103
+		i += n113
 	}
 	if m.LeaderLease != nil {
 		data[i] = 0xa2
@@ -3032,11 +3614,11 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.LeaderLease.Size()))
-		n104, err := m.LeaderLease.MarshalTo(data[i:])
+		n114, err := m.LeaderLease.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n104
+		i += n114
 	}
 	if m.ReverseScan != nil {
 		data[i] = 0xaa
@@ -3044,23 +3626,59 @@ func (m *ResponseUnion) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x1
 		i++
 		i = encodeVarintApi(data, i, uint64(m.ReverseScan.Size()))
-		n105, err := m.ReverseScan.MarshalTo(data[i:])
+		n115, err := m.ReverseScan.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n105
+		i += n115
 	}
-	if m.Noop != nil {
+	if m.ComputeChecksum != nil {
 		data[i] = 0xb2
 		i++
 		data[i] = 0x1
 		i++
-		i = encodeVarintApi(data, i, uint64(m.Noop.Size()))
-		n106, err := m.Noop.MarshalTo(data[i:])
+		i = encodeVarintApi(data, i, uint64(m.ComputeChecksum.Size()))
+		n116, err := m.ComputeChecksum.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n106
+		i += n116
+	}
+	if m.VerifyChecksum != nil {
+		data[i] = 0xba
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.VerifyChecksum.Size()))
+		n117, err := m.VerifyChecksum.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n117
+	}
+	if m.CheckConsistency != nil {
+		data[i] = 0xc2
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.CheckConsistency.Size()))
+		n118, err := m.CheckConsistency.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n118
+	}
+	if m.Noop != nil {
+		data[i] = 0xca
+		i++
+		data[i] = 0x1
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Noop.Size()))
+		n119, err := m.Noop.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n119
 	}
 	return i, nil
 }
@@ -3083,19 +3701,19 @@ func (m *Header) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Timestamp.Size()))
-	n107, err := m.Timestamp.MarshalTo(data[i:])
+	n120, err := m.Timestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n107
+	i += n120
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Replica.Size()))
-	n108, err := m.Replica.MarshalTo(data[i:])
+	n121, err := m.Replica.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n108
+	i += n121
 	data[i] = 0x18
 	i++
 	i = encodeVarintApi(data, i, uint64(m.RangeID))
@@ -3106,15 +3724,28 @@ func (m *Header) MarshalTo(data []byte) (int, error) {
 		data[i] = 0x2a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Txn.Size()))
-		n109, err := m.Txn.MarshalTo(data[i:])
+		n122, err := m.Txn.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n109
+		i += n122
 	}
 	data[i] = 0x30
 	i++
 	i = encodeVarintApi(data, i, uint64(m.ReadConsistency))
+	if m.Trace != nil {
+		data[i] = 0x3a
+		i++
+		i = encodeVarintApi(data, i, uint64(m.Trace.Size()))
+		n123, err := m.Trace.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n123
+	}
+	data[i] = 0x40
+	i++
+	i = encodeVarintApi(data, i, uint64(m.MaxScanResults))
 	return i, nil
 }
 
@@ -3136,11 +3767,11 @@ func (m *BatchRequest) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Header.Size()))
-	n110, err := m.Header.MarshalTo(data[i:])
+	n124, err := m.Header.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n110
+	i += n124
 	if len(m.Requests) > 0 {
 		for _, msg := range m.Requests {
 			data[i] = 0x12
@@ -3174,11 +3805,11 @@ func (m *BatchResponse) MarshalTo(data []byte) (int, error) {
 	data[i] = 0xa
 	i++
 	i = encodeVarintApi(data, i, uint64(m.BatchResponse_Header.Size()))
-	n111, err := m.BatchResponse_Header.MarshalTo(data[i:])
+	n125, err := m.BatchResponse_Header.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n111
+	i += n125
 	if len(m.Responses) > 0 {
 		for _, msg := range m.Responses {
 			data[i] = 0x12
@@ -3213,30 +3844,83 @@ func (m *BatchResponse_Header) MarshalTo(data []byte) (int, error) {
 		data[i] = 0xa
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Error.Size()))
-		n112, err := m.Error.MarshalTo(data[i:])
+		n126, err := m.Error.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n112
+		i += n126
 	}
 	data[i] = 0x12
 	i++
 	i = encodeVarintApi(data, i, uint64(m.Timestamp.Size()))
-	n113, err := m.Timestamp.MarshalTo(data[i:])
+	n127, err := m.Timestamp.MarshalTo(data[i:])
 	if err != nil {
 		return 0, err
 	}
-	i += n113
+	i += n127
 	if m.Txn != nil {
 		data[i] = 0x1a
 		i++
 		i = encodeVarintApi(data, i, uint64(m.Txn.Size()))
-		n114, err := m.Txn.MarshalTo(data[i:])
+		n128, err := m.Txn.MarshalTo(data[i:])
 		if err != nil {
 			return 0, err
 		}
-		i += n114
+		i += n128
 	}
+	if len(m.CollectedSpans) > 0 {
+		for _, b := range m.CollectedSpans {
+			data[i] = 0x22
+			i++
+			i = encodeVarintApi(data, i, uint64(len(b)))
+			i += copy(data[i:], b)
+		}
+	}
+	data[i] = 0x2a
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Now.Size()))
+	n129, err := m.Now.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n129
+	return i, nil
+}
+
+func (m *RaftCommand) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *RaftCommand) MarshalTo(data []byte) (int, error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0x8
+	i++
+	i = encodeVarintApi(data, i, uint64(m.RangeID))
+	data[i] = 0x12
+	i++
+	i = encodeVarintApi(data, i, uint64(m.OriginReplica.Size()))
+	n130, err := m.OriginReplica.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n130
+	data[i] = 0x1a
+	i++
+	i = encodeVarintApi(data, i, uint64(m.Cmd.Size()))
+	n131, err := m.Cmd.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n131
 	return i, nil
 }
 
@@ -3270,8 +3954,6 @@ func encodeVarintApi(data []byte, offset int, v uint64) int {
 func (m *ResponseHeader) Size() (n int) {
 	var l int
 	_ = l
-	l = m.Timestamp.Size()
-	n += 1 + l + sovApi(uint64(l))
 	if m.Txn != nil {
 		l = m.Txn.Size()
 		n += 1 + l + sovApi(uint64(l))
@@ -3306,6 +3988,7 @@ func (m *PutRequest) Size() (n int) {
 	n += 1 + l + sovApi(uint64(l))
 	l = m.Value.Size()
 	n += 1 + l + sovApi(uint64(l))
+	n += 2
 	return n
 }
 
@@ -3379,6 +4062,7 @@ func (m *DeleteRangeRequest) Size() (n int) {
 	l = m.Span.Size()
 	n += 1 + l + sovApi(uint64(l))
 	n += 1 + sovApi(uint64(m.MaxEntriesToDelete))
+	n += 2
 	return n
 }
 
@@ -3387,7 +4071,12 @@ func (m *DeleteRangeResponse) Size() (n int) {
 	_ = l
 	l = m.ResponseHeader.Size()
 	n += 1 + l + sovApi(uint64(l))
-	n += 1 + sovApi(uint64(m.NumDeleted))
+	if len(m.Keys) > 0 {
+		for _, b := range m.Keys {
+			l = len(b)
+			n += 1 + l + sovApi(uint64(l))
+		}
+	}
 	return n
 }
 
@@ -3437,6 +4126,23 @@ func (m *ReverseScanResponse) Size() (n int) {
 	return n
 }
 
+func (m *CheckConsistencyRequest) Size() (n int) {
+	var l int
+	_ = l
+	l = m.Span.Size()
+	n += 1 + l + sovApi(uint64(l))
+	n += 2
+	return n
+}
+
+func (m *CheckConsistencyResponse) Size() (n int) {
+	var l int
+	_ = l
+	l = m.ResponseHeader.Size()
+	n += 1 + l + sovApi(uint64(l))
+	return n
+}
+
 func (m *BeginTransactionRequest) Size() (n int) {
 	var l int
 	_ = l
@@ -3482,12 +4188,13 @@ func (m *EndTransactionResponse) Size() (n int) {
 	l = m.ResponseHeader.Size()
 	n += 1 + l + sovApi(uint64(l))
 	n += 1 + sovApi(uint64(m.CommitWait))
-	if len(m.Resolved) > 0 {
-		for _, b := range m.Resolved {
+	if len(m.DEPRECATEDResolved) > 0 {
+		for _, b := range m.DEPRECATEDResolved {
 			l = len(b)
 			n += 1 + l + sovApi(uint64(l))
 		}
 	}
+	n += 2
 	return n
 }
 
@@ -3549,6 +4256,12 @@ func (m *RangeLookupResponse) Size() (n int) {
 			n += 1 + l + sovApi(uint64(l))
 		}
 	}
+	if len(m.PrefetchedRanges) > 0 {
+		for _, e := range m.PrefetchedRanges {
+			l = e.Size()
+			n += 1 + l + sovApi(uint64(l))
+		}
+	}
 	return n
 }
 
@@ -3556,6 +4269,8 @@ func (m *HeartbeatTxnRequest) Size() (n int) {
 	var l int
 	_ = l
 	l = m.Span.Size()
+	n += 1 + l + sovApi(uint64(l))
+	l = m.Now.Size()
 	n += 1 + l + sovApi(uint64(l))
 	return n
 }
@@ -3664,16 +4379,12 @@ func (m *ResolveIntentRangeRequest) Size() (n int) {
 func (m *NoopResponse) Size() (n int) {
 	var l int
 	_ = l
-	l = m.ResponseHeader.Size()
-	n += 1 + l + sovApi(uint64(l))
 	return n
 }
 
 func (m *NoopRequest) Size() (n int) {
 	var l int
 	_ = l
-	l = m.Span.Size()
-	n += 1 + l + sovApi(uint64(l))
 	return n
 }
 
@@ -3732,6 +4443,53 @@ func (m *LeaderLeaseRequest) Size() (n int) {
 }
 
 func (m *LeaderLeaseResponse) Size() (n int) {
+	var l int
+	_ = l
+	l = m.ResponseHeader.Size()
+	n += 1 + l + sovApi(uint64(l))
+	return n
+}
+
+func (m *ComputeChecksumRequest) Size() (n int) {
+	var l int
+	_ = l
+	l = m.Span.Size()
+	n += 1 + l + sovApi(uint64(l))
+	n += 1 + sovApi(uint64(m.Version))
+	l = m.ChecksumID.Size()
+	n += 1 + l + sovApi(uint64(l))
+	n += 2
+	return n
+}
+
+func (m *ComputeChecksumResponse) Size() (n int) {
+	var l int
+	_ = l
+	l = m.ResponseHeader.Size()
+	n += 1 + l + sovApi(uint64(l))
+	return n
+}
+
+func (m *VerifyChecksumRequest) Size() (n int) {
+	var l int
+	_ = l
+	l = m.Span.Size()
+	n += 1 + l + sovApi(uint64(l))
+	n += 1 + sovApi(uint64(m.Version))
+	l = m.ChecksumID.Size()
+	n += 1 + l + sovApi(uint64(l))
+	if m.Checksum != nil {
+		l = len(m.Checksum)
+		n += 1 + l + sovApi(uint64(l))
+	}
+	if m.Snapshot != nil {
+		l = m.Snapshot.Size()
+		n += 1 + l + sovApi(uint64(l))
+	}
+	return n
+}
+
+func (m *VerifyChecksumResponse) Size() (n int) {
 	var l int
 	_ = l
 	l = m.ResponseHeader.Size()
@@ -3824,6 +4582,18 @@ func (m *RequestUnion) Size() (n int) {
 	}
 	if m.ReverseScan != nil {
 		l = m.ReverseScan.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
+	if m.ComputeChecksum != nil {
+		l = m.ComputeChecksum.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
+	if m.VerifyChecksum != nil {
+		l = m.VerifyChecksum.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
+	if m.CheckConsistency != nil {
+		l = m.CheckConsistency.Size()
 		n += 2 + l + sovApi(uint64(l))
 	}
 	if m.Noop != nil {
@@ -3920,6 +4690,18 @@ func (m *ResponseUnion) Size() (n int) {
 		l = m.ReverseScan.Size()
 		n += 2 + l + sovApi(uint64(l))
 	}
+	if m.ComputeChecksum != nil {
+		l = m.ComputeChecksum.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
+	if m.VerifyChecksum != nil {
+		l = m.VerifyChecksum.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
+	if m.CheckConsistency != nil {
+		l = m.CheckConsistency.Size()
+		n += 2 + l + sovApi(uint64(l))
+	}
 	if m.Noop != nil {
 		l = m.Noop.Size()
 		n += 2 + l + sovApi(uint64(l))
@@ -3941,6 +4723,11 @@ func (m *Header) Size() (n int) {
 		n += 1 + l + sovApi(uint64(l))
 	}
 	n += 1 + sovApi(uint64(m.ReadConsistency))
+	if m.Trace != nil {
+		l = m.Trace.Size()
+		n += 1 + l + sovApi(uint64(l))
+	}
+	n += 1 + sovApi(uint64(m.MaxScanResults))
 	return n
 }
 
@@ -3985,6 +4772,25 @@ func (m *BatchResponse_Header) Size() (n int) {
 		l = m.Txn.Size()
 		n += 1 + l + sovApi(uint64(l))
 	}
+	if len(m.CollectedSpans) > 0 {
+		for _, b := range m.CollectedSpans {
+			l = len(b)
+			n += 1 + l + sovApi(uint64(l))
+		}
+	}
+	l = m.Now.Size()
+	n += 1 + l + sovApi(uint64(l))
+	return n
+}
+
+func (m *RaftCommand) Size() (n int) {
+	var l int
+	_ = l
+	n += 1 + sovApi(uint64(m.RangeID))
+	l = m.OriginReplica.Size()
+	n += 1 + l + sovApi(uint64(l))
+	l = m.Cmd.Size()
+	n += 1 + l + sovApi(uint64(l))
 	return n
 }
 
@@ -4065,6 +4871,15 @@ func (this *RequestUnion) GetValue() interface{} {
 	if this.ReverseScan != nil {
 		return this.ReverseScan
 	}
+	if this.ComputeChecksum != nil {
+		return this.ComputeChecksum
+	}
+	if this.VerifyChecksum != nil {
+		return this.VerifyChecksum
+	}
+	if this.CheckConsistency != nil {
+		return this.CheckConsistency
+	}
 	if this.Noop != nil {
 		return this.Noop
 	}
@@ -4115,6 +4930,12 @@ func (this *RequestUnion) SetValue(value interface{}) bool {
 		this.LeaderLease = vt
 	case *ReverseScanRequest:
 		this.ReverseScan = vt
+	case *ComputeChecksumRequest:
+		this.ComputeChecksum = vt
+	case *VerifyChecksumRequest:
+		this.VerifyChecksum = vt
+	case *CheckConsistencyRequest:
+		this.CheckConsistency = vt
 	case *NoopRequest:
 		this.Noop = vt
 	default:
@@ -4186,6 +5007,15 @@ func (this *ResponseUnion) GetValue() interface{} {
 	if this.ReverseScan != nil {
 		return this.ReverseScan
 	}
+	if this.ComputeChecksum != nil {
+		return this.ComputeChecksum
+	}
+	if this.VerifyChecksum != nil {
+		return this.VerifyChecksum
+	}
+	if this.CheckConsistency != nil {
+		return this.CheckConsistency
+	}
 	if this.Noop != nil {
 		return this.Noop
 	}
@@ -4236,6 +5066,12 @@ func (this *ResponseUnion) SetValue(value interface{}) bool {
 		this.LeaderLease = vt
 	case *ReverseScanResponse:
 		this.ReverseScan = vt
+	case *ComputeChecksumResponse:
+		this.ComputeChecksum = vt
+	case *VerifyChecksumResponse:
+		this.VerifyChecksum = vt
+	case *CheckConsistencyResponse:
+		this.CheckConsistency = vt
 	case *NoopResponse:
 		this.Noop = vt
 	default:
@@ -4272,36 +5108,6 @@ func (m *ResponseHeader) Unmarshal(data []byte) error {
 			return fmt.Errorf("proto: ResponseHeader: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Timestamp", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowApi
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthApi
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Timestamp.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
 		case 3:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Txn", wireType)
@@ -4638,6 +5444,26 @@ func (m *PutRequest) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Inline", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Inline = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -5398,6 +6224,26 @@ func (m *DeleteRangeRequest) Unmarshal(data []byte) error {
 					break
 				}
 			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ReturnKeys", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.ReturnKeys = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -5479,10 +6325,10 @@ func (m *DeleteRangeResponse) Unmarshal(data []byte) error {
 			}
 			iNdEx = postIndex
 		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NumDeleted", wireType)
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Keys", wireType)
 			}
-			m.NumDeleted = 0
+			var byteLen int
 			for shift := uint(0); ; shift += 7 {
 				if shift >= 64 {
 					return ErrIntOverflowApi
@@ -5492,11 +6338,21 @@ func (m *DeleteRangeResponse) Unmarshal(data []byte) error {
 				}
 				b := data[iNdEx]
 				iNdEx++
-				m.NumDeleted |= (int64(b) & 0x7F) << shift
+				byteLen |= (int(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+			if byteLen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Keys = append(m.Keys, make([]byte, postIndex-iNdEx))
+			copy(m.Keys[len(m.Keys)-1], data[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -5914,6 +6770,186 @@ func (m *ReverseScanResponse) Unmarshal(data []byte) error {
 			}
 			m.Rows = append(m.Rows, KeyValue{})
 			if err := m.Rows[len(m.Rows)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *CheckConsistencyRequest) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: CheckConsistencyRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: CheckConsistencyRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Span.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field WithDiff", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.WithDiff = bool(v != 0)
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *CheckConsistencyResponse) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: CheckConsistencyResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: CheckConsistencyResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ResponseHeader", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.ResponseHeader.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -6375,7 +7411,7 @@ func (m *EndTransactionResponse) Unmarshal(data []byte) error {
 			}
 		case 3:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Resolved", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field DEPRECATEDResolved", wireType)
 			}
 			var byteLen int
 			for shift := uint(0); ; shift += 7 {
@@ -6399,9 +7435,29 @@ func (m *EndTransactionResponse) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Resolved = append(m.Resolved, make([]byte, postIndex-iNdEx))
-			copy(m.Resolved[len(m.Resolved)-1], data[iNdEx:postIndex])
+			m.DEPRECATEDResolved = append(m.DEPRECATEDResolved, make([]byte, postIndex-iNdEx))
+			copy(m.DEPRECATEDResolved[len(m.DEPRECATEDResolved)-1], data[iNdEx:postIndex])
 			iNdEx = postIndex
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OnePhaseCommit", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.OnePhaseCommit = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -7003,6 +8059,37 @@ func (m *RangeLookupResponse) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field PrefetchedRanges", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.PrefetchedRanges = append(m.PrefetchedRanges, RangeDescriptor{})
+			if err := m.PrefetchedRanges[len(m.PrefetchedRanges)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -7080,6 +8167,36 @@ func (m *HeartbeatTxnRequest) Unmarshal(data []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if err := m.Span.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Now", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Now.Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -8222,36 +9339,6 @@ func (m *NoopResponse) Unmarshal(data []byte) error {
 			return fmt.Errorf("proto: NoopResponse: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ResponseHeader", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowApi
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthApi
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.ResponseHeader.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -8302,36 +9389,6 @@ func (m *NoopRequest) Unmarshal(data []byte) error {
 			return fmt.Errorf("proto: NoopRequest: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowApi
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthApi
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Span.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -8958,6 +10015,508 @@ func (m *LeaderLeaseResponse) Unmarshal(data []byte) error {
 		}
 		if fieldNum <= 0 {
 			return fmt.Errorf("proto: LeaderLeaseResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ResponseHeader", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.ResponseHeader.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ComputeChecksumRequest) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ComputeChecksumRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ComputeChecksumRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Span.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Version", wireType)
+			}
+			m.Version = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.Version |= (uint32(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ChecksumID", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.ChecksumID.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Snapshot", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				v |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Snapshot = bool(v != 0)
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *ComputeChecksumResponse) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: ComputeChecksumResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: ComputeChecksumResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ResponseHeader", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.ResponseHeader.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *VerifyChecksumRequest) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: VerifyChecksumRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: VerifyChecksumRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Span", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Span.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 2:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Version", wireType)
+			}
+			m.Version = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.Version |= (uint32(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ChecksumID", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.ChecksumID.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Checksum", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Checksum = append(m.Checksum[:0], data[iNdEx:postIndex]...)
+			if m.Checksum == nil {
+				m.Checksum = []byte{}
+			}
+			iNdEx = postIndex
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Snapshot", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Snapshot == nil {
+				m.Snapshot = &RaftSnapshotData{}
+			}
+			if err := m.Snapshot.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *VerifyChecksumResponse) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: VerifyChecksumResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: VerifyChecksumResponse: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -9735,6 +11294,105 @@ func (m *RequestUnion) Unmarshal(data []byte) error {
 			iNdEx = postIndex
 		case 22:
 			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ComputeChecksum", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.ComputeChecksum == nil {
+				m.ComputeChecksum = &ComputeChecksumRequest{}
+			}
+			if err := m.ComputeChecksum.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 23:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field VerifyChecksum", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.VerifyChecksum == nil {
+				m.VerifyChecksum = &VerifyChecksumRequest{}
+			}
+			if err := m.VerifyChecksum.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 24:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CheckConsistency", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.CheckConsistency == nil {
+				m.CheckConsistency = &CheckConsistencyRequest{}
+			}
+			if err := m.CheckConsistency.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 25:
+			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Noop", wireType)
 			}
 			var msglen int
@@ -10511,6 +12169,105 @@ func (m *ResponseUnion) Unmarshal(data []byte) error {
 			iNdEx = postIndex
 		case 22:
 			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ComputeChecksum", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.ComputeChecksum == nil {
+				m.ComputeChecksum = &ComputeChecksumResponse{}
+			}
+			if err := m.ComputeChecksum.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 23:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field VerifyChecksum", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.VerifyChecksum == nil {
+				m.VerifyChecksum = &VerifyChecksumResponse{}
+			}
+			if err := m.VerifyChecksum.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 24:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CheckConsistency", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.CheckConsistency == nil {
+				m.CheckConsistency = &CheckConsistencyResponse{}
+			}
+			if err := m.CheckConsistency.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 25:
+			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Noop", wireType)
 			}
 			var msglen int
@@ -10737,6 +12494,58 @@ func (m *Header) Unmarshal(data []byte) error {
 				b := data[iNdEx]
 				iNdEx++
 				m.ReadConsistency |= (ReadConsistencyType(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 7:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Trace", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.Trace == nil {
+				m.Trace = &cockroach_util_tracing.Span{}
+			}
+			if err := m.Trace.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MaxScanResults", wireType)
+			}
+			m.MaxScanResults = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.MaxScanResults |= (int64(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
@@ -11109,6 +12918,194 @@ func (m *BatchResponse_Header) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CollectedSpans", wireType)
+			}
+			var byteLen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				byteLen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if byteLen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + byteLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.CollectedSpans = append(m.CollectedSpans, make([]byte, postIndex-iNdEx))
+			copy(m.CollectedSpans[len(m.CollectedSpans)-1], data[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 5:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Now", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Now.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipApi(data[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if skippy < 0 {
+				return ErrInvalidLengthApi
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *RaftCommand) Unmarshal(data []byte) error {
+	l := len(data)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowApi
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[iNdEx]
+			iNdEx++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: RaftCommand: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: RaftCommand: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RangeID", wireType)
+			}
+			m.RangeID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				m.RangeID |= (RangeID(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field OriginReplica", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.OriginReplica.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Cmd", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowApi
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthApi
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Cmd.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipApi(data[iNdEx:])
@@ -11234,3 +13231,189 @@ var (
 	ErrInvalidLengthApi = fmt.Errorf("proto: negative length found during unmarshaling")
 	ErrIntOverflowApi   = fmt.Errorf("proto: integer overflow")
 )
+
+var fileDescriptorApi = []byte{
+	// 2897 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xdc, 0x5a, 0xcf, 0x6f, 0x1b, 0xc7,
+	0xf5, 0x17, 0x45, 0x51, 0xa2, 0x1e, 0x7f, 0x98, 0x1a, 0x4b, 0x16, 0xad, 0x24, 0xa2, 0xbc, 0xb1,
+	0x15, 0xdb, 0x49, 0xa4, 0x40, 0xf9, 0xe6, 0x9b, 0x5f, 0x2d, 0x1a, 0x51, 0x62, 0x62, 0x36, 0xb6,
+	0x2c, 0xaf, 0xa8, 0xd8, 0x49, 0x9b, 0x6c, 0x57, 0xdc, 0x11, 0xb9, 0x30, 0xb9, 0xcb, 0xec, 0x2e,
+	0x25, 0x19, 0x3d, 0x14, 0x28, 0xd0, 0x1f, 0x68, 0x2f, 0x2d, 0x50, 0x14, 0x05, 0x7a, 0x09, 0xda,
+	0x3f, 0xa0, 0x97, 0x02, 0x3d, 0xf6, 0x54, 0xc0, 0xa7, 0xc2, 0xc7, 0xa2, 0x07, 0xa3, 0x4d, 0xd1,
+	0x4b, 0x6f, 0x45, 0x7b, 0x69, 0xd0, 0x02, 0x9d, 0x5f, 0xbb, 0xdc, 0xe5, 0xee, 0x8a, 0xb4, 0xb3,
+	0xe9, 0xaf, 0x83, 0x04, 0xee, 0x9b, 0x79, 0x9f, 0x99, 0x79, 0x6f, 0x66, 0x3e, 0x6f, 0xde, 0x0c,
+	0x3c, 0xd1, 0x34, 0x9b, 0x77, 0x2d, 0x53, 0x6d, 0xb6, 0xd7, 0xd9, 0xff, 0xde, 0xc1, 0xba, 0xda,
+	0xd3, 0xd7, 0x7a, 0x96, 0xe9, 0x98, 0x68, 0xce, 0x2b, 0x5c, 0x13, 0x85, 0x4b, 0x4f, 0x86, 0xeb,
+	0x6b, 0xaa, 0xa3, 0x72, 0x85, 0xa5, 0xe5, 0x70, 0x29, 0xb6, 0x2c, 0xd3, 0xb2, 0x45, 0xf9, 0xa5,
+	0x70, 0xb9, 0x6e, 0x38, 0xd8, 0x32, 0xd4, 0x8e, 0x62, 0xa9, 0x87, 0x8e, 0xa8, 0xb6, 0x12, 0xae,
+	0xd6, 0xc5, 0x8e, 0xea, 0x6b, 0xe8, 0xc2, 0xa0, 0x46, 0xdf, 0xd1, 0x3b, 0xeb, 0x8e, 0xa5, 0x36,
+	0x75, 0xa3, 0xb5, 0x6e, 0xf7, 0x54, 0x43, 0x54, 0x99, 0x6f, 0x99, 0x2d, 0x93, 0xfd, 0x5c, 0xa7,
+	0xbf, 0xb8, 0x54, 0xaa, 0x42, 0x51, 0xc6, 0x76, 0xcf, 0x34, 0x6c, 0x7c, 0x0d, 0xab, 0x1a, 0xb6,
+	0xd0, 0x0b, 0x90, 0x76, 0x4e, 0x8c, 0x72, 0x7a, 0x25, 0x75, 0x39, 0xb7, 0xb1, 0xbc, 0x16, 0x1a,
+	0xf2, 0x5a, 0xc3, 0x52, 0x0d, 0x5b, 0x6d, 0x3a, 0xba, 0x69, 0xc8, 0xb4, 0xaa, 0xf4, 0x16, 0xc0,
+	0x5b, 0xd8, 0x91, 0xf1, 0x87, 0x7d, 0x6c, 0x3b, 0xe8, 0x55, 0x98, 0x6e, 0x33, 0xa4, 0x72, 0x8a,
+	0x41, 0x2c, 0x46, 0x40, 0xec, 0x91, 0x6e, 0x55, 0xb3, 0xf7, 0x1f, 0x56, 0x26, 0x1e, 0x3c, 0xac,
+	0xa4, 0x64, 0xa1, 0x20, 0x7d, 0x3d, 0x05, 0x39, 0x86, 0xc4, 0x3b, 0x84, 0xb6, 0x86, 0xa0, 0x2e,
+	0x44, 0x40, 0x05, 0x7b, 0x1f, 0x06, 0x45, 0x6b, 0x90, 0x39, 0x52, 0x3b, 0x7d, 0x5c, 0x9e, 0x64,
+	0x18, 0xe5, 0x08, 0x8c, 0x77, 0x68, 0xb9, 0xcc, 0xab, 0x49, 0x3f, 0x4e, 0x01, 0xec, 0xf6, 0x13,
+	0x18, 0x0e, 0xfa, 0xbf, 0x31, 0x5b, 0xae, 0x4e, 0x51, 0x55, 0xd1, 0x3e, 0x7a, 0x12, 0xa6, 0x75,
+	0xa3, 0xa3, 0x1b, 0x98, 0xb9, 0x20, 0x2b, 0x0a, 0x85, 0x4c, 0x92, 0x21, 0xc7, 0x3a, 0x97, 0xa0,
+	0x85, 0xa4, 0x5f, 0xa6, 0x60, 0x61, 0xcb, 0x34, 0x34, 0x9d, 0xba, 0x54, 0xed, 0xfc, 0x3b, 0x07,
+	0xff, 0x12, 0xcc, 0xe2, 0x93, 0x9e, 0xc2, 0x35, 0xd3, 0x23, 0x1c, 0x96, 0x25, 0x55, 0xd9, 0x2f,
+	0xe9, 0x7d, 0x38, 0x37, 0x3c, 0x80, 0x24, 0x0d, 0xf4, 0x21, 0x94, 0xea, 0x46, 0xd3, 0xc2, 0x5d,
+	0x6c, 0x24, 0x61, 0x1a, 0x09, 0x66, 0x75, 0x17, 0x8e, 0x99, 0x27, 0x2d, 0x8c, 0x30, 0x10, 0x4b,
+	0x5f, 0x85, 0x39, 0x5f, 0x93, 0x49, 0xae, 0x87, 0x0b, 0x30, 0x6b, 0xe0, 0x63, 0x65, 0xe0, 0x1c,
+	0xb7, 0xf5, 0x2c, 0x11, 0x73, 0x73, 0x7e, 0x11, 0x0a, 0xdb, 0xb8, 0x83, 0x1d, 0x9c, 0xc0, 0x9a,
+	0xde, 0x87, 0xa2, 0x8b, 0x95, 0xa4, 0x4b, 0x7e, 0x96, 0x02, 0x24, 0x70, 0x55, 0xa3, 0x95, 0x40,
+	0x47, 0xd1, 0xcb, 0xb0, 0xd0, 0x55, 0x4f, 0x14, 0x62, 0x6f, 0x4b, 0xc7, 0xb6, 0xe2, 0x98, 0x8a,
+	0xc6, 0xf0, 0x03, 0x36, 0x42, 0xa4, 0x4a, 0x8d, 0xd7, 0x68, 0x98, 0xbc, 0x7d, 0x74, 0x09, 0x72,
+	0x16, 0x76, 0xfa, 0x96, 0xa1, 0xdc, 0xc5, 0xf7, 0xec, 0xc0, 0xaa, 0x05, 0x5e, 0xf0, 0x36, 0x91,
+	0x4b, 0xc7, 0x70, 0x36, 0xd0, 0xe1, 0x24, 0x7d, 0xfa, 0x04, 0x4c, 0xb1, 0xb6, 0x27, 0x57, 0xd2,
+	0x97, 0xf3, 0xd5, 0x99, 0x4f, 0x1e, 0x56, 0xd2, 0xa4, 0x4d, 0x99, 0x09, 0x25, 0x13, 0x72, 0x7b,
+	0x4d, 0xd5, 0x48, 0xc0, 0x44, 0x64, 0xa4, 0xd4, 0x44, 0x16, 0xb6, 0xfb, 0x1d, 0xc7, 0x0e, 0x18,
+	0x06, 0x48, 0x81, 0xcc, 0xe5, 0xd2, 0x77, 0x52, 0x90, 0xe7, 0x2d, 0x26, 0x39, 0xc6, 0x97, 0x60,
+	0xca, 0x32, 0x8f, 0xf9, 0x18, 0x73, 0x1b, 0x4f, 0x44, 0x40, 0x90, 0x21, 0xfb, 0xb7, 0x14, 0x56,
+	0x5d, 0x3a, 0x02, 0x24, 0xe3, 0x23, 0x6c, 0xd9, 0xf8, 0x5f, 0x6b, 0x84, 0xef, 0xa7, 0xe0, 0x6c,
+	0xa0, 0xe1, 0xff, 0x00, 0x5b, 0x1c, 0xc3, 0xe2, 0x56, 0x1b, 0x37, 0xef, 0x92, 0xbd, 0xd2, 0xd6,
+	0x6d, 0x07, 0x1b, 0xcd, 0x7b, 0x09, 0x18, 0x84, 0x6c, 0x28, 0xc7, 0xba, 0xd3, 0x56, 0x34, 0xfd,
+	0xf0, 0x90, 0x99, 0xc3, 0x9d, 0xfd, 0x59, 0x2a, 0xde, 0x26, 0x52, 0x49, 0x81, 0x72, 0xb8, 0xe1,
+	0x24, 0xb7, 0x83, 0x06, 0x2c, 0x56, 0x71, 0x4b, 0x37, 0xfc, 0xb1, 0xc9, 0xa7, 0xdf, 0xbb, 0x48,
+	0xb7, 0xc3, 0xa8, 0x49, 0x76, 0xfb, 0xd7, 0x93, 0xb0, 0x50, 0x33, 0xb4, 0x44, 0x7b, 0x4d, 0x03,
+	0x88, 0xa6, 0xd9, 0xed, 0xea, 0x4e, 0xc0, 0x19, 0x42, 0x86, 0x5e, 0x81, 0xac, 0x46, 0xea, 0x79,
+	0x01, 0x46, 0x6e, 0xe3, 0xc9, 0xa8, 0x18, 0x4f, 0xef, 0x92, 0x5e, 0xa8, 0xdd, 0x9e, 0xec, 0xd5,
+	0x46, 0x5f, 0x81, 0x45, 0x2f, 0x38, 0xe5, 0x60, 0x0a, 0xd9, 0x08, 0x5b, 0x2d, 0xd2, 0xc7, 0x29,
+	0x06, 0x74, 0x39, 0x02, 0xa8, 0x2e, 0x34, 0xb6, 0x98, 0x42, 0x83, 0xd7, 0x97, 0x17, 0xf4, 0x28,
+	0x31, 0x7a, 0x03, 0xf2, 0xb4, 0xc0, 0x70, 0x14, 0x1a, 0xb7, 0xda, 0xe5, 0x0c, 0x9b, 0xde, 0xb1,
+	0x43, 0xe7, 0x03, 0xcb, 0x71, 0x15, 0x2a, 0xb1, 0xa5, 0x3f, 0xa6, 0xe0, 0xdc, 0xb0, 0x41, 0x93,
+	0x5c, 0x78, 0x64, 0xf1, 0x8b, 0xa1, 0x1f, 0xab, 0x7a, 0x90, 0xbc, 0x81, 0x17, 0xdc, 0x26, 0x72,
+	0xb4, 0x4e, 0xf6, 0xfa, 0xda, 0xae, 0x5c, 0xdb, 0xda, 0x6c, 0xd4, 0xb6, 0xe9, 0x56, 0x61, 0x76,
+	0x8e, 0xb0, 0x46, 0xec, 0x4d, 0xb6, 0x67, 0x19, 0x69, 0x5e, 0x91, 0x2c, 0x4a, 0x48, 0x90, 0x5a,
+	0x32, 0x0d, 0xac, 0xf4, 0xda, 0xaa, 0x8d, 0x85, 0x71, 0x99, 0x51, 0x5d, 0xef, 0x15, 0x49, 0xe9,
+	0x2e, 0x2d, 0xe4, 0x06, 0x93, 0x1c, 0x98, 0xdb, 0xd4, 0xba, 0xba, 0xb1, 0xd7, 0xeb, 0xe8, 0x49,
+	0x84, 0x24, 0x17, 0x61, 0xd6, 0xa6, 0x50, 0x94, 0xc2, 0xd8, 0xa8, 0x7c, 0x2c, 0x92, 0x65, 0x25,
+	0xe4, 0x97, 0xf4, 0x2e, 0x20, 0x7f, 0xab, 0x49, 0xae, 0x84, 0x1d, 0x31, 0xa0, 0x1b, 0xd8, 0x4a,
+	0x82, 0xcd, 0xbd, 0xae, 0x0a, 0xbc, 0x24, 0xbb, 0xfa, 0x2b, 0x12, 0x7a, 0x30, 0x0e, 0xbf, 0x6e,
+	0x9a, 0x77, 0xfb, 0xbd, 0x04, 0xac, 0xff, 0x34, 0x00, 0xa3, 0x14, 0x0a, 0xca, 0x19, 0x25, 0xe3,
+	0x46, 0x84, 0x94, 0x51, 0x98, 0x98, 0xcc, 0xa9, 0x52, 0x93, 0x6e, 0x9f, 0x44, 0x41, 0xe1, 0x53,
+	0x3e, 0x18, 0x6b, 0x9c, 0x71, 0x4b, 0xeb, 0xbc, 0x10, 0x2d, 0xc3, 0x8c, 0xc5, 0x09, 0x28, 0x30,
+	0x95, 0x5c, 0xa1, 0xf4, 0x17, 0xca, 0x50, 0xfe, 0x71, 0x24, 0xb9, 0x50, 0xde, 0x80, 0x69, 0x6f,
+	0x38, 0x74, 0x11, 0x4b, 0x51, 0x20, 0xb4, 0xc2, 0x36, 0xb6, 0x9b, 0x96, 0xde, 0x73, 0x4c, 0xcb,
+	0xdd, 0xa8, 0xb8, 0x1e, 0xda, 0x87, 0xb9, 0x9e, 0x85, 0x0f, 0xb1, 0xd3, 0x6c, 0x63, 0xcd, 0xb5,
+	0x4d, 0xfa, 0x11, 0xc1, 0x4a, 0x03, 0x08, 0x6e, 0x46, 0xe9, 0x9b, 0x64, 0xd4, 0xa4, 0xd7, 0x96,
+	0x73, 0x80, 0x55, 0xa7, 0x71, 0x62, 0x24, 0x72, 0xd4, 0x49, 0x1b, 0xe6, 0xb1, 0x38, 0xe8, 0x9c,
+	0xba, 0x9b, 0x8a, 0x5e, 0xd1, 0xea, 0xd2, 0x97, 0x60, 0x3e, 0xd8, 0x8f, 0x24, 0xe7, 0xe8, 0x9f,
+	0x52, 0x30, 0xfb, 0xd6, 0x56, 0x02, 0x63, 0xfb, 0x9c, 0x88, 0x2c, 0xe3, 0x0d, 0xef, 0x35, 0x43,
+	0x7e, 0x91, 0x4d, 0xc2, 0x0d, 0x38, 0xa8, 0xd6, 0x92, 0x06, 0x19, 0x26, 0x44, 0xe7, 0x21, 0x4d,
+	0x77, 0x96, 0x54, 0x70, 0x67, 0xa1, 0x32, 0x32, 0x53, 0x66, 0x1d, 0xd7, 0x3e, 0x8f, 0x60, 0xc3,
+	0x81, 0x92, 0x74, 0x0b, 0x80, 0x76, 0x22, 0x49, 0xfb, 0x7d, 0x2b, 0x0d, 0xc5, 0xdd, 0xbe, 0xdd,
+	0x4e, 0x66, 0x82, 0x6c, 0x01, 0xf4, 0x08, 0x18, 0x59, 0xb8, 0x34, 0xb3, 0x32, 0x39, 0x4e, 0x66,
+	0xc5, 0x1d, 0x25, 0xd7, 0x23, 0xdd, 0x40, 0x5f, 0x10, 0x20, 0x58, 0x19, 0xa4, 0x67, 0x96, 0xa2,
+	0x40, 0x4e, 0xc8, 0xa6, 0xe7, 0xa8, 0x01, 0x00, 0x4c, 0x01, 0x5e, 0x87, 0x19, 0xfa, 0x41, 0x4e,
+	0x36, 0x82, 0xaf, 0xc7, 0x31, 0xf3, 0x34, 0x55, 0x69, 0x98, 0xee, 0x1c, 0xcf, 0x3c, 0xd2, 0x1c,
+	0x47, 0x9b, 0x30, 0xcb, 0x9b, 0xbc, 0xd7, 0xc3, 0xe5, 0x69, 0xa2, 0x5b, 0x8c, 0x1c, 0xb7, 0xb0,
+	0x74, 0x83, 0xd4, 0x72, 0x43, 0x47, 0xd6, 0x2c, 0xf9, 0xa6, 0xe9, 0x98, 0x33, 0x9e, 0x27, 0x92,
+	0xdc, 0xa1, 0xb6, 0x02, 0xf6, 0x7c, 0x74, 0xa7, 0x50, 0x9b, 0x4a, 0x7f, 0x4d, 0xc1, 0xbc, 0x20,
+	0x71, 0xbe, 0xed, 0x26, 0x30, 0x5b, 0x88, 0xa3, 0x45, 0x14, 0x34, 0xe8, 0xd8, 0x18, 0x8e, 0xe6,
+	0x3a, 0xd4, 0xd1, 0x55, 0x98, 0x26, 0x9e, 0x70, 0xfa, 0x9c, 0x1f, 0x8a, 0x1b, 0x17, 0x4f, 0x1f,
+	0xd5, 0x1e, 0xab, 0xeb, 0xfa, 0x9b, 0x6b, 0xd2, 0x20, 0xb2, 0x67, 0xea, 0xb6, 0x69, 0x04, 0xb8,
+	0x43, 0xc8, 0xa4, 0x2f, 0xc3, 0xc2, 0xd0, 0xa8, 0x93, 0x5c, 0x7c, 0x7f, 0x4b, 0xc1, 0xf9, 0x20,
+	0x7c, 0x42, 0x47, 0xfc, 0xff, 0x02, 0xcb, 0x16, 0x21, 0xbf, 0x63, 0x9a, 0x1e, 0x19, 0x4b, 0x05,
+	0xc8, 0xf1, 0x6f, 0x36, 0x78, 0x49, 0x85, 0xa5, 0x28, 0xcb, 0x24, 0x69, 0xfd, 0xaf, 0x41, 0x3e,
+	0xa1, 0x20, 0xec, 0xf1, 0x72, 0x80, 0xe4, 0x2c, 0x57, 0xf8, 0x0c, 0xa2, 0xb6, 0x9f, 0x90, 0xa8,
+	0xad, 0x61, 0xf5, 0x8d, 0xa6, 0xea, 0x90, 0x80, 0xa7, 0x95, 0xc0, 0xe8, 0x96, 0x20, 0xa3, 0x1b,
+	0x1a, 0x3e, 0x61, 0xa3, 0x9b, 0x72, 0xc7, 0xc0, 0x44, 0xe4, 0x80, 0x9e, 0x65, 0x11, 0x8b, 0xa2,
+	0x6b, 0x6c, 0xaa, 0xa4, 0xab, 0x4b, 0xb4, 0xf8, 0xe3, 0x87, 0x95, 0x19, 0xe6, 0xb2, 0xfa, 0xf6,
+	0x27, 0x83, 0x9f, 0x24, 0x24, 0x63, 0x3f, 0x34, 0xe9, 0x3d, 0x38, 0x1b, 0xe8, 0x63, 0x92, 0x06,
+	0xf8, 0x06, 0x31, 0xc0, 0x75, 0xf6, 0x93, 0xfc, 0xb7, 0x13, 0x72, 0x6f, 0x87, 0x42, 0x9d, 0xe2,
+	0x5e, 0xd6, 0x94, 0x6b, 0x1a, 0x56, 0x99, 0x8e, 0x31, 0xd0, 0x8d, 0x24, 0xc7, 0xf8, 0x8f, 0x14,
+	0x4d, 0x04, 0x77, 0x7b, 0x7d, 0x07, 0xb3, 0x7c, 0x83, 0xdd, 0xef, 0x26, 0x30, 0x4e, 0x12, 0x48,
+	0xd3, 0x88, 0x99, 0x2c, 0x68, 0x36, 0xd2, 0x82, 0x1b, 0x48, 0x0b, 0x21, 0x3a, 0x24, 0x87, 0x42,
+	0xd1, 0x9a, 0xeb, 0xef, 0x7c, 0xb5, 0x46, 0xeb, 0xfc, 0xf6, 0x61, 0x65, 0xbd, 0xa5, 0x3b, 0xed,
+	0xfe, 0x01, 0x69, 0xad, 0xbb, 0xee, 0xb5, 0xa8, 0x1d, 0xac, 0x0f, 0x5d, 0xd8, 0xf4, 0xfb, 0xba,
+	0xb6, 0xb6, 0xbf, 0x5f, 0xdf, 0x26, 0x53, 0x04, 0xdc, 0xbe, 0x93, 0xa9, 0x01, 0x2e, 0x72, 0x5d,
+	0x43, 0x2b, 0x90, 0xb5, 0x0d, 0xb5, 0x67, 0xb7, 0xcd, 0xe0, 0xe1, 0xd0, 0x93, 0x4a, 0x1f, 0xc0,
+	0x62, 0x68, 0xf8, 0x49, 0xda, 0xf7, 0x17, 0x93, 0xb0, 0xf0, 0x0e, 0xb6, 0xf4, 0xc3, 0x7b, 0xff,
+	0x83, 0xe6, 0x5d, 0x82, 0xac, 0xfb, 0xc5, 0xcc, 0x9b, 0x97, 0xbd, 0x6f, 0xc2, 0x1c, 0x03, 0xd3,
+	0xf3, 0x18, 0xe8, 0xe9, 0xc8, 0x33, 0xc8, 0xa1, 0xb3, 0x27, 0xaa, 0x6d, 0xab, 0x8e, 0xea, 0xf3,
+	0xcc, 0xfb, 0x70, 0x6e, 0xd8, 0x70, 0x49, 0x3a, 0xe6, 0xef, 0x05, 0xc8, 0x0b, 0x57, 0xec, 0x1b,
+	0xd4, 0x68, 0xeb, 0x90, 0x6e, 0x61, 0x47, 0x40, 0x3e, 0x15, 0x15, 0xb6, 0x7b, 0x37, 0x76, 0x32,
+	0xad, 0x49, 0x15, 0xc8, 0xbc, 0x11, 0x4b, 0xf9, 0xa9, 0xc8, 0x20, 0x6d, 0xa0, 0x40, 0x6a, 0xa2,
+	0x5b, 0x40, 0x4f, 0x9c, 0xee, 0x9d, 0x8b, 0x42, 0x95, 0xd3, 0xb1, 0x69, 0xa0, 0xc8, 0xeb, 0x25,
+	0xb9, 0xd8, 0x0c, 0x88, 0x69, 0xb8, 0x38, 0xb8, 0x18, 0x99, 0x8a, 0x35, 0xf3, 0xf0, 0x5d, 0x8c,
+	0xef, 0xde, 0x04, 0xbd, 0x02, 0xd3, 0x22, 0x6d, 0xcf, 0xdd, 0xb4, 0x12, 0xa1, 0x1f, 0xb8, 0xdb,
+	0x90, 0x45, 0x7d, 0x74, 0x0d, 0xf2, 0xfc, 0x17, 0x3f, 0x6b, 0xb2, 0x70, 0x35, 0xb7, 0x71, 0x29,
+	0x5e, 0xdf, 0x17, 0x94, 0xc8, 0x39, 0x6d, 0x20, 0x43, 0x1b, 0x30, 0x65, 0x37, 0x55, 0xa3, 0x3c,
+	0x13, 0x1b, 0x53, 0xfa, 0x52, 0xd1, 0x32, 0xab, 0x8b, 0x6e, 0xc3, 0xdc, 0x01, 0x4d, 0x35, 0x2a,
+	0xce, 0x20, 0x7c, 0x28, 0x67, 0x19, 0xc0, 0xd5, 0x08, 0x80, 0x98, 0x64, 0xa7, 0x5c, 0x3a, 0x18,
+	0x2a, 0xa0, 0x6e, 0xc2, 0x86, 0x16, 0x80, 0x9d, 0x8d, 0x75, 0x53, 0x64, 0x2e, 0x52, 0x2e, 0xe2,
+	0x80, 0x18, 0xd5, 0x20, 0xa7, 0xd2, 0xdc, 0x8a, 0xc2, 0x12, 0x43, 0x65, 0x60, 0x70, 0x51, 0xa1,
+	0x50, 0x28, 0x45, 0x25, 0x83, 0xea, 0x89, 0x06, 0x30, 0x5d, 0xca, 0xf6, 0xe5, 0xdc, 0xe9, 0x30,
+	0xfe, 0x98, 0x44, 0xc0, 0x30, 0x11, 0x7a, 0x1b, 0x0a, 0x6d, 0xf7, 0x1c, 0xcd, 0xe2, 0xba, 0x3c,
+	0x03, 0x5a, 0x8d, 0x00, 0x8a, 0x38, 0xf7, 0xcb, 0xf9, 0xb6, 0x4f, 0x88, 0x9e, 0x83, 0xc9, 0x56,
+	0xb3, 0x5c, 0x88, 0x3d, 0xe5, 0x78, 0x87, 0x5d, 0x99, 0xd4, 0x23, 0x87, 0xe3, 0x2c, 0x3f, 0xde,
+	0x90, 0x56, 0x8b, 0xb1, 0x8b, 0x37, 0x78, 0x8e, 0x94, 0xd9, 0x21, 0x8c, 0xb6, 0x45, 0x26, 0x1c,
+	0x8f, 0x11, 0x3a, 0x2c, 0xff, 0x52, 0x3e, 0x13, 0x3b, 0xe1, 0xc2, 0xd9, 0x26, 0x39, 0x67, 0x0d,
+	0x64, 0x68, 0x07, 0x8a, 0x22, 0xc7, 0x28, 0x32, 0x43, 0xe5, 0x12, 0xc3, 0x7a, 0x26, 0x7a, 0x2b,
+	0x09, 0x9d, 0x56, 0xe4, 0x82, 0xe5, 0x97, 0xa2, 0x0f, 0x60, 0x3e, 0x88, 0x27, 0x96, 0xc4, 0x1c,
+	0x43, 0x7d, 0x6e, 0x24, 0xaa, 0x7f, 0x65, 0x20, 0x2b, 0x54, 0x44, 0xa2, 0xa3, 0x0c, 0xf7, 0x39,
+	0x62, 0x80, 0x95, 0x08, 0xc0, 0x80, 0xbb, 0x79, 0x6d, 0x6a, 0x30, 0x47, 0x44, 0x47, 0xc4, 0x66,
+	0xad, 0xf2, 0xd9, 0x58, 0x83, 0x85, 0x03, 0x3d, 0x39, 0xe7, 0x0c, 0x64, 0x14, 0xa9, 0xc3, 0x36,
+	0x4e, 0x85, 0x07, 0x30, 0xf3, 0xb1, 0x48, 0xe1, 0x88, 0x49, 0xce, 0x75, 0x06, 0x32, 0xe6, 0x44,
+	0x9e, 0x4f, 0x53, 0xd8, 0x9a, 0x5f, 0x88, 0x77, 0x62, 0xe8, 0x16, 0x8a, 0x38, 0x71, 0x20, 0x43,
+	0x0d, 0x9a, 0xdf, 0x63, 0xdc, 0xad, 0x78, 0x34, 0x74, 0x8e, 0xa1, 0x5d, 0x89, 0xdc, 0x50, 0xa3,
+	0xa2, 0x1c, 0x9a, 0x04, 0x0c, 0xc8, 0xe9, 0xf2, 0x3f, 0x62, 0xbc, 0x33, 0x00, 0x5d, 0x8c, 0x5d,
+	0xfe, 0x91, 0xd4, 0x2e, 0x17, 0x8f, 0x02, 0x62, 0xba, 0x55, 0x31, 0x2c, 0xa5, 0x39, 0xb8, 0xcd,
+	0x29, 0x97, 0x63, 0xb7, 0xaa, 0x98, 0x1b, 0x27, 0xb9, 0xd4, 0x1c, 0x2a, 0xa0, 0xfb, 0xa6, 0x41,
+	0xce, 0x3a, 0xe5, 0xf3, 0xb1, 0xfb, 0xa6, 0xef, 0x28, 0x24, 0xb3, 0xba, 0xaf, 0x4d, 0xdd, 0xff,
+	0xa8, 0x92, 0x92, 0x7e, 0x58, 0x84, 0x82, 0xcb, 0x91, 0x9c, 0xff, 0x5e, 0xf0, 0xf3, 0xdf, 0x72,
+	0x1c, 0xff, 0x71, 0x0d, 0x4e, 0x80, 0x2f, 0xf8, 0x09, 0x70, 0x39, 0x8e, 0x00, 0x5d, 0x0d, 0xca,
+	0x80, 0x72, 0x1c, 0x03, 0x5e, 0x19, 0x83, 0x01, 0x05, 0xd0, 0x30, 0x05, 0x56, 0xc3, 0x14, 0x78,
+	0xf1, 0x74, 0x0a, 0x14, 0x40, 0x3e, 0x0e, 0x7c, 0x75, 0x88, 0x03, 0x2f, 0x9c, 0xc2, 0x81, 0x42,
+	0xdb, 0x25, 0xc1, 0x7a, 0x24, 0x09, 0xae, 0x8e, 0x22, 0x41, 0x81, 0x12, 0x60, 0xc1, 0x17, 0x03,
+	0x2c, 0x58, 0x89, 0x65, 0x41, 0xa1, 0xcb, 0x69, 0xf0, 0x4e, 0x3c, 0x0d, 0x3e, 0x3b, 0x16, 0x0d,
+	0x0a, 0xb4, 0x30, 0x0f, 0xca, 0x71, 0x3c, 0x78, 0x65, 0x0c, 0x1e, 0x74, 0x9d, 0x35, 0x44, 0x84,
+	0x6f, 0x46, 0x11, 0xe1, 0xa5, 0x11, 0x44, 0x28, 0xb0, 0xfc, 0x4c, 0xf8, 0x66, 0x14, 0x13, 0x5e,
+	0x1a, 0xc1, 0x84, 0x01, 0x1c, 0x4e, 0x85, 0xd7, 0xa3, 0xa9, 0xf0, 0x99, 0x91, 0x54, 0x28, 0xb0,
+	0x82, 0x5c, 0xf8, 0xbc, 0x8f, 0x0b, 0x9f, 0x8a, 0xe1, 0x42, 0xa1, 0x48, 0xc9, 0xf0, 0xf3, 0x21,
+	0x32, 0x94, 0x4e, 0x23, 0x43, 0xa1, 0xe9, 0xb1, 0x61, 0x3d, 0x92, 0x0d, 0x57, 0x47, 0xb1, 0xa1,
+	0x3b, 0xf3, 0xfc, 0x74, 0x78, 0x33, 0x86, 0x0e, 0x2f, 0x8f, 0xa6, 0x43, 0x01, 0x37, 0xc4, 0x87,
+	0xca, 0xa9, 0x7c, 0xf8, 0xfc, 0x98, 0x7c, 0x28, 0xb0, 0xa3, 0x08, 0xf1, 0xff, 0x83, 0x84, 0xb8,
+	0x12, 0x4f, 0x88, 0x02, 0x44, 0x30, 0x62, 0x3d, 0x92, 0x11, 0x57, 0x47, 0x31, 0xa2, 0x6b, 0x34,
+	0x3f, 0x25, 0xd6, 0x23, 0x29, 0x71, 0x75, 0x14, 0x25, 0xba, 0x50, 0x7e, 0x4e, 0xac, 0x47, 0x72,
+	0xe2, 0xea, 0x28, 0x4e, 0xf4, 0x5c, 0xe9, 0x23, 0xc5, 0xfd, 0x58, 0x52, 0xbc, 0x3a, 0x0e, 0x29,
+	0x0a, 0xc8, 0x10, 0x2b, 0xca, 0x71, 0xac, 0x78, 0x65, 0x0c, 0x56, 0x74, 0x37, 0x83, 0x21, 0x5a,
+	0xbc, 0x13, 0x4f, 0x8b, 0xcf, 0x8e, 0x45, 0x8b, 0xee, 0xd6, 0x15, 0xe2, 0xc5, 0x17, 0x03, 0xbc,
+	0x58, 0x89, 0xe5, 0x45, 0x77, 0x27, 0xf5, 0x11, 0xe3, 0x9f, 0xd3, 0x30, 0x7d, 0xcd, 0xbd, 0x91,
+	0xf3, 0xdd, 0xb3, 0xa4, 0x1e, 0xe3, 0x9e, 0x05, 0x6d, 0xd3, 0x0b, 0x45, 0xb2, 0x61, 0x35, 0x55,
+	0xc1, 0x92, 0x17, 0x23, 0x5d, 0xca, 0x6a, 0x84, 0x6e, 0xe2, 0x5c, 0xd5, 0xc7, 0x4c, 0x8d, 0x11,
+	0x52, 0x2b, 0xf4, 0x6d, 0x32, 0x3b, 0x7b, 0x96, 0x6e, 0x5a, 0xba, 0x73, 0x8f, 0x91, 0x63, 0xaa,
+	0x3a, 0x4f, 0x75, 0x89, 0x42, 0x7e, 0x9f, 0x14, 0xee, 0x8a, 0x32, 0x39, 0xdf, 0xf7, 0x7d, 0xb9,
+	0x2f, 0x5a, 0x33, 0x63, 0xbf, 0x68, 0x25, 0x21, 0x4e, 0xc9, 0x22, 0x56, 0x0b, 0xb8, 0x92, 0x5f,
+	0x5f, 0x44, 0xcf, 0x62, 0x55, 0xf3, 0xf9, 0xcb, 0x77, 0x8d, 0x71, 0xc6, 0x0a, 0x16, 0x91, 0x10,
+	0x27, 0x43, 0x9f, 0xe6, 0x62, 0xc1, 0x8a, 0x7e, 0x07, 0xd0, 0x3c, 0xc5, 0x9a, 0x78, 0xb7, 0xcb,
+	0x52, 0x25, 0x32, 0xaf, 0x4a, 0xdf, 0x06, 0xd0, 0xdb, 0x61, 0xba, 0x94, 0xbc, 0x57, 0x47, 0x59,
+	0xdf, 0xc3, 0x83, 0x22, 0x29, 0x15, 0x2b, 0x88, 0xbd, 0x3c, 0xfa, 0x41, 0x0a, 0xf2, 0x55, 0xd5,
+	0x69, 0xb6, 0xdd, 0xdc, 0xcc, 0xeb, 0x43, 0x19, 0x86, 0xf3, 0xd1, 0x7c, 0x10, 0x7d, 0x4d, 0xb2,
+	0x49, 0xdc, 0xc5, 0x71, 0xdc, 0xab, 0xdc, 0x4a, 0xa4, 0x09, 0x06, 0xb9, 0x07, 0x37, 0x2b, 0xe5,
+	0xaa, 0xbd, 0x36, 0xf5, 0xa3, 0x8f, 0x2a, 0x13, 0xd2, 0xcf, 0xd3, 0x50, 0x10, 0xdd, 0x12, 0x99,
+	0x8f, 0xfa, 0x50, 0xbf, 0xa2, 0x78, 0x2a, 0xa0, 0x11, 0xdf, 0xcb, 0x6d, 0x98, 0xb5, 0x44, 0x25,
+	0xb7, 0x9b, 0x2b, 0xa7, 0xe4, 0x51, 0xfc, 0xfd, 0x1c, 0x28, 0x2e, 0x7d, 0x77, 0xd2, 0x5b, 0x2d,
+	0x6b, 0x90, 0x61, 0x2f, 0xb5, 0x45, 0xd7, 0xa2, 0x72, 0x9b, 0x35, 0x5a, 0x2e, 0xf3, 0x6a, 0x74,
+	0x75, 0x35, 0x3e, 0xd5, 0x2d, 0xe6, 0xa3, 0xbf, 0xbb, 0x46, 0xcf, 0xd0, 0xf8, 0xb3, 0xd3, 0xc1,
+	0x4d, 0x07, 0x6b, 0xe2, 0xc5, 0xcc, 0x14, 0x7b, 0x61, 0x52, 0xf4, 0xc4, 0xec, 0x55, 0xcc, 0xe3,
+	0x5d, 0xde, 0x09, 0xb7, 0x3d, 0x48, 0x41, 0x8e, 0xe6, 0xb5, 0xe8, 0xc3, 0x13, 0xd5, 0xd0, 0x02,
+	0xcb, 0x37, 0x35, 0xfe, 0xf2, 0xbd, 0x05, 0x45, 0xb2, 0x18, 0x69, 0x64, 0xf7, 0xf8, 0x5b, 0x48,
+	0x81, 0x23, 0x88, 0x62, 0xf4, 0x32, 0xa4, 0x9b, 0x5d, 0x4d, 0x18, 0xac, 0x12, 0x3f, 0x77, 0xd8,
+	0x2c, 0x74, 0x07, 0x46, 0x34, 0xae, 0x5e, 0xa7, 0x2f, 0xf3, 0x42, 0x4b, 0x16, 0x15, 0x01, 0xb6,
+	0x6e, 0xee, 0xec, 0xd5, 0xf7, 0x1a, 0xb5, 0x9d, 0x46, 0x69, 0x02, 0x15, 0x60, 0x96, 0x7e, 0xd7,
+	0x76, 0xf6, 0xf6, 0xf7, 0x4a, 0x29, 0x54, 0x82, 0x7c, 0x7d, 0xc7, 0x57, 0x61, 0x72, 0x69, 0xea,
+	0xdb, 0x3f, 0x5d, 0x9e, 0xb8, 0x7a, 0x9b, 0xbe, 0xc8, 0xf6, 0xee, 0x2f, 0x11, 0x82, 0xe2, 0xee,
+	0xfe, 0xde, 0x35, 0xa5, 0x51, 0xbf, 0x51, 0xdb, 0x6b, 0x6c, 0xde, 0xd8, 0x25, 0x48, 0x04, 0x99,
+	0xc9, 0x36, 0xab, 0x37, 0xe5, 0x06, 0x81, 0x72, 0xbf, 0x1b, 0x37, 0xf7, 0xb7, 0xae, 0x95, 0x26,
+	0xbd, 0xef, 0x5b, 0xfb, 0x35, 0xf9, 0xdd, 0x52, 0x9a, 0x03, 0x6f, 0xdc, 0x81, 0xac, 0xfb, 0x7a,
+	0x8a, 0x44, 0x76, 0x19, 0x36, 0x1a, 0x34, 0x6a, 0x9c, 0x4b, 0x2b, 0xa3, 0x16, 0x91, 0xc4, 0x90,
+	0x6b, 0x27, 0x9f, 0x05, 0x72, 0xf5, 0xc2, 0xfd, 0xdf, 0x2f, 0x4f, 0xdc, 0xff, 0x78, 0x39, 0xf5,
+	0x80, 0xfc, 0xfd, 0x86, 0xfc, 0xfd, 0x8e, 0xfc, 0x7d, 0xef, 0x0f, 0xcb, 0x13, 0xef, 0xcd, 0x08,
+	0x95, 0x3b, 0x99, 0x7f, 0x06, 0x00, 0x00, 0xff, 0xff, 0x08, 0xa4, 0x89, 0xc9, 0x64, 0x31, 0x00,
+	0x00,
+}

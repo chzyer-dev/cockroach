@@ -17,10 +17,12 @@
 package sqlutils
 
 import (
+	"fmt"
 	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/security"
@@ -35,8 +37,13 @@ import (
 // In order to connect securely using postgres, this method will create temporary on-disk copies of
 // certain embedded security certificates. The certificates will be created in a new temporary
 // directory. The returned cleanup function will delete this temporary directory.
+// Note that two calls to this function for the same `user` will generate different
+// copies of the certificates, so the cleanup function must always be called.
+//
+// Args:
+//  prefix: A prefix to be prepended to the temp file names generated, for debugging.
 func PGUrl(t testing.TB, ts *server.TestServer, user, prefix string) (url.URL, func()) {
-	host, port, err := net.SplitHostPort(ts.PGAddr())
+	host, port, err := net.SplitHostPort(ts.ServingAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,9 +53,9 @@ func PGUrl(t testing.TB, ts *server.TestServer, user, prefix string) (url.URL, f
 		t.Fatal(err)
 	}
 
-	caPath := security.CACertPath(security.EmbeddedCertsDir)
-	certPath := security.ClientCertPath(security.EmbeddedCertsDir, user)
-	keyPath := security.ClientKeyPath(security.EmbeddedCertsDir, user)
+	caPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
+	certPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.crt", user))
+	keyPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.key", user))
 
 	// Copy these assets to disk from embedded strings, so this test can
 	// run from a standalone binary.

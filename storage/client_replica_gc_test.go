@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
@@ -31,7 +32,7 @@ import (
 // TestReplicaGCQueueDropReplica verifies that a removed replica is
 // immediately cleaned up.
 func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	mtc := &multiTestContext{}
 	const numStores = 3
 	rangeID := roachpb.RangeID(1)
@@ -43,29 +44,30 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	// no GC will take place since the consistent RangeLookup hits the first
 	// Node. We use the TestingCommandFilter to make sure that the second Node
 	// waits for the first.
-	storage.TestingCommandFilter = func(id roachpb.StoreID, args roachpb.Request, _ roachpb.Header) error {
-		et, ok := args.(*roachpb.EndTransactionRequest)
-		if !ok || id != 2 {
+	ctx := storage.TestStoreContext()
+	mtc.storeContext = &ctx
+	mtc.storeContext.TestingKnobs.TestingCommandFilter =
+		func(filterArgs storageutils.FilterArgs) *roachpb.Error {
+			et, ok := filterArgs.Req.(*roachpb.EndTransactionRequest)
+			if !ok || filterArgs.Sid != 2 {
+				return nil
+			}
+			rct := et.InternalCommitTrigger.GetChangeReplicasTrigger()
+			if rct == nil || rct.ChangeType != roachpb.REMOVE_REPLICA {
+				return nil
+			}
+			util.SucceedsSoon(t, func() error {
+				r, err := mtc.stores[0].GetReplica(rangeID)
+				if err != nil {
+					return err
+				}
+				if i, _ := r.Desc().FindReplica(2); i >= 0 {
+					return errors.New("expected second node gone from first node's known replicas")
+				}
+				return nil
+			})
 			return nil
 		}
-		rct := et.InternalCommitTrigger.GetChangeReplicasTrigger()
-		if rct == nil || rct.ChangeType != roachpb.REMOVE_REPLICA {
-			return nil
-		}
-		util.SucceedsWithin(t, time.Second, func() error {
-			r, err := mtc.stores[0].GetReplica(rangeID)
-			if err != nil {
-				return err
-			}
-			if i, _ := r.Desc().FindReplica(2); i >= 0 {
-				return errors.New("expected second node gone from first node's known replicas")
-			}
-			return nil
-		})
-		return nil
-	}
-
-	defer func() { storage.TestingCommandFilter = nil }()
 
 	mtc.Start(t, numStores)
 	defer mtc.Stop()
@@ -74,7 +76,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 	mtc.unreplicateRange(rangeID, 1)
 
 	// Make sure the range is removed from the store.
-	util.SucceedsWithin(t, 10*time.Second, func() error {
+	util.SucceedsSoon(t, func() error {
 		if _, err := mtc.stores[1].GetReplica(rangeID); !testutils.IsError(err, "range .* was not found") {
 			return util.Errorf("expected range removal")
 		}
@@ -85,7 +87,7 @@ func TestReplicaGCQueueDropReplicaDirect(t *testing.T) {
 // TestReplicaGCQueueDropReplicaOnScan verifies that the range GC queue
 // removes a range from a store that no longer should have a replica.
 func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	mtc := startMultiTestContext(t, 3)
 	defer mtc.Stop()
@@ -107,11 +109,11 @@ func TestReplicaGCQueueDropReplicaGCOnScan(t *testing.T) {
 	mtc.stores[1].DisableReplicaGCQueue(false)
 
 	// Increment the clock's timestamp to make the replica GC queue process the range.
-	mtc.manualClock.Increment(int64(storage.ReplicaGCQueueInactivityThreshold+
-		storage.DefaultLeaderLeaseDuration) + 1)
+	mtc.expireLeaderLeases()
+	mtc.manualClock.Increment(int64(storage.ReplicaGCQueueInactivityThreshold + 1))
 
 	// Make sure the range is removed from the store.
-	util.SucceedsWithin(t, time.Second, func() error {
+	util.SucceedsSoon(t, func() error {
 		store := mtc.stores[1]
 		store.ForceReplicaGCScanAndProcess()
 		if _, err := store.GetReplica(rangeID); !testutils.IsError(err, "range .* was not found") {

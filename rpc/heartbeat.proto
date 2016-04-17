@@ -57,3 +57,7 @@ message PingResponse {
   optional string pong = 1 [(gogoproto.nullable) = false];
   optional int64 server_time = 2 [(gogoproto.nullable) = false];
 }
+
+service Heartbeat {
+  rpc Ping (PingRequest) returns (PingResponse) {}
+}

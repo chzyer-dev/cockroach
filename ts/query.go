@@ -18,7 +18,9 @@ package ts
 
 import (
 	"container/heap"
+	"fmt"
 	"sort"
+	"time"
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -30,7 +32,7 @@ import (
 // adjustment which adjusts each Sample offset to be relative to the start time
 // of the dataSpan, rather than the start time of the InternalTimeSeriesData.
 type calibratedData struct {
-	*roachpb.InternalTimeSeriesData
+	roachpb.InternalTimeSeriesData
 	offsetAdjustment int32
 }
 
@@ -59,7 +61,7 @@ func (ds *dataSpan) timestampForOffset(offset int32) int64 {
 
 // addData adds an InternalTimeSeriesData object into this dataSpan, normalizing
 // it to a calibratedData object in the process.
-func (ds *dataSpan) addData(data *roachpb.InternalTimeSeriesData) error {
+func (ds *dataSpan) addData(data roachpb.InternalTimeSeriesData) error {
 	if data.SampleDurationNanos != ds.sampleNanos {
 		return util.Errorf("data added to dataSpan with mismatched sample duration period")
 	}
@@ -96,24 +98,29 @@ func (ds *dataSpan) addData(data *roachpb.InternalTimeSeriesData) error {
 	return nil
 }
 
+// downsampleFn is a function which extracts a float64 value from a time series
+// sample.
+type downsampleFn func(roachpb.InternalTimeSeriesSample) float64
+
 // dataSpanIterator is used to iterate through the samples in a dataSpan.
 // Samples are spread across multiple InternalTimeSeriesData objects; this
 // iterator thus maintains a two-level index to point to a unique sample.
 type dataSpanIterator struct {
 	*dataSpan
-	offset    int32 // The calibrated offset of the current sample within the dataSpan
-	dataIdx   int   // Index of InternalTimeSeriesData which contains current Sample
-	sampleIdx int   // Index of current Sample within InternalTimeSeriesData
-	valid     bool  // True if this iterator points to a valid Sample
+	offset       int32        // The calibrated offset of the current sample within the dataSpan
+	dataIdx      int          // Index of InternalTimeSeriesData which contains current Sample
+	sampleIdx    int          // Index of current Sample within InternalTimeSeriesData
+	valid        bool         // True if this iterator points to a valid Sample
+	downsampleFn downsampleFn // Function to extract float64 values from samples
 }
 
-// sample returns the InternalTimeSeriesSample value currently pointed to by
-// this iterator.
-func (dsi *dataSpanIterator) sample() *roachpb.InternalTimeSeriesSample {
+// value returns a float64 value by applying downsampleFn to the
+// InternalTimeSeriesSample value currently pointed to by this iterator.
+func (dsi *dataSpanIterator) value() float64 {
 	if !dsi.valid {
-		return nil
+		panic(fmt.Sprintf("value called on invalid dataSpanIterator: %v", dsi))
 	}
-	return dsi.datas[dsi.dataIdx].Samples[dsi.sampleIdx]
+	return dsi.downsampleFn(dsi.datas[dsi.dataIdx].Samples[dsi.sampleIdx])
 }
 
 // advance moves the iterator to point to the next Sample.
@@ -163,13 +170,13 @@ func (ii *interpolatingIterator) isValid() bool {
 	return ii.nextReal.valid
 }
 
-// avg returns the average value at the current offset for this iterator.
-func (ii *interpolatingIterator) avg() float64 {
+// value returns the value at the current offset of this iterator.
+func (ii *interpolatingIterator) value() float64 {
 	if !ii.isValid() {
 		return 0
 	}
 	if ii.nextReal.offset == ii.offset {
-		return ii.nextReal.sample().Average()
+		return ii.nextReal.value()
 	}
 	// Cannot interpolate if previous value is invalid.
 	if !ii.prevReal.valid {
@@ -178,50 +185,40 @@ func (ii *interpolatingIterator) avg() float64 {
 
 	// Linear interpolation of value at the current offset.
 	off := float64(ii.offset)
-	nextAvg := ii.nextReal.sample().Average()
+	nextAvg := ii.nextReal.value()
 	nextOff := float64(ii.nextReal.offset)
-	prevAvg := ii.prevReal.sample().Average()
+	prevAvg := ii.prevReal.value()
 	prevOff := float64(ii.prevReal.offset)
 	return prevAvg + (nextAvg-prevAvg)*(off-prevOff)/(nextOff-prevOff)
 }
 
-// dAvg returns the derivative (rate of change) of the average value at the
-// current offset for this iterator.
-func (ii *interpolatingIterator) dAvg() float64 {
-	if !ii.isValid() || !ii.prevReal.valid {
-		return 0
-	}
-
-	nextAvg := ii.nextReal.sample().Average()
-	nextOff := float64(ii.nextReal.offset)
-	prevAvg := ii.prevReal.sample().Average()
-	prevOff := float64(ii.prevReal.offset)
-	return (nextAvg - prevAvg) / (nextOff - prevOff)
-}
-
 // newIterator returns an interpolating iterator for the given dataSpan. The
-// iterator is initialized to offset 0.
-func (ds *dataSpan) newIterator() interpolatingIterator {
+// iterator is initialized to position startOffset, which should be 0 when
+// querying non-derivatives and -1 when querying a derivative. Values returned
+// by the iterator will be generated from samples using the supplied
+// downsampleFn.
+func (ds *dataSpan) newIterator(startOffset int32, downsampleFn downsampleFn) interpolatingIterator {
 	if len(ds.datas) == 0 {
 		return interpolatingIterator{}
 	}
 
 	// The first data index necessarily contains the positive offset closest to
-	// 0. Use a binary search to find the lowest positive offset (or the zero
-	// offset).
+	// 0, along with 0 itself and negative offsets. Use a binary search to
+	// find the lowest offset greater than or equal to startOffset.
 	data := ds.datas[0]
 	innerIdx := sort.Search(len(data.Samples), func(i int) bool {
-		return data.offsetAt(i) >= 0
+		return data.offsetAt(i) >= startOffset
 	})
 
 	iterator := interpolatingIterator{
-		offset: 0,
+		offset: startOffset,
 		nextReal: dataSpanIterator{
-			dataSpan:  ds,
-			dataIdx:   0,
-			sampleIdx: innerIdx,
-			offset:    data.offsetAt(innerIdx),
-			valid:     true,
+			dataSpan:     ds,
+			dataIdx:      0,
+			sampleIdx:    innerIdx,
+			offset:       data.offsetAt(innerIdx),
+			valid:        true,
+			downsampleFn: downsampleFn,
 		},
 	}
 
@@ -230,11 +227,12 @@ func (ds *dataSpan) newIterator() interpolatingIterator {
 	// data.
 	if innerIdx > 0 {
 		iterator.prevReal = dataSpanIterator{
-			dataSpan:  ds,
-			dataIdx:   0,
-			sampleIdx: innerIdx - 1,
-			offset:    data.offsetAt(innerIdx - 1),
-			valid:     true,
+			dataSpan:     ds,
+			dataIdx:      0,
+			sampleIdx:    innerIdx - 1,
+			offset:       data.offsetAt(innerIdx - 1),
+			valid:        true,
+			downsampleFn: downsampleFn,
 		}
 	}
 
@@ -361,23 +359,50 @@ func (is unionIterator) timestamp() int64 {
 	return is[0].nextReal.timestampForOffset(is[0].offset)
 }
 
-// avg returns the sum of the averages of all iterators in the set.
-func (is unionIterator) avg() float64 {
+// offset returns the current offset of the iterator.
+func (is unionIterator) offset() int32 {
+	if !is.isValid() {
+		return 0
+	}
+	return is[0].offset
+}
+
+// sum returns the sum of the current values in the iterator.
+func (is unionIterator) sum() float64 {
 	var sum float64
 	for i := range is {
-		sum += is[i].avg()
+		sum = sum + is[i].value()
 	}
 	return sum
 }
 
-// dAvg returns the sum of the derivatives for the averages of all iterators in
-// the set.
-func (is unionIterator) dAvg() float64 {
-	var sum float64
-	for i := range is {
-		sum += is[i].dAvg()
+// avg returns the average of the current values in the iterator.
+func (is unionIterator) avg() float64 {
+	return is.sum() / float64(len(is))
+}
+
+// max return the maximum value of the current values in the iterator.
+func (is unionIterator) max() float64 {
+	max := is[0].value()
+	for i := range is[1:] {
+		val := is[i+1].value()
+		if val > max {
+			max = val
+		}
 	}
-	return sum
+	return max
+}
+
+// min return the minimum value of the current values in the iterator.
+func (is unionIterator) min() float64 {
+	min := is[0].value()
+	for i := range is[1:] {
+		val := is[i+1].value()
+		if val < min {
+			min = val
+		}
+	}
+	return min
 }
 
 // Query returns datapoints for the named time series during the supplied time
@@ -395,8 +420,7 @@ func (is unionIterator) dAvg() float64 {
 // returned datapoint will represent the sum of datapoints from all sources at
 // the same time. The returned string slices contains a list of all sources for
 // the metric which were aggregated to produce the result.
-func (db *DB) Query(query TimeSeriesQueryRequest_Query, r Resolution,
-	startNanos, endNanos int64) ([]*TimeSeriesDatapoint, []string, error) {
+func (db *DB) Query(query Query, r Resolution, startNanos, endNanos int64) ([]TimeSeriesDatapoint, []string, error) {
 	// Normalize startNanos and endNanos the nearest SampleDuration boundary.
 	startNanos -= startNanos % r.SampleDuration()
 
@@ -408,15 +432,19 @@ func (db *DB) Query(query TimeSeriesQueryRequest_Query, r Resolution,
 		startKey := MakeDataKey(query.Name, "" /* source */, r, startNanos)
 		endKey := MakeDataKey(query.Name, "" /* source */, r, endNanos).PrefixEnd()
 		var pErr *roachpb.Error
-		rows, pErr = db.db.Scan(startKey, endKey, 0)
+		rows, pErr = db.db.ScanInconsistent(startKey, endKey, 0)
 		if pErr != nil {
 			return nil, nil, pErr.GoError()
 		}
 	} else {
 		b := db.db.NewBatch()
+		b.ReadConsistency = roachpb.INCONSISTENT
 		// Iterate over all key timestamps which may contain data for the given
 		// sources, based on the given start/end time and the resolution.
-		for currentTimestamp := startNanos; currentTimestamp <= endNanos; currentTimestamp += r.KeyDuration() {
+		kd := r.KeyDuration()
+		startKeyNanos := startNanos - (startNanos % kd)
+		endKeyNanos := endNanos - (endNanos % kd)
+		for currentTimestamp := startKeyNanos; currentTimestamp <= endKeyNanos; currentTimestamp += kd {
 			for _, source := range query.Sources {
 				key := MakeDataKey(query.Name, source, r, currentTimestamp)
 				b.Get(key)
@@ -435,18 +463,111 @@ func (db *DB) Query(query TimeSeriesQueryRequest_Query, r Resolution,
 		}
 	}
 
-	// Construct a new dataSpan for each distinct source encountered in the
-	// query. Each dataspan will contain all data queried from the same source.
+	// Convert the queried source data into a set of data spans, one for each
+	// source.
+	sourceSpans, err := makeDataSpans(rows, startNanos)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Compute a downsample function which will be used to return values from
+	// each source for each sample period.
+	downsampler, err := getDownsampleFunction(query.GetDownsampler())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// If we are returning a derivative, iteration needs to start at offset -1
+	// (in order to correctly compute the rate of change at offset 0).
+	var startOffset int32
+	isDerivative := query.GetDerivative() != TimeSeriesQueryDerivative_NONE
+	if isDerivative {
+		startOffset = -1
+	}
+
+	// Create an interpolatingIterator for each dataSpan, adding each iterator
+	// into a unionIterator collection. This is also where we compute a list of
+	// all sources with data present in the query.
+	sources := make([]string, 0, len(sourceSpans))
+	iters := make(unionIterator, 0, len(sourceSpans))
+	for name, span := range sourceSpans {
+		sources = append(sources, name)
+		iters = append(iters, span.newIterator(startOffset, downsampler))
+	}
+
+	// Choose an aggregation function to use when taking values from the
+	// unionIterator.
+	var valueFn func() float64
+	switch query.GetSourceAggregator() {
+	case TimeSeriesQueryAggregator_SUM:
+		valueFn = iters.sum
+	case TimeSeriesQueryAggregator_AVG:
+		valueFn = iters.avg
+	case TimeSeriesQueryAggregator_MAX:
+		valueFn = iters.max
+	case TimeSeriesQueryAggregator_MIN:
+		valueFn = iters.min
+	}
+
+	// Iterate over all requested offsets, recording a value from the
+	// unionIterator at each offset encountered. If the query is requesting a
+	// derivative, a rate of change is recorded instead of the actual values.
+	iters.init()
+	var last TimeSeriesDatapoint
+	if isDerivative {
+		last = TimeSeriesDatapoint{
+			TimestampNanos: iters.timestamp(),
+			Value:          valueFn(),
+		}
+		// For derivatives, the iterator was initialized at offset -1 in order
+		// to calculate the rate of change at offset zero. However, in some
+		// cases (such as the very first value recorded) offset -1 is not
+		// available. In this case, we treat the rate-of-change at the first
+		// offset as zero.
+		if iters.offset() < 0 {
+			iters.advance()
+		}
+	}
+	var responseData []TimeSeriesDatapoint
+	for iters.isValid() && iters.timestamp() <= endNanos {
+		current := TimeSeriesDatapoint{
+			TimestampNanos: iters.timestamp(),
+			Value:          valueFn(),
+		}
+		response := current
+		if isDerivative {
+			dTime := (current.TimestampNanos - last.TimestampNanos) / time.Second.Nanoseconds()
+			if dTime == 0 {
+				response.Value = 0
+			} else {
+				response.Value = (current.Value - last.Value) / float64(dTime)
+			}
+			if response.Value < 0 &&
+				query.GetDerivative() == TimeSeriesQueryDerivative_NON_NEGATIVE_DERIVATIVE {
+				response.Value = 0
+			}
+		}
+		responseData = append(responseData, response)
+		last = current
+		iters.advance()
+	}
+
+	return responseData, sources, nil
+}
+
+// makeDataSpans constructs a new dataSpan for each distinct source encountered
+// in the query. Each dataspan will contain all data queried from a single
+// source.
+func makeDataSpans(rows []client.KeyValue, startNanos int64) (map[string]*dataSpan, error) {
 	sourceSpans := make(map[string]*dataSpan)
 	for _, row := range rows {
-		data := &roachpb.InternalTimeSeriesData{}
-		if err := row.ValueProto(data); err != nil {
-			return nil, nil, err
+		var data roachpb.InternalTimeSeriesData
+		if err := row.ValueProto(&data); err != nil {
+			return nil, err
 		}
-
 		_, source, _, _, err := DecodeDataKey(row.Key)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if _, ok := sourceSpans[source]; !ok {
 			sourceSpans[source] = &dataSpan{
@@ -456,38 +577,23 @@ func (db *DB) Query(query TimeSeriesQueryRequest_Query, r Resolution,
 			}
 		}
 		if err := sourceSpans[source].addData(data); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
+	return sourceSpans, nil
+}
 
-	var responseData []*TimeSeriesDatapoint
-	sources := make([]string, 0, len(sourceSpans))
-
-	// Create an interpolatingIterator for each dataSpan.
-	iters := make(unionIterator, 0, len(sourceSpans))
-	for name, span := range sourceSpans {
-		sources = append(sources, name)
-		iters = append(iters, span.newIterator())
-	}
-
-	// Iterate through all values in the iteratorSet, adding a datapoint to
-	// the response for each value.
-	var valueFn func() float64
-	switch query.GetAggregator() {
+// getDownsampleFunction returns
+func getDownsampleFunction(agg TimeSeriesQueryAggregator) (downsampleFn, error) {
+	switch agg {
 	case TimeSeriesQueryAggregator_AVG:
-		valueFn = iters.avg
-	case TimeSeriesQueryAggregator_AVG_RATE:
-		valueFn = iters.dAvg
+		return (roachpb.InternalTimeSeriesSample).Average, nil
+	case TimeSeriesQueryAggregator_SUM:
+		return (roachpb.InternalTimeSeriesSample).Summation, nil
+	case TimeSeriesQueryAggregator_MAX:
+		return (roachpb.InternalTimeSeriesSample).Maximum, nil
+	case TimeSeriesQueryAggregator_MIN:
+		return (roachpb.InternalTimeSeriesSample).Minimum, nil
 	}
-
-	iters.init()
-	for iters.isValid() && iters.timestamp() <= endNanos {
-		responseData = append(responseData, &TimeSeriesDatapoint{
-			TimestampNanos: iters.timestamp(),
-			Value:          valueFn(),
-		})
-		iters.advance()
-	}
-
-	return responseData, sources, nil
+	return nil, util.Errorf("query specified unknown time series aggregator %s", agg.String())
 }

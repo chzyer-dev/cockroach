@@ -26,7 +26,6 @@ import (
 	"math/rand"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -35,17 +34,10 @@ import (
 	"gopkg.in/inf.v0"
 
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/duration"
 	"github.com/cockroachdb/cockroach/util/encoding"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 	"github.com/cockroachdb/cockroach/util/uuid"
-)
-
-const (
-	// SequencePoisonAbort is a special value for the sequence cache which
-	// commands a TransactionAbortedError.
-	SequencePoisonAbort = math.MaxUint32
-	// SequencePoisonRestart is a special value for the sequence cache which
-	// commands a TransactionRestartError.
-	SequencePoisonRestart = math.MaxUint32 - 1
 )
 
 var (
@@ -85,6 +77,8 @@ func (rk RKey) Equal(other []byte) bool {
 }
 
 // Next returns the RKey that sorts immediately after the given one.
+// The method may only take a shallow copy of the RKey, so both the
+// receiver and the return value should be treated as immutable after.
 func (rk RKey) Next() RKey {
 	return RKey(BytesNext(rk))
 }
@@ -108,24 +102,27 @@ func (rk RKey) String() string {
 // messages which refer to Cockroach keys.
 type Key []byte
 
-// MakeKey makes a new key which is the concatenation of the
-// given inputs, in order.
-func MakeKey(keys ...[]byte) []byte {
-	byteSlices := make([][]byte, len(keys))
-	for i, k := range keys {
-		byteSlices[i] = []byte(k)
-	}
-	return bytes.Join(byteSlices, nil)
-}
-
-// BytesNext returns the next possible byte by appending an \x00.
+// BytesNext returns the next possible byte slice, using the extra capacity
+// of the provided slice if possible, and if not, appending an \x00.
 func BytesNext(b []byte) []byte {
+	if cap(b) > len(b) {
+		bNext := b[:len(b)+1]
+		if bNext[len(bNext)-1] == 0 {
+			return bNext
+		}
+	}
 	// TODO(spencer): Do we need to enforce KeyMaxLength here?
-	return append(append([]byte(nil), b...), 0)
+	// Switched to "make and copy" pattern in #4963 for performance.
+	bn := make([]byte, len(b)+1)
+	copy(bn, b)
+	bn[len(bn)-1] = 0
+	return bn
 }
 
 func bytesPrefixEnd(b []byte) []byte {
-	end := append([]byte(nil), b...)
+	// Switched to "make and copy" pattern in #4963 for performance.
+	end := make([]byte, len(b))
+	copy(end, b)
 	for i := len(end) - 1; i >= 0; i-- {
 		end[i] = end[i] + 1
 		if end[i] != 0 {
@@ -137,7 +134,9 @@ func bytesPrefixEnd(b []byte) []byte {
 	return b
 }
 
-// Next returns the next key in lexicographic sort order.
+// Next returns the next key in lexicographic sort order. The method may only
+// take a shallow copy of the Key, so both the receiver and the return
+// value should be treated as immutable after.
 func (k Key) Next() Key {
 	return Key(BytesNext(k))
 }
@@ -275,10 +274,10 @@ func (t Timestamp) GoTime() time.Time {
 }
 
 const (
-	checksumUnitialized = 0
-	checksumSize        = 4
-	tagPos              = checksumSize
-	headerSize          = tagPos + 1
+	checksumUninitialized = 0
+	checksumSize          = 4
+	tagPos                = checksumSize
+	headerSize            = tagPos + 1
 )
 
 func (v Value) checksum() uint32 {
@@ -308,11 +307,11 @@ func (v *Value) InitChecksum(key []byte) {
 	if v.RawBytes == nil {
 		return
 	}
-	// TODO(peter): Is this guard to avoid re-initializing the checksum if it is
-	// already initialized necessary? Is this a safety or a performance concern?
-	if v.checksum() == checksumUnitialized {
-		v.setChecksum(v.computeChecksum(key))
+	// Should be uninitialized.
+	if v.checksum() != checksumUninitialized {
+		panic(fmt.Sprintf("initialized checksum = %x", v.checksum()))
 	}
+	v.setChecksum(v.computeChecksum(key))
 }
 
 // ClearChecksum clears the checksum value.
@@ -334,6 +333,15 @@ func (v Value) Verify(key []byte) error {
 		}
 	}
 	return nil
+}
+
+// ShallowClone returns a shallow clone of the receiver.
+func (v *Value) ShallowClone() *Value {
+	if v == nil {
+		return nil
+	}
+	t := *v
+	return &t
 }
 
 // MakeValueFromString returns a value with bytes and tag set.
@@ -402,7 +410,7 @@ func (v *Value) SetInt(i int64) {
 // receiver and clears the checksum. If the proto message is an
 // InternalTimeSeriesData, the tag will be set to TIMESERIES rather than BYTES.
 func (v *Value) SetProto(msg proto.Message) error {
-	data, err := proto.Marshal(msg)
+	data, err := protoutil.Marshal(msg)
 	if err != nil {
 		return err
 	}
@@ -423,16 +431,25 @@ func (v *Value) SetTime(t time.Time) {
 	v.setTag(ValueType_TIME)
 }
 
+// SetDuration encodes the specified duration value into the bytes field of the
+// receiver, sets the tag and clears the checksum.
+func (v *Value) SetDuration(t duration.Duration) error {
+	var err error
+	v.RawBytes = make([]byte, headerSize, headerSize+encoding.EncodedDurationMaxLen)
+	v.RawBytes, err = encoding.EncodeDurationAscending(v.RawBytes, t)
+	if err != nil {
+		return err
+	}
+	v.setTag(ValueType_DURATION)
+	return nil
+}
+
 // SetDecimal encodes the specified decimal value into the bytes field of
 // the receiver using Gob encoding, sets the tag and clears the checksum.
 func (v *Value) SetDecimal(dec *inf.Dec) error {
-	// TODO(nvanbenschoten) Deal with exponent normalization.
-	bb, err := dec.GobEncode()
-	if err != nil {
-		return fmt.Errorf("failed to Gob encode decimal %s: %v", dec, err)
-	}
-	v.RawBytes = make([]byte, headerSize+len(bb))
-	copy(v.RawBytes[headerSize:], bb)
+	decSize := encoding.UpperBoundNonsortingDecimalSize(dec)
+	v.RawBytes = make([]byte, headerSize, headerSize+decSize)
+	v.RawBytes = encoding.EncodeNonsortingDecimal(v.RawBytes, dec)
 	v.setTag(ValueType_DECIMAL)
 	return nil
 }
@@ -504,15 +521,23 @@ func (v Value) GetTime() (time.Time, error) {
 	return t, err
 }
 
+// GetDuration decodes a duration value from the bytes field of the receiver. If
+// the tag is not DURATION an error will be returned.
+func (v Value) GetDuration() (duration.Duration, error) {
+	if tag := v.GetTag(); tag != ValueType_DURATION {
+		return duration.Duration{}, fmt.Errorf("value type is not %s: %s", ValueType_DURATION, tag)
+	}
+	_, t, err := encoding.DecodeDurationAscending(v.dataBytes())
+	return t, err
+}
+
 // GetDecimal decodes a decimal value from the bytes of the receiver. If the
 // tag is not DECIMAL an error will be returned.
 func (v Value) GetDecimal() (*inf.Dec, error) {
 	if tag := v.GetTag(); tag != ValueType_DECIMAL {
 		return nil, fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
 	}
-	dec := new(inf.Dec)
-	err := dec.GobDecode(v.dataBytes())
-	return dec, err
+	return encoding.DecodeNonsortingDecimal(v.dataBytes(), nil)
 }
 
 // GetTimeseries decodes an InternalTimeSeriesData value from the bytes
@@ -545,10 +570,10 @@ func (v Value) computeChecksum(key []byte) uint32 {
 	sum := crc.Sum32()
 	crc.Reset()
 	crc32Pool.Put(crc)
-	// We reserved the value 0 (checksumUnitialized) to indicate that a checksum
+	// We reserved the value 0 (checksumUninitialized) to indicate that a checksum
 	// has not been initialized. This reservation is accomplished by folding a
 	// computed checksum of 0 to the value 1.
-	if sum == checksumUnitialized {
+	if sum == checksumUninitialized {
 		return 1
 	}
 	return sum
@@ -573,24 +598,25 @@ func NewTransaction(name string, baseKey Key, userPriority UserPriority,
 		TxnMeta: TxnMeta{
 			Key:       baseKey,
 			ID:        uuid.NewV4(),
+			Isolation: isolation,
 			Timestamp: now,
+			Priority:  priority,
+			Sequence:  1,
 		},
 		Name:          name,
-		Priority:      priority,
-		Isolation:     isolation,
 		OrigTimestamp: now,
 		MaxTimestamp:  max,
-		Sequence:      1,
 	}
 }
 
-// GetMeta returns the Transaction's metadata, or nil if the transaction
-// is nil.
-func (t *Transaction) GetMeta() *TxnMeta {
-	if t == nil {
-		return nil
+// LastActive returns the last timestamp at which client activity definitely
+// occurred, i.e. the maximum of OrigTimestamp and LastHeartbeat.
+func (t Transaction) LastActive() Timestamp {
+	candidate := t.OrigTimestamp
+	if t.LastHeartbeat != nil && candidate.Less(*t.LastHeartbeat) {
+		candidate = *t.LastHeartbeat
 	}
-	return &t.TxnMeta
+	return candidate
 }
 
 // Clone creates a copy of the given transaction. The copy is "mostly" deep,
@@ -601,7 +627,13 @@ func (t Transaction) Clone() Transaction {
 		h := *t.LastHeartbeat
 		t.LastHeartbeat = &h
 	}
-	t.CertainNodes.Nodes = append([]NodeID(nil), t.CertainNodes.Nodes...)
+	mt := t.ObservedTimestamps
+	if mt != nil {
+		t.ObservedTimestamps = make(map[NodeID]Timestamp)
+		for k, v := range mt {
+			t.ObservedTimestamps[k] = v
+		}
+	}
 	// Note that we're not cloning the span keys under the assumption that the
 	// keys themselves are not mutable.
 	t.Intents = append([]Span(nil), t.Intents...)
@@ -730,6 +762,7 @@ func (t *Transaction) Restart(userPriority UserPriority, upgradePriority int32, 
 	// - the conflicting transaction's upgradePriority
 	t.UpgradePriority(MakePriority(userPriority))
 	t.UpgradePriority(upgradePriority)
+	t.WriteTooOld = false
 }
 
 // Update ratchets priority, timestamp and original timestamp values (among
@@ -762,13 +795,21 @@ func (t *Transaction) Update(o *Transaction) {
 		t.LastHeartbeat.Forward(*o.LastHeartbeat)
 	}
 
-	// Copy the list of nodes without time uncertainty.
-	t.CertainNodes = NodeList{Nodes: append(NodeIDSlice(nil),
-		o.CertainNodes.Nodes...)}
+	// Absorb the collected clock uncertainty information.
+	for k, v := range o.ObservedTimestamps {
+		t.UpdateObservedTimestamp(k, v)
+	}
 	t.UpgradePriority(o.Priority)
 	// We can't assert against regression here since it can actually happen
 	// that we update from a transaction which isn't Writing.
 	t.Writing = t.Writing || o.Writing
+	// This isn't or'd (similar to Writing) because we want WriteTooOld
+	// to be set each time according to "o". This allows a persisted
+	// txn to have its WriteTooOld flag reset on update.
+	// TODO(tschottdorf): reset in a central location when it's certifiably
+	//   a new request. Update is called in many situations and shouldn't
+	//   reset anything.
+	t.WriteTooOld = o.WriteTooOld
 	if t.Sequence < o.Sequence {
 		t.Sequence = o.Sequence
 	}
@@ -793,47 +834,51 @@ func (t Transaction) String() string {
 	if len(t.Name) > 0 {
 		fmt.Fprintf(&buf, "%q ", t.Name)
 	}
-	fmt.Fprintf(&buf, "id=%s key=%s rw=%t pri=%.8f iso=%s stat=%s epo=%d ts=%s orig=%s max=%s",
-		t.Short(), t.Key, t.Writing, floatPri, t.Isolation, t.Status, t.Epoch, t.Timestamp, t.OrigTimestamp, t.MaxTimestamp)
+	fmt.Fprintf(&buf, "id=%s key=%s rw=%t pri=%.8f iso=%s stat=%s epo=%d ts=%s orig=%s max=%s wto=%t",
+		t.ID.Short(), t.Key, t.Writing, floatPri, t.Isolation, t.Status, t.Epoch, t.Timestamp,
+		t.OrigTimestamp, t.MaxTimestamp, t.WriteTooOld)
 	return buf.String()
 }
 
-// Short returns the short form of the Transaction's UUID.
-func (t Transaction) Short() string {
-	if t.ID == nil {
-		return strings.Repeat("?", 8)
-	}
-	return t.ID.String()[:8]
+// ResetObservedTimestamps clears out all timestamps recorded from individual
+// nodes.
+func (t *Transaction) ResetObservedTimestamps() {
+	t.ObservedTimestamps = nil
 }
 
-// Add adds the given NodeID to the interface (unless already present)
-// and restores ordering.
-func (s *NodeList) Add(nodeID NodeID) {
-	if !s.Contains(nodeID) {
-		s.Nodes = append(s.Nodes, nodeID)
-		sort.Sort(NodeIDSlice(s.Nodes))
+// UpdateObservedTimestamp stores a timestamp off a node's clock for future
+// operations in the transaction. When multiple calls are made for a single
+// nodeID, the lowest timestamp prevails.
+func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS Timestamp) {
+	if t.ObservedTimestamps == nil {
+		t.ObservedTimestamps = make(map[NodeID]Timestamp)
+	}
+	if ts, ok := t.ObservedTimestamps[nodeID]; !ok || maxTS.Less(ts) {
+		t.ObservedTimestamps[nodeID] = maxTS
 	}
 }
 
-// Contains returns true if the underlying slice contains the given NodeID.
-func (s NodeList) Contains(nodeID NodeID) bool {
-	ns := s.Nodes
-	i := sort.Search(len(ns), func(i int) bool { return NodeID(ns[i]) >= nodeID })
-	return i < len(ns) && NodeID(ns[i]) == nodeID
+// GetObservedTimestamp returns the lowest HLC timestamp recorded from the
+// given node's clock during the transaction. The returned boolean is false if
+// no observation about the requested node was found. Otherwise, MaxTimestamp
+// can be lowered to the returned timestamp when reading from nodeID.
+func (t Transaction) GetObservedTimestamp(nodeID NodeID) (Timestamp, bool) {
+	ts, ok := t.ObservedTimestamps[nodeID]
+	return ts, ok
 }
 
 var _ fmt.Stringer = &Lease{}
 
 func (l Lease) String() string {
-	t := time.Unix(l.Start.WallTime/1E9, 0).UTC()
-	return fmt.Sprintf("replica %s %s +%.3fs", l.Replica, t, float64(l.Expiration.WallTime-l.Start.WallTime)/1E9)
+	start := time.Unix(0, l.Start.WallTime).UTC()
+	expiration := time.Unix(0, l.Expiration.WallTime).UTC()
+	return fmt.Sprintf("replica %s %s %s", l.Replica, start, expiration.Sub(start))
 }
 
-// Covers returns true if the given timestamp is strictly less than the
-// Lease expiration, which indicates that the lease holder is authorized
-// to carry out operations with that timestamp.
+// Covers returns true if the given timestamp can be served by the Lease.
+// This is the case if the timestamp precedes the Lease's stasis period.
 func (l Lease) Covers(timestamp Timestamp) bool {
-	return timestamp.Less(l.Expiration)
+	return timestamp.Less(l.StartStasis)
 }
 
 // OwnedBy returns whether the given store is the lease owner.
@@ -858,6 +903,18 @@ func AsIntents(spans []Span, txn *Transaction) []Intent {
 // Equal compares for equality.
 func (s Span) Equal(o Span) bool {
 	return s.Key.Equal(o.Key) && s.EndKey.Equal(o.EndKey)
+}
+
+// Overlaps returns whether the two spans overlap.
+func (s Span) Overlaps(o Span) bool {
+	if len(s.EndKey) == 0 && len(o.EndKey) == 0 {
+		return s.Key.Equal(o.Key)
+	} else if len(s.EndKey) == 0 {
+		return bytes.Compare(s.Key, o.Key) >= 0 && bytes.Compare(s.Key, o.EndKey) < 0
+	} else if len(o.EndKey) == 0 {
+		return bytes.Compare(o.Key, s.Key) >= 0 && bytes.Compare(o.Key, s.EndKey) < 0
+	}
+	return bytes.Compare(s.EndKey, o.Key) > 0 && bytes.Compare(s.Key, o.EndKey) < 0
 }
 
 // RSpan is a key range with an inclusive start RKey and an exclusive end RKey.
@@ -893,13 +950,15 @@ func (rs RSpan) ContainsKeyRange(start, end RKey) bool {
 // Intersect returns the intersection of the current span and the
 // descriptor's range. Returns an error if the span and the
 // descriptor's range do not overlap.
+// TODO(nvanbenschoten) Investigate why this returns an endKey when
+// rs.EndKey is nil. This gives the method unexpected behavior.
 func (rs RSpan) Intersect(desc *RangeDescriptor) (RSpan, error) {
 	if !rs.Key.Less(desc.EndKey) || !desc.StartKey.Less(rs.EndKey) {
 		return rs, util.Errorf("span and descriptor's range do not overlap")
 	}
 
 	key := rs.Key
-	if !desc.ContainsKey(key) {
+	if key.Less(desc.StartKey) {
 		key = desc.StartKey
 	}
 	endKey := rs.EndKey

@@ -24,11 +24,11 @@ import (
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/util/leaktest"
-	"github.com/gogo/protobuf/proto"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 )
 
 func TestDropDatabase(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s, sqlDB, kvDB := setup(t)
 	defer cleanup(s, sqlDB)
 
@@ -70,7 +70,8 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	tbDesc := desc.GetTable()
 
 	// Add a zone config for both the table and database.
-	buf, err := proto.Marshal(config.DefaultZoneConfig)
+	cfg := config.DefaultZoneConfig()
+	buf, err := protoutil.Marshal(&cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 }
 
 func TestDropIndex(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s, sqlDB, kvDB := setup(t)
 	defer cleanup(s, sqlDB)
 
@@ -181,9 +182,12 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	}
 	tableDesc := desc.GetTable()
 
-	_, i, err := tableDesc.FindIndexByName("foo")
+	status, i, err := tableDesc.FindIndexByName("foo")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if status != sql.DescriptorActive {
+		t.Fatal("Index 'foo' is not active.")
 	}
 	indexPrefix := sql.MakeIndexKeyPrefix(tableDesc.ID, tableDesc.Indexes[i].ID)
 
@@ -218,7 +222,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 }
 
 func TestDropTable(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s, sqlDB, kvDB := setup(t)
 	defer cleanup(s, sqlDB)
 
@@ -248,7 +252,8 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 	tableDesc := desc.GetTable()
 
 	// Add a zone config for the table.
-	buf, err := proto.Marshal(config.DefaultZoneConfig)
+	cfg := config.DefaultZoneConfig()
+	buf, err := protoutil.Marshal(&cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

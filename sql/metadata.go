@@ -32,8 +32,9 @@ import (
 // installed on the underlying persistent storage before a cockroach store can
 // start running correctly, thus requiring this special initialization.
 type MetadataSchema struct {
-	descs  []metadataDescriptor
-	tables []metadataTable
+	descs   []metadataDescriptor
+	tables  []metadataTable
+	otherKV []roachpb.KeyValue
 }
 
 type metadataDescriptor struct {
@@ -79,6 +80,24 @@ func (ms MetadataSchema) DescriptorCount() int {
 	count := len(ms.descs)
 	count += len(ms.tables)
 	return count
+}
+
+// TableCount returns the number of non-system config tables in the system
+// database. This value is needed to automate certain tests.
+func (ms MetadataSchema) TableCount() int {
+	return len(ms.tables)
+}
+
+// MaxTableID returns the highest table ID of any system table. This value is
+// needed to automate certain tests.
+func (ms MetadataSchema) MaxTableID() ID {
+	var maxID ID
+	for _, tbl := range ms.tables {
+		if maxID < tbl.id {
+			maxID = tbl.id
+		}
+	}
+	return maxID
 }
 
 // GetInitialValues returns the set of initial K/V values which should be added to
@@ -130,6 +149,10 @@ func (ms MetadataSchema) GetInitialValues() []roachpb.KeyValue {
 		desc := createTableDescriptor(tbl.id, dbID, tbl.definition, tbl.privileges)
 		addDescriptor(dbID, &desc)
 	}
+
+	// Other key/value generation that doesn't fit into databases and
+	// tables. This can be used to add initial entries to a table.
+	ret = append(ret, ms.otherKV...)
 
 	// Sort returned key values; this is valuable because it matches the way the
 	// objects would be sorted if read from the engine.

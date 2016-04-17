@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -40,18 +41,19 @@ import (
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
-	csql "github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/timeutil"
+	"github.com/cockroachdb/pq"
 )
 
 var (
-	resultsRE = regexp.MustCompile(`^(\d+)\s+values?\s+hashing\s+to\s+([0-9A-Fa-f]+)$`)
-	errorRE   = regexp.MustCompile(`^(?:statement|query)\s+error\s+(.*)$`)
-	testdata  = flag.String("d", "testdata/[^.]*", "test data glob")
-	bigtest   = flag.Bool("bigtest", false, "use the big set of logic test files (overrides testdata)")
+	resultsRE     = regexp.MustCompile(`^(\d+)\s+values?\s+hashing\s+to\s+([0-9A-Fa-f]+)$`)
+	errorRE       = regexp.MustCompile(`^(?:statement|query)\s+error\s+(?:pgcode\s+([[:alnum:]]+)\s+)?(.*)$`)
+	logictestdata = flag.String("d", "testdata/[^.]*", "test data glob")
+	bigtest       = flag.Bool("bigtest", false, "use the big set of logic test files (overrides testdata)")
 )
 
 const logicMaxOffset = 50 * time.Millisecond
@@ -78,9 +80,10 @@ func (l *lineScanner) Scan() bool {
 }
 
 type logicStatement struct {
-	pos       string
-	sql       string
-	expectErr string
+	pos           string
+	sql           string
+	expectErr     string
+	expectErrCode string
 }
 
 type logicSorter func(numCols int, values []string)
@@ -140,6 +143,7 @@ type logicQuery struct {
 	colTypes        string
 	label           string
 	sorter          logicSorter
+	expectErrCode   string
 	expectErr       string
 	expectedValues  int
 	expectedHash    string
@@ -159,14 +163,18 @@ type logicTest struct {
 	// re-use them and close them all on exit.
 	clients map[string]*sql.DB
 	// client currently in use.
-	user         string
-	db           *sql.DB
-	progress     int
-	lastProgress time.Time
-	traceFile    *os.File
+	user            string
+	db              *sql.DB
+	progress        int
+	lastProgress    time.Time
+	traceFile       *os.File
+	cleanupRootUser func()
 }
 
 func (t *logicTest) close() {
+	if t.cleanupRootUser != nil {
+		t.cleanupRootUser()
+	}
 	if t.srv != nil {
 		cleanupTestServer(t.srv)
 		t.srv = nil
@@ -208,6 +216,7 @@ func (t *logicTest) setUser(user string) func() {
 	}
 	if db, ok := t.clients[user]; ok {
 		t.db = db
+		t.user = user
 
 		if err := t.db.QueryRow("SHOW DATABASE").Scan(&outDBName); err != nil {
 			t.Fatal(err)
@@ -217,8 +226,8 @@ func (t *logicTest) setUser(user string) func() {
 		return func() {}
 	}
 
-	pgUrl, cleanupFunc := sqlutils.PGUrl(t.T, &t.srv.TestServer, user, "TestLogic")
-	db, err := sql.Open("postgres", pgUrl.String())
+	pgURL, cleanupFunc := sqlutils.PGUrl(t.T, &t.srv.TestServer, user, "TestLogic")
+	db, err := sql.Open("postgres", pgURL.String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,30 +237,26 @@ func (t *logicTest) setUser(user string) func() {
 	return cleanupFunc
 }
 
-// TODO(tschottdorf): some logic tests currently take a long time to run.
-// Probably a case of heartbeats timing out or many restarts in some tests.
-// Need to investigate when all moving parts are in place.
 func (t *logicTest) run(path string) {
 	defer t.close()
-
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
+	t.setup()
+	if err := t.processTestFile(path); err != nil {
+		t.Error(err)
 	}
-	defer file.Close()
+}
 
-	t.lastProgress = time.Now()
-
+func (t *logicTest) setup() {
 	// TODO(pmattis): Add a flag to make it easy to run the tests against a local
 	// MySQL or Postgres instance.
 	ctx := server.NewTestContext()
 	ctx.MaxOffset = logicMaxOffset
-	t.srv = setupTestServer(t.T)
+	ctx.TestingKnobs.ExecutorTestingKnobs.WaitForGossipUpdate = true
+	ctx.TestingKnobs.ExecutorTestingKnobs.CheckStmtStringChange = true
+	t.srv = setupTestServerWithContext(t.T, ctx)
 
 	// db may change over the lifetime of this function, with intermediate
 	// values cached in t.clients and finally closed in t.close().
-	cleanupFunc := t.setUser(security.RootUser)
-	defer cleanupFunc()
+	t.cleanupRootUser = t.setUser(security.RootUser)
 
 	if _, err := t.db.Exec(`
 CREATE DATABASE test;
@@ -259,7 +264,24 @@ SET DATABASE = test;
 `); err != nil {
 		t.Fatal(err)
 	}
+}
 
+// TODO(tschottdorf): some logic tests currently take a long time to run.
+// Probably a case of heartbeats timing out or many restarts in some tests.
+// Need to investigate when all moving parts are in place.
+func (t *logicTest) processTestFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	defer t.traceStop()
+
+	t.lastProgress = timeutil.Now()
+
+	testingKnobs := &t.srv.Ctx.TestingKnobs
+
+	repeat := 1
 	s := newLineScanner(file)
 	for s.Scan() {
 		fields := strings.Fields(s.Text())
@@ -272,11 +294,26 @@ SET DATABASE = test;
 			continue
 		}
 		switch cmd {
+		case "repeat":
+			// A line "repeat X" makes the test repeat the following statement or query X times.
+			var err error
+			count := 0
+			if len(fields) != 2 {
+				err = errors.New("invalid line format")
+			} else if count, err = strconv.Atoi(fields[1]); err == nil && count < 2 {
+				err = errors.New("invalid count")
+			}
+			if err != nil {
+				return fmt.Errorf("%s:%d invalid repeat line: %s", path, s.line, err)
+			}
+			repeat = count
+
 		case "statement":
 			stmt := logicStatement{pos: fmt.Sprintf("%s:%d", path, s.line)}
 			// Parse "query error <regexp>"
 			if m := errorRE.FindStringSubmatch(s.Text()); m != nil {
-				stmt.expectErr = m[1]
+				stmt.expectErrCode = m[1]
+				stmt.expectErr = m[2]
 			}
 			var buf bytes.Buffer
 			for s.Scan() {
@@ -288,19 +325,23 @@ SET DATABASE = test;
 			}
 			stmt.sql = strings.TrimSpace(buf.String())
 			if !s.skip {
-				t.execStatement(stmt)
+				for i := 0; i < repeat; i++ {
+					t.execStatement(stmt)
+				}
 			} else {
 				s.skip = false
 			}
+			repeat = 1
 			t.success(path)
 
 		case "query":
 			query := logicQuery{pos: fmt.Sprintf("%s:%d", path, s.line)}
 			// Parse "query error <regexp>"
 			if m := errorRE.FindStringSubmatch(s.Text()); m != nil {
-				query.expectErr = m[1]
+				query.expectErrCode = m[1]
+				query.expectErr = m[2]
 			} else if len(fields) < 2 {
-				t.Fatalf("%s: invalid test statement: %s", query.pos, s.Text())
+				return fmt.Errorf("%s: invalid test statement: %s", query.pos, s.Text())
 			} else {
 				// Parse "query <type-string> <sort-mode> <label>"
 				// The type string specifies the number of columns and their types:
@@ -337,7 +378,7 @@ SET DATABASE = test;
 							query.colNames = true
 
 						default:
-							t.Fatalf("%s: unknown sort mode: %s", query.pos, opt)
+							return fmt.Errorf("%s: unknown sort mode: %s", query.pos, opt)
 						}
 					}
 				}
@@ -351,7 +392,7 @@ SET DATABASE = test;
 				line := s.Text()
 				if line == "----" {
 					if query.expectErr != "" {
-						t.Fatalf("%s: invalid ---- delimiter after a query expecting an error: %s", query.pos, query.expectErr)
+						return fmt.Errorf("%s: invalid ---- delimiter after a query expecting an error: %s", query.pos, query.expectErr)
 					}
 					break
 				}
@@ -372,7 +413,7 @@ SET DATABASE = test;
 						var err error
 						query.expectedValues, err = strconv.Atoi(m[1])
 						if err != nil {
-							t.Fatal(err)
+							return err
 						}
 						query.expectedHash = m[2]
 					} else {
@@ -392,10 +433,13 @@ SET DATABASE = test;
 			}
 
 			if !s.skip {
-				t.execQuery(query)
+				for i := 0; i < repeat; i++ {
+					t.execQuery(query)
+				}
 			} else {
 				s.skip = false
 			}
+			repeat = 1
 			t.success(path)
 
 		case "halt", "hash-threshold":
@@ -403,67 +447,109 @@ SET DATABASE = test;
 
 		case "user":
 			if len(fields) < 2 {
-				t.Fatalf("user command requires one argument, found: %v", fields)
+				return fmt.Errorf("user command requires one argument, found: %v", fields)
 			}
 			if len(fields[1]) == 0 {
-				t.Fatal("user command requires a non-blank argument")
+				return errors.New("user command requires a non-blank argument")
 			}
 			cleanupUserFunc := t.setUser(fields[1])
 			defer cleanupUserFunc()
 
 		case "skipif":
 			if len(fields) < 2 {
-				t.Fatalf("skipif command requires one argument, found: %v", fields)
+				return fmt.Errorf("skipif command requires one argument, found: %v", fields)
 			}
 			switch fields[1] {
 			case "":
-				t.Fatal("skipif command requires a non-blank argument")
+				return errors.New("skipif command requires a non-blank argument")
 			case "mysql":
 			case "postgresql":
 				s.skip = true
 				continue
 			default:
-				t.Fatalf("unimplemented test statement: %s", s.Text())
+				return fmt.Errorf("unimplemented test statement: %s", s.Text())
 			}
 
 		case "onlyif":
 			if len(fields) < 2 {
-				t.Fatalf("onlyif command requires one argument, found: %v", fields)
+				return fmt.Errorf("onlyif command requires one argument, found: %v", fields)
 			}
 			switch fields[1] {
 			case "":
-				t.Fatal("onlyif command requires a non-blank argument")
+				return errors.New("onlyif command requires a non-blank argument")
 			case "mysql":
 				s.skip = true
 				continue
 			default:
-				t.Fatalf("unimplemented test statement: %s", s.Text())
+				return fmt.Errorf("unimplemented test statement: %s", s.Text())
 			}
 
 		case "traceon":
 			if len(fields) != 2 {
-				t.Fatalf("traceon requires a filename argument, found: %v", fields)
+				return fmt.Errorf("traceon requires a filename argument, found: %v", fields)
 			}
 			t.traceStart(fields[1])
 
 		case "traceoff":
 			if t.traceFile == nil {
-				t.Fatalf("no trace active")
+				return errors.New("no trace active")
 			}
 			t.traceStop()
 
+		case "fix-txn-priorities":
+			// fix-txn-priorities causes future transactions to have hardcoded
+			// priority values (based on the priority level), (replacing the
+			// probabilistic generation).
+			// The change stays in effect for the duration of that particular
+			// test file.
+			if len(fields) != 1 {
+				return fmt.Errorf("fix-txn-priority takes no arguments, found: %v", fields[1:])
+			}
+			fmt.Println("Setting deterministic priorities.")
+
+			testingKnobs.ExecutorTestingKnobs.FixTxnPriority = true
+			defer func() { testingKnobs.ExecutorTestingKnobs.FixTxnPriority = false }()
 		default:
-			t.Fatalf("%s:%d: unknown command: %s", path, s.line, cmd)
+			return fmt.Errorf("%s:%d: unknown command: %s", path, s.line, cmd)
 		}
 	}
 
 	if err := s.Err(); err != nil {
-		t.Fatal(err)
+		return err
 	}
 
-	t.traceStop()
-
 	fmt.Printf("%s: %d\n", path, t.progress)
+	return nil
+}
+
+func (t *logicTest) verifyError(
+	pos string, expectErr string, expectErrCode string, err error) {
+	if expectErr == "" && expectErrCode == "" && err != nil {
+		t.Fatalf("%s: expected success, but found\n%s", pos, err)
+	}
+	if expectErr != "" && !testutils.IsError(err, expectErr) {
+		if err != nil {
+			t.Fatalf("%s: expected %q, but found\n%s", pos, expectErr, err)
+		} else {
+			t.Fatalf("%s: expected %q, but found success", pos, expectErr)
+		}
+	}
+	if expectErrCode != "" {
+		if err != nil {
+			pqErr, ok := err.(*pq.Error)
+			if !ok {
+				t.Fatalf("%s: expected error code %q, but the error we found is not "+
+					"a libpq error: %s", pos, expectErrCode, err)
+			}
+			if pqErr.Code != pq.ErrorCode(expectErrCode) {
+				t.Fatalf("%s: expected error code %q, but found code %q (%s)",
+					pos, expectErrCode, pqErr.Code, pqErr.Code.Name())
+			}
+		} else {
+			t.Fatalf("%s: expected error code %q, but found success",
+				pos, expectErrCode)
+		}
+	}
 }
 
 func (t *logicTest) execStatement(stmt logicStatement) {
@@ -471,18 +557,7 @@ func (t *logicTest) execStatement(stmt logicStatement) {
 		fmt.Printf("%s %s: %s\n", stmt.pos, t.user, stmt.sql)
 	}
 	_, err := t.db.Exec(stmt.sql)
-	switch {
-	case stmt.expectErr == "":
-		if err != nil {
-			t.Fatalf("%s: expected success, but found\n%s", stmt.pos, err)
-		}
-	case !testutils.IsError(err, stmt.expectErr):
-		if err != nil {
-			t.Fatalf("%s: expected %q, but found\n%s", stmt.pos, stmt.expectErr, err)
-		} else {
-			t.Fatalf("%s: expected %q, but found success", stmt.pos, stmt.expectErr)
-		}
-	}
+	t.verifyError(stmt.pos, stmt.expectErr, stmt.expectErrCode, err)
 }
 
 func (t *logicTest) execQuery(query logicQuery) {
@@ -490,13 +565,8 @@ func (t *logicTest) execQuery(query logicQuery) {
 		fmt.Printf("%s %s: %s\n", query.pos, t.user, query.sql)
 	}
 	rows, err := t.db.Query(query.sql)
-	if query.expectErr == "" {
-		if err != nil {
-			t.Fatalf("%s: expected success, but found %v", query.pos, err)
-		}
-	} else if !testutils.IsError(err, query.expectErr) {
-		t.Fatalf("%s: expected %s, but found %v", query.pos, query.expectErr, err)
-	} else {
+	t.verifyError(query.pos, query.expectErr, query.expectErrCode, err)
+	if err != nil {
 		// An error occurred, but it was expected.
 		return
 	}
@@ -517,7 +587,12 @@ func (t *logicTest) execQuery(query logicQuery) {
 
 	var results []string
 	if query.colNames {
-		results = append(results, cols...)
+		for _, col := range cols {
+			// We split column names on whitespace and append a separate "result"
+			// for each string. A bit unusual, but otherwise we can't match strings
+			// containing whitespace.
+			results = append(results, strings.Fields(col)...)
+		}
 	}
 	for rows.Next() {
 		if err := rows.Scan(vals...); err != nil {
@@ -626,7 +701,7 @@ func (t *logicTest) execQuery(query logicQuery) {
 
 func (t *logicTest) success(file string) {
 	t.progress++
-	now := time.Now()
+	now := timeutil.Now()
 	if now.Sub(t.lastProgress) >= 2*time.Second {
 		t.lastProgress = now
 		fmt.Printf("%s: %d\n", file, t.progress)
@@ -656,8 +731,7 @@ func (t *logicTest) traceStop() {
 }
 
 func TestLogic(t *testing.T) {
-	defer leaktest.AfterTest(t)
-	defer csql.TestingWaitForMetadata()()
+	defer leaktest.AfterTest(t)()
 
 	// TODO(marc): splitting ranges at table boundaries causes
 	// a blocked task and won't drain. Investigate and fix.
@@ -700,7 +774,7 @@ func TestLogic(t *testing.T) {
 			// [uses joins] logicTestPath + "/test/random/select/*.test",
 		}
 	} else {
-		globs = []string{*testdata}
+		globs = []string{*logictestdata}
 	}
 
 	var paths []string
@@ -712,8 +786,15 @@ func TestLogic(t *testing.T) {
 		paths = append(paths, match...)
 	}
 
+	if len(paths) == 0 {
+		t.Fatalf("No testfiles found (globs: %v)", globs)
+	}
+
 	total := 0
 	for _, p := range paths {
+		if testing.Verbose() || log.V(1) {
+			fmt.Printf("Running logic test on file: %s\n", p)
+		}
 		l := logicTest{T: t}
 		l.run(p)
 		total += l.progress

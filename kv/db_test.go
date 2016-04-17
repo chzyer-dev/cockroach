@@ -19,10 +19,13 @@ package kv_test
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/testutils"
@@ -35,18 +38,23 @@ func createTestClient(t *testing.T, stopper *stop.Stopper, addr string) *client.
 }
 
 func createTestClientForUser(t *testing.T, stopper *stop.Stopper, addr, user string) *client.DB {
-	db, err := client.Open(stopper, fmt.Sprintf("rpcs://%s@%s?certs=%s",
-		user, addr, security.EmbeddedCertsDir))
+	var ctx base.Context
+	ctx.InitDefaults()
+	ctx.User = user
+	ctx.SSLCA = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
+	ctx.SSLCert = filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.crt", user))
+	ctx.SSLCertKey = filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.key", user))
+	sender, err := client.NewSender(rpc.NewContext(&ctx, nil, stopper), addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return db
+	return client.NewDB(sender)
 }
 
 // TestKVDBCoverage verifies that all methods may be invoked on the
 // key value database.
 func TestKVDBCoverage(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 
@@ -151,7 +159,7 @@ func TestKVDBCoverage(t *testing.T) {
 }
 
 func TestKVDBInternalMethods(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 
@@ -173,9 +181,15 @@ func TestKVDBInternalMethods(t *testing.T) {
 	// Verify internal methods experience bad request errors.
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
 	for i, args := range testCases {
-		args.Header().Key = roachpb.Key("a")
+		{
+			header := args.Header()
+			header.Key = roachpb.Key("a")
+			args.SetHeader(header)
+		}
 		if roachpb.IsRange(args) {
-			args.Header().EndKey = args.Header().Key.Next()
+			header := args.Header()
+			header.EndKey = args.Header().Key.Next()
+			args.SetHeader(header)
 		}
 		b := &client.Batch{}
 		b.InternalAddRequest(args)
@@ -191,7 +205,7 @@ func TestKVDBInternalMethods(t *testing.T) {
 // TestKVDBTransaction verifies that transactions work properly over
 // the KV DB endpoint.
 func TestKVDBTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 
@@ -238,26 +252,27 @@ func TestKVDBTransaction(t *testing.T) {
 
 // TestAuthentication tests authentication for the KV endpoint.
 func TestAuthentication(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 
-	arg := &roachpb.PutRequest{}
-	arg.Header().Key = roachpb.Key("a")
-	b := &client.Batch{}
-	b.InternalAddRequest(arg)
+	var b1 client.Batch
+	b1.Put("a", "b")
 
-	// Create a "node" client and call Run() on it which lets us build
-	// our own request, specifying the user.
+	// Create a node user client and call Run() on it which lets us build our own
+	// request, specifying the user.
 	db1 := createTestClientForUser(t, s.Stopper(), s.ServingAddr(), security.NodeUser)
-	if pErr := db1.Run(b); pErr != nil {
+	if pErr := db1.Run(&b1); pErr != nil {
 		t.Fatal(pErr)
 	}
+
+	var b2 client.Batch
+	b2.Put("c", "d")
 
 	// Try again, but this time with certs for a non-node user (even the root
 	// user has no KV permissions).
 	db2 := createTestClientForUser(t, s.Stopper(), s.ServingAddr(), security.RootUser)
-	if pErr := db2.Run(b); pErr == nil {
-		t.Fatal("Expected error!")
+	if pErr := db2.Run(&b2); !testutils.IsPError(pErr, "is not allowed") {
+		t.Fatal(pErr)
 	}
 }

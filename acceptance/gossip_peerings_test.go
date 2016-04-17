@@ -14,8 +14,6 @@
 //
 // Author: Peter Mattis (peter@cockroachlabs.com)
 
-// +build acceptance
-
 package acceptance
 
 import (
@@ -31,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 const longWaitTime = 2 * time.Minute
@@ -43,7 +42,7 @@ type checkGossipFunc func(map[string]interface{}) error
 // retrying for up to the given duration.
 func checkGossip(t *testing.T, c cluster.Cluster, d time.Duration,
 	f checkGossipFunc) {
-	util.SucceedsWithin(t, d, func() error {
+	err := util.RetryForDuration(d, func() error {
 		select {
 		case <-stopper:
 			t.Fatalf("interrupted")
@@ -67,6 +66,9 @@ func checkGossip(t *testing.T, c cluster.Cluster, d time.Duration,
 
 		return nil
 	})
+	if err != nil {
+		t.Fatal(util.ErrorfSkipFrames(1, "condition failed to evaluate within %s: %s", d, err))
+	}
 }
 
 // hasPeers returns a checkGossipFunc that passes when the given
@@ -103,18 +105,20 @@ func hasClusterID(infos map[string]interface{}) error {
 }
 
 func TestGossipPeerings(t *testing.T) {
-	c := StartCluster(t)
-	defer c.AssertAndStop(t)
+	runTestOnConfigs(t, testGossipPeeringsInner)
+}
+
+func testGossipPeeringsInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConfig) {
 	num := c.NumNodes()
 
-	deadline := time.Now().Add(*flagDuration)
+	deadline := timeutil.Now().Add(cfg.Duration)
 
 	waitTime := longWaitTime
-	if *flagDuration < waitTime {
+	if cfg.Duration < waitTime {
 		waitTime = shortWaitTime
 	}
 
-	for time.Now().Before(deadline) {
+	for timeutil.Now().Before(deadline) {
 		checkGossip(t, c, waitTime, hasPeers(num))
 
 		// Restart the first node.
@@ -141,24 +145,28 @@ func TestGossipPeerings(t *testing.T) {
 // re-bootstrapped after a time when all nodes were down
 // simultaneously.
 func TestGossipRestart(t *testing.T) {
+	// TODO(bram): #4559 Limit this test to only the relevant cases. No chaos
+	// agents should be required.
+	runTestOnConfigs(t, testGossipRestartInner)
+}
+
+func testGossipRestartInner(t *testing.T, c cluster.Cluster, cfg cluster.TestConfig) {
 	// This already replicates the first range (in the local setup).
 	// The replication of the first range is important: as long as the
 	// first range only exists on one node, that node can trivially
 	// acquire the leader lease. Once the range is replicated, however,
 	// nodes must be able to discover each other over gossip before the
 	// lease can be acquired.
-	c := StartCluster(t)
-	defer c.AssertAndStop(t)
 	num := c.NumNodes()
 
-	deadline := time.Now().Add(*flagDuration)
+	deadline := timeutil.Now().Add(cfg.Duration)
 
 	waitTime := longWaitTime
-	if *flagDuration < waitTime {
+	if cfg.Duration < waitTime {
 		waitTime = shortWaitTime
 	}
 
-	for time.Now().Before(deadline) {
+	for timeutil.Now().Before(deadline) {
 		log.Infof("waiting for initial gossip connections")
 		checkGossip(t, c, waitTime, hasPeers(num))
 		checkGossip(t, c, waitTime, hasClusterID)
@@ -184,7 +192,7 @@ func TestGossipRestart(t *testing.T) {
 		checkGossip(t, c, waitTime, hasSentinel)
 
 		for i := 0; i < num; i++ {
-			db, dbStopper := makeClient(t, c.ConnString(i))
+			db, dbStopper := c.NewClient(t, i)
 			if i == 0 {
 				if err := db.Del("count"); err != nil {
 					t.Fatal(err)

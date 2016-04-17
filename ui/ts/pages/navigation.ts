@@ -44,19 +44,14 @@ module AdminViews {
             icon: SvgIcons.nodesIcon,
           },
           {
-            title: "Stores",
-            route: "/stores",
-            icon: SvgIcons.storesIcon,
-          },
-          {
-            title: "Users",
-            route: "/sql?title=Users&q=" + encodeURIComponent("SELECT * FROM SYSTEM.USERS;"),
-            icon: SvgIcons.usersIcon,
-          },
-          {
             title: "Databases",
-            route: "/sql?title=Databases&q=" + encodeURIComponent("SHOW DATABASES;"),
+            route: "/databases",
             icon: SvgIcons.databaseIcon,
+          },
+          {
+            title: "Help Us",
+            route: "/help-us/reporting",
+            icon: SvgIcons.cockroachIconSmall,
           },
         ].map(function(v: {title: string; route: string; icon: string; liClass?: string; }): NavigationBar.Target {
           return {
@@ -93,7 +88,7 @@ module AdminViews {
           m.component(
             NavigationBar,
             {
-              ts: ctrl.TargetSet()
+              ts: ctrl.TargetSet(),
             }
           )
         );

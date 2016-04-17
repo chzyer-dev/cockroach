@@ -55,7 +55,7 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 
 	// Extract Node IDs from NodeStatuses.
 	nodeStatuses := map[string][]status.NodeStatus{}
-	if err := getJSON(cliContext.Addr, server.PathForNodeStatus(""), &nodeStatuses); err != nil {
+	if err := getJSON(cliContext.HTTPAddr, server.PathForNodeStatus(""), &nodeStatuses); err != nil {
 		return err
 	}
 
@@ -66,13 +66,14 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	printQueryOutput(os.Stdout, lsNodesColumnHeaders, rows)
+	printQueryOutput(os.Stdout, lsNodesColumnHeaders, rows, "")
 	return nil
 }
 
 var nodesColumnHeaders = []string{
 	"id",
 	"address",
+	"build",
 	"updated_at",
 	"started_at",
 	"live_bytes",
@@ -103,7 +104,7 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 	case 0:
 		// Show status for all nodes.
 		jsonResponse := map[string][]status.NodeStatus{}
-		if err := getJSON(cliContext.Addr, server.PathForNodeStatus(""), &jsonResponse); err != nil {
+		if err := getJSON(cliContext.HTTPAddr, server.PathForNodeStatus(""), &jsonResponse); err != nil {
 			return err
 		}
 		nodeStatuses = jsonResponse["d"]
@@ -111,7 +112,7 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 	case 1:
 		nodeStatus := status.NodeStatus{}
 		nodeID := args[0]
-		if err := getJSON(cliContext.Addr, server.PathForNodeStatus(nodeID), &nodeStatus); err != nil {
+		if err := getJSON(cliContext.HTTPAddr, server.PathForNodeStatus(nodeID), &nodeStatus); err != nil {
 			return err
 		}
 		if nodeStatus.Desc.NodeID == 0 {
@@ -128,7 +129,7 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 		return util.Errorf("expected no arguments or a single node ID")
 	}
 
-	printQueryOutput(os.Stdout, nodesColumnHeaders, nodeStatusesToRows(nodeStatuses))
+	printQueryOutput(os.Stdout, nodesColumnHeaders, nodeStatusesToRows(nodeStatuses), "")
 	return nil
 }
 
@@ -139,24 +140,33 @@ func nodeStatusesToRows(statuses []status.NodeStatus) [][]string {
 	var rows [][]string
 	for _, nodeStatus := range statuses {
 		hostPort := nodeStatus.Desc.Address.AddressField
-		updatedAt := time.Unix(nodeStatus.UpdatedAt/1e9, nodeStatus.UpdatedAt%1e9)
+		updatedAt := time.Unix(0, nodeStatus.UpdatedAt)
 		updatedAtStr := updatedAt.Format(localTimeFormat)
-		startedAt := time.Unix(nodeStatus.StartedAt/1e9, nodeStatus.StartedAt%1e9)
+		startedAt := time.Unix(0, nodeStatus.StartedAt)
 		startedAtStr := startedAt.Format(localTimeFormat)
+		build := nodeStatus.BuildInfo.Tag
+
+		metricVals := map[string]float64{}
+		for _, storeStatus := range nodeStatus.StoreStatuses {
+			for key, val := range storeStatus.Metrics {
+				metricVals[key] += val
+			}
+		}
 
 		rows = append(rows, []string{
 			strconv.FormatInt(int64(nodeStatus.Desc.NodeID), 10),
 			hostPort,
+			build,
 			updatedAtStr,
 			startedAtStr,
-			strconv.FormatInt(int64(nodeStatus.Stats.LiveBytes), 10),
-			strconv.FormatInt(int64(nodeStatus.Stats.KeyBytes), 10),
-			strconv.FormatInt(int64(nodeStatus.Stats.ValBytes), 10),
-			strconv.FormatInt(int64(nodeStatus.Stats.IntentBytes), 10),
-			strconv.FormatInt(int64(nodeStatus.Stats.SysBytes), 10),
-			strconv.FormatInt(int64(nodeStatus.LeaderRangeCount), 10),
-			strconv.FormatInt(int64(nodeStatus.ReplicatedRangeCount), 10),
-			strconv.FormatInt(int64(nodeStatus.AvailableRangeCount), 10),
+			strconv.FormatInt(int64(metricVals["livebytes"]), 10),
+			strconv.FormatInt(int64(metricVals["keybytes"]), 10),
+			strconv.FormatInt(int64(metricVals["valbytes"]), 10),
+			strconv.FormatInt(int64(metricVals["intentbytes"]), 10),
+			strconv.FormatInt(int64(metricVals["sysbytes"]), 10),
+			strconv.FormatInt(int64(metricVals["ranges.leader"]), 10),
+			strconv.FormatInt(int64(metricVals["ranges.replicated"]), 10),
+			strconv.FormatInt(int64(metricVals["ranges.available"]), 10),
 		})
 	}
 	return rows

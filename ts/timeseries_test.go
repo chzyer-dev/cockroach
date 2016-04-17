@@ -22,19 +22,21 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
-func ts(name string, dps ...*TimeSeriesDatapoint) *TimeSeriesData {
-	return &TimeSeriesData{
+func ts(name string, dps ...TimeSeriesDatapoint) TimeSeriesData {
+	return TimeSeriesData{
 		Name:       name,
 		Datapoints: dps,
 	}
 }
 
-func tsdp(ts time.Duration, val float64) *TimeSeriesDatapoint {
-	return &TimeSeriesDatapoint{
-		TimestampNanos: int64(ts),
+func tsdp(ts time.Duration, val float64) TimeSeriesDatapoint {
+	return TimeSeriesDatapoint{
+		TimestampNanos: ts.Nanoseconds(),
 		Value:          val,
 	}
 }
@@ -42,45 +44,45 @@ func tsdp(ts time.Duration, val float64) *TimeSeriesDatapoint {
 // TestToInternal verifies the conversion of TimeSeriesData to internal storage
 // format is correct.
 func TestToInternal(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tcases := []struct {
 		keyDuration    int64
 		sampleDuration int64
-		expectsError   bool
-		input          *TimeSeriesData
-		expected       []*roachpb.InternalTimeSeriesData
+		expectedError  string
+		input          TimeSeriesData
+		expected       []roachpb.InternalTimeSeriesData
 	}{
 		{
 			time.Minute.Nanoseconds(),
 			101,
-			true,
+			"does not evenly divide key duration",
 			ts("error.series"),
 			nil,
 		},
 		{
 			time.Minute.Nanoseconds(),
 			time.Hour.Nanoseconds(),
-			true,
+			"does not evenly divide key duration",
 			ts("error.series"),
 			nil,
 		},
 		{
-			(time.Hour * 24).Nanoseconds(),
-			(time.Minute * 20).Nanoseconds(),
-			false,
+			(24 * time.Hour).Nanoseconds(),
+			(20 * time.Minute).Nanoseconds(),
+			"",
 			ts("test.series",
-				tsdp((time.Hour*5)+(time.Minute*5), 1.0),
-				tsdp((time.Hour*24)+(time.Minute*39), 2.0),
-				tsdp((time.Hour*10)+(time.Minute*10), 3.0),
-				tsdp((time.Hour*48), 4.0),
-				tsdp((time.Hour*15)+(time.Minute*22)+1, 5.0),
-				tsdp((time.Hour*52)+(time.Minute*15), 0.0),
+				tsdp(5*time.Hour+5*time.Minute, 1.0),
+				tsdp(24*time.Hour+39*time.Minute, 2.0),
+				tsdp(10*time.Hour+10*time.Minute, 3.0),
+				tsdp(48*time.Hour, 4.0),
+				tsdp(15*time.Hour+22*time.Minute+1, 5.0),
+				tsdp(52*time.Hour+15*time.Minute, 0.0),
 			),
-			[]*roachpb.InternalTimeSeriesData{
+			[]roachpb.InternalTimeSeriesData{
 				{
 					StartTimestampNanos: 0,
-					SampleDurationNanos: int64(time.Minute * 20),
-					Samples: []*roachpb.InternalTimeSeriesSample{
+					SampleDurationNanos: 20 * time.Minute.Nanoseconds(),
+					Samples: []roachpb.InternalTimeSeriesSample{
 						{
 							Offset: 15,
 							Count:  1,
@@ -99,9 +101,9 @@ func TestToInternal(t *testing.T) {
 					},
 				},
 				{
-					StartTimestampNanos: int64(time.Hour * 24),
-					SampleDurationNanos: int64(time.Minute * 20),
-					Samples: []*roachpb.InternalTimeSeriesSample{
+					StartTimestampNanos: 24 * time.Hour.Nanoseconds(),
+					SampleDurationNanos: 20 * time.Minute.Nanoseconds(),
+					Samples: []roachpb.InternalTimeSeriesSample{
 						{
 							Offset: 1,
 							Count:  1,
@@ -110,9 +112,9 @@ func TestToInternal(t *testing.T) {
 					},
 				},
 				{
-					StartTimestampNanos: int64(time.Hour * 48),
-					SampleDurationNanos: int64(time.Minute * 20),
-					Samples: []*roachpb.InternalTimeSeriesSample{
+					StartTimestampNanos: 48 * time.Hour.Nanoseconds(),
+					SampleDurationNanos: 20 * time.Minute.Nanoseconds(),
+					Samples: []roachpb.InternalTimeSeriesSample{
 						{
 							Offset: 0,
 							Count:  1,
@@ -131,18 +133,44 @@ func TestToInternal(t *testing.T) {
 
 	for i, tc := range tcases {
 		actual, err := tc.input.ToInternal(tc.keyDuration, tc.sampleDuration)
-		if err != nil {
-			if !tc.expectsError {
-				t.Errorf("unexpected error from case %d: %s", i, err.Error())
+		if e := tc.expectedError; len(e) > 0 {
+			if !testutils.IsError(err, e) {
+				t.Errorf("unexpected error from case %d: %v", i, err)
 			}
-			continue
-		} else if tc.expectsError {
-			t.Errorf("expected error from case %d, none encountered", i)
-			continue
+		} else {
+			if err != nil {
+				t.Errorf("unexpected error from case %d: %v", i, err)
+			}
 		}
 
 		if !reflect.DeepEqual(actual, tc.expected) {
 			t.Errorf("case %d fails: ToInternal result was %v, expected %v", i, actual, tc.expected)
 		}
+	}
+}
+
+// TestDiscardEarlierSamples verifies that only a single sample is kept for each
+// sample period; earlier samples are discarded.
+func TestDiscardEarlierSamples(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ts := ts("test.series",
+		tsdp(5*time.Hour+5*time.Minute, -1.0),
+		tsdp(5*time.Hour+5*time.Minute, -2.0),
+	)
+	internal, err := ts.ToInternal(Resolution10s.KeyDuration(), Resolution10s.SampleDuration())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := engine.MergeInternalTimeSeriesData(internal...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if maxVal := out.Samples[0].Max; maxVal != nil {
+		t.Fatal("Expected maximum of sample 0 to be nil; samples are no longer merged.")
+	}
+	if a, e := out.Samples[0].Sum, -2.0; a != e {
+		t.Fatalf("Expected sum of sample 0 to be %f after initial merge, was %f", e, a)
 	}
 }

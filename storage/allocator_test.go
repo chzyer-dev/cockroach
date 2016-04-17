@@ -23,7 +23,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -165,8 +164,8 @@ var multiDCStores = []*roachpb.StoreDescriptor{
 func createTestAllocator() (*stop.Stopper, *gossip.Gossip, *StorePool, Allocator) {
 	stopper := stop.NewStopper()
 	clock := hlc.NewClock(hlc.UnixNano)
-	rpcContext := rpc.NewContext(&base.Context{}, clock, stopper)
-	g := gossip.New(rpcContext, gossip.TestBootstrap, stopper)
+	rpcContext := rpc.NewContext(nil, clock, stopper)
+	g := gossip.New(rpcContext, nil, stopper)
 	// Have to call g.SetNodeID before call g.AddInfo
 	g.SetNodeID(roachpb.NodeID(1))
 	storePool := NewStorePool(g, clock, TestTimeUntilStoreDeadOff, stopper)
@@ -184,19 +183,19 @@ func mockStorePool(storePool *StorePool, aliveStoreIDs, deadStoreIDs []roachpb.S
 	for _, storeID := range aliveStoreIDs {
 		storePool.stores[storeID] = &storeDetail{
 			dead: false,
-			desc: roachpb.StoreDescriptor{StoreID: storeID},
+			desc: &roachpb.StoreDescriptor{StoreID: storeID},
 		}
 	}
 	for _, storeID := range deadStoreIDs {
 		storePool.stores[storeID] = &storeDetail{
 			dead: true,
-			desc: roachpb.StoreDescriptor{StoreID: storeID},
+			desc: &roachpb.StoreDescriptor{StoreID: storeID},
 		}
 	}
 }
 
 func TestAllocatorSimpleRetrieval(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 	gossiputil.NewStoreGossiper(g).GossipStores(singleStore, t)
@@ -210,7 +209,7 @@ func TestAllocatorSimpleRetrieval(t *testing.T) {
 }
 
 func TestAllocatorNoAvailableDisks(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, _, _, a := createTestAllocator()
 	defer stopper.Stop()
 	result, err := a.AllocateTarget(simpleZoneConfig.ReplicaAttrs[0], []roachpb.ReplicaDescriptor{}, false, nil)
@@ -223,7 +222,7 @@ func TestAllocatorNoAvailableDisks(t *testing.T) {
 }
 
 func TestAllocatorThreeDisksSameDC(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
@@ -260,7 +259,7 @@ func TestAllocatorThreeDisksSameDC(t *testing.T) {
 }
 
 func TestAllocatorTwoDatacenters(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 	gossiputil.NewStoreGossiper(g).GossipStores(multiDCStores, t)
@@ -288,7 +287,7 @@ func TestAllocatorTwoDatacenters(t *testing.T) {
 }
 
 func TestAllocatorExistingReplica(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
@@ -310,7 +309,7 @@ func TestAllocatorExistingReplica(t *testing.T) {
 // will be relaxed in order to match nodes lacking required attributes,
 // if necessary to find an allocation target.
 func TestAllocatorRelaxConstraints(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 	gossiputil.NewStoreGossiper(g).GossipStores(multiDCStores, t)
@@ -358,7 +357,7 @@ func TestAllocatorRelaxConstraints(t *testing.T) {
 // TestAllocatorRandomAllocation verifies that allocations bias
 // towards least loaded stores.
 func TestAllocatorRandomAllocation(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 
@@ -403,7 +402,7 @@ func TestAllocatorRandomAllocation(t *testing.T) {
 // TestAllocatorRebalance verifies that rebalance targets are chosen
 // randomly from amongst stores over the minAvailCapacityThreshold.
 func TestAllocatorRebalance(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 
@@ -455,7 +454,7 @@ func TestAllocatorRebalance(t *testing.T) {
 // TestAllocatorRebalance verifies that only rebalance targets within
 // a standard deviation of the mean are chosen.
 func TestAllocatorRebalanceByCapacity(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 
@@ -505,7 +504,7 @@ func TestAllocatorRebalanceByCapacity(t *testing.T) {
 // chosen by range counts in the event that available capacities
 // exceed the maxAvailCapacityThreshold.
 func TestAllocatorRebalanceByCount(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 
@@ -555,7 +554,7 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 // TestAllocatorRemoveTarget verifies that the replica chosen by RemoveTarget is
 // the one with the lowest capacity.
 func TestAllocatorRemoveTarget(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, g, _, a := createTestAllocator()
 	defer stopper.Stop()
 
@@ -653,7 +652,7 @@ func TestAllocatorRemoveTarget(t *testing.T) {
 }
 
 func TestAllocatorComputeAction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper, _, sp, a := createTestAllocator()
 	defer stopper.Stop()
 
@@ -1053,6 +1052,59 @@ func TestAllocatorComputeAction(t *testing.T) {
 			t.Errorf("Test cases should have descending priority. Case %d had priority %f, previous case had priority %f", i, priority, lastPriority)
 		}
 		lastPriority = priority
+	}
+}
+
+// TestAllocatorComputeActionNoStorePool verifies that
+// ComputeAction returns AllocatorNoop when storePool is nil.
+func TestAllocatorComputeActionNoStorePool(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	a := MakeAllocator(nil /* storePool */, AllocatorOptions{})
+	action, priority := a.ComputeAction(config.ZoneConfig{}, nil)
+	if action != AllocatorNoop {
+		t.Errorf("expected AllocatorNoop, but got %v", action)
+	}
+	if priority != 0 {
+		t.Errorf("expected priority 0, but got %f", priority)
+	}
+}
+
+// TestAllocatorError ensures that the correctly formatted error message is
+// returned from an allocatorError.
+func TestAllocatorError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	attribute := roachpb.Attributes{Attrs: []string{"one"}}
+	attributes := roachpb.Attributes{Attrs: []string{"one", "two"}}
+
+	testCases := []struct {
+		ae       allocatorError
+		expected string
+	}{
+		{allocatorError{roachpb.Attributes{}, false, 1},
+			"0 of 1 store with all attributes matching []; likely not enough nodes in cluster"},
+		{allocatorError{attribute, false, 1},
+			"0 of 1 store with all attributes matching [one]"},
+		{allocatorError{attribute, true, 1},
+			"0 of 1 store with an attribute matching [one]; likely not enough nodes in cluster"},
+		{allocatorError{attribute, false, 2},
+			"0 of 2 stores with all attributes matching [one]"},
+		{allocatorError{attribute, true, 2},
+			"0 of 2 stores with an attribute matching [one]; likely not enough nodes in cluster"},
+		{allocatorError{attributes, false, 1},
+			"0 of 1 store with all attributes matching [one,two]"},
+		{allocatorError{attributes, true, 1},
+			"0 of 1 store with an attribute matching [one,two]; likely not enough nodes in cluster"},
+		{allocatorError{attributes, false, 2},
+			"0 of 2 stores with all attributes matching [one,two]"},
+		{allocatorError{attributes, true, 2},
+			"0 of 2 stores with an attribute matching [one,two]; likely not enough nodes in cluster"},
+	}
+
+	for i, testCase := range testCases {
+		if actual := testCase.ae.Error(); testCase.expected != actual {
+			t.Errorf("%d: actual error message \"%s\" does not match expected \"%s\"", i, actual, testCase.expected)
+		}
 	}
 }
 

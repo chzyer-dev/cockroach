@@ -17,18 +17,6 @@ var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
 
-// A RaftCommand is a command which can be serialized and sent via
-// raft.
-type RaftCommand struct {
-	RangeID       RangeID           `protobuf:"varint,1,opt,name=range_id,casttype=RangeID" json:"range_id"`
-	OriginReplica ReplicaDescriptor `protobuf:"bytes,2,opt,name=origin_replica" json:"origin_replica"`
-	Cmd           BatchRequest      `protobuf:"bytes,3,opt,name=cmd" json:"cmd"`
-}
-
-func (m *RaftCommand) Reset()         { *m = RaftCommand{} }
-func (m *RaftCommand) String() string { return proto.CompactTextString(m) }
-func (*RaftCommand) ProtoMessage()    {}
-
 // InternalTimeSeriesData is a collection of data samples for some
 // measurable value, where each sample is taken over a uniform time
 // interval.
@@ -51,16 +39,17 @@ type InternalTimeSeriesData struct {
 	// Holds a wall time, expressed as a unix epoch time in nanoseconds. This
 	// represents the earliest possible timestamp for a sample within the
 	// collection.
-	StartTimestampNanos int64 `protobuf:"varint,1,opt,name=start_timestamp_nanos" json:"start_timestamp_nanos"`
+	StartTimestampNanos int64 `protobuf:"varint,1,opt,name=start_timestamp_nanos,json=startTimestampNanos" json:"start_timestamp_nanos"`
 	// The duration of each sample interval, expressed in nanoseconds.
-	SampleDurationNanos int64 `protobuf:"varint,2,opt,name=sample_duration_nanos" json:"sample_duration_nanos"`
+	SampleDurationNanos int64 `protobuf:"varint,2,opt,name=sample_duration_nanos,json=sampleDurationNanos" json:"sample_duration_nanos"`
 	// The actual data samples for this metric.
-	Samples []*InternalTimeSeriesSample `protobuf:"bytes,3,rep,name=samples" json:"samples,omitempty"`
+	Samples []InternalTimeSeriesSample `protobuf:"bytes,3,rep,name=samples" json:"samples"`
 }
 
-func (m *InternalTimeSeriesData) Reset()         { *m = InternalTimeSeriesData{} }
-func (m *InternalTimeSeriesData) String() string { return proto.CompactTextString(m) }
-func (*InternalTimeSeriesData) ProtoMessage()    {}
+func (m *InternalTimeSeriesData) Reset()                    { *m = InternalTimeSeriesData{} }
+func (m *InternalTimeSeriesData) String() string            { return proto.CompactTextString(m) }
+func (*InternalTimeSeriesData) ProtoMessage()               {}
+func (*InternalTimeSeriesData) Descriptor() ([]byte, []int) { return fileDescriptorInternal, []int{0} }
 
 // A InternalTimeSeriesSample represents data gathered from multiple
 // measurements of a variable value over a given period of time. The
@@ -87,111 +76,25 @@ type InternalTimeSeriesSample struct {
 	// determined by the value of the "sample_duration_milliseconds" field of
 	// the TimeSeriesData collection.
 	Offset int32 `protobuf:"varint,1,opt,name=offset" json:"offset"`
-	// Count of measurements taken within this sample.
-	Count uint32 `protobuf:"varint,6,opt,name=count" json:"count"`
 	// Sum of all measurements.
 	Sum float64 `protobuf:"fixed64,7,opt,name=sum" json:"sum"`
+	// Count of measurements taken within this sample.
+	Count uint32 `protobuf:"varint,6,opt,name=count" json:"count"`
 	// Maximum encountered measurement in this sample.
 	Max *float64 `protobuf:"fixed64,8,opt,name=max" json:"max,omitempty"`
 	// Minimum encountered measurement in this sample.
 	Min *float64 `protobuf:"fixed64,9,opt,name=min" json:"min,omitempty"`
 }
 
-func (m *InternalTimeSeriesSample) Reset()         { *m = InternalTimeSeriesSample{} }
-func (m *InternalTimeSeriesSample) String() string { return proto.CompactTextString(m) }
-func (*InternalTimeSeriesSample) ProtoMessage()    {}
-
-// RaftTruncatedState contains metadata about the truncated portion of the raft log.
-// Raft requires access to the term of the last truncated log entry even after the
-// rest of the entry has been discarded.
-type RaftTruncatedState struct {
-	// The highest index that has been removed from the log.
-	Index uint64 `protobuf:"varint,1,opt,name=index" json:"index"`
-	// The term corresponding to 'index'.
-	Term uint64 `protobuf:"varint,2,opt,name=term" json:"term"`
-}
-
-func (m *RaftTruncatedState) Reset()         { *m = RaftTruncatedState{} }
-func (m *RaftTruncatedState) String() string { return proto.CompactTextString(m) }
-func (*RaftTruncatedState) ProtoMessage()    {}
-
-// RaftTombstone contains information about a replica that has been deleted.
-type RaftTombstone struct {
-	NextReplicaID ReplicaID `protobuf:"varint,1,opt,name=next_replica_id,casttype=ReplicaID" json:"next_replica_id"`
-}
-
-func (m *RaftTombstone) Reset()         { *m = RaftTombstone{} }
-func (m *RaftTombstone) String() string { return proto.CompactTextString(m) }
-func (*RaftTombstone) ProtoMessage()    {}
-
-// RaftSnapshotData is the payload of a raftpb.Snapshot. It contains a raw copy of
-// all of the range's data and metadata, including the raft log, sequence cache, etc.
-type RaftSnapshotData struct {
-	// The latest RangeDescriptor
-	RangeDescriptor RangeDescriptor              `protobuf:"bytes,1,opt,name=range_descriptor" json:"range_descriptor"`
-	KV              []*RaftSnapshotData_KeyValue `protobuf:"bytes,2,rep,name=KV" json:"KV,omitempty"`
-}
-
-func (m *RaftSnapshotData) Reset()         { *m = RaftSnapshotData{} }
-func (m *RaftSnapshotData) String() string { return proto.CompactTextString(m) }
-func (*RaftSnapshotData) ProtoMessage()    {}
-
-type RaftSnapshotData_KeyValue struct {
-	Key       []byte    `protobuf:"bytes,1,opt,name=key" json:"key,omitempty"`
-	Value     []byte    `protobuf:"bytes,2,opt,name=value" json:"value,omitempty"`
-	Timestamp Timestamp `protobuf:"bytes,3,opt,name=timestamp" json:"timestamp"`
-}
-
-func (m *RaftSnapshotData_KeyValue) Reset()         { *m = RaftSnapshotData_KeyValue{} }
-func (m *RaftSnapshotData_KeyValue) String() string { return proto.CompactTextString(m) }
-func (*RaftSnapshotData_KeyValue) ProtoMessage()    {}
+func (m *InternalTimeSeriesSample) Reset()                    { *m = InternalTimeSeriesSample{} }
+func (m *InternalTimeSeriesSample) String() string            { return proto.CompactTextString(m) }
+func (*InternalTimeSeriesSample) ProtoMessage()               {}
+func (*InternalTimeSeriesSample) Descriptor() ([]byte, []int) { return fileDescriptorInternal, []int{1} }
 
 func init() {
-	proto.RegisterType((*RaftCommand)(nil), "cockroach.roachpb.RaftCommand")
 	proto.RegisterType((*InternalTimeSeriesData)(nil), "cockroach.roachpb.InternalTimeSeriesData")
 	proto.RegisterType((*InternalTimeSeriesSample)(nil), "cockroach.roachpb.InternalTimeSeriesSample")
-	proto.RegisterType((*RaftTruncatedState)(nil), "cockroach.roachpb.RaftTruncatedState")
-	proto.RegisterType((*RaftTombstone)(nil), "cockroach.roachpb.RaftTombstone")
-	proto.RegisterType((*RaftSnapshotData)(nil), "cockroach.roachpb.RaftSnapshotData")
-	proto.RegisterType((*RaftSnapshotData_KeyValue)(nil), "cockroach.roachpb.RaftSnapshotData.KeyValue")
 }
-func (m *RaftCommand) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *RaftCommand) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	data[i] = 0x8
-	i++
-	i = encodeVarintInternal(data, i, uint64(m.RangeID))
-	data[i] = 0x12
-	i++
-	i = encodeVarintInternal(data, i, uint64(m.OriginReplica.Size()))
-	n1, err := m.OriginReplica.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n1
-	data[i] = 0x1a
-	i++
-	i = encodeVarintInternal(data, i, uint64(m.Cmd.Size()))
-	n2, err := m.Cmd.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n2
-	return i, nil
-}
-
 func (m *InternalTimeSeriesData) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
@@ -265,127 +168,6 @@ func (m *InternalTimeSeriesSample) MarshalTo(data []byte) (int, error) {
 	return i, nil
 }
 
-func (m *RaftTruncatedState) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *RaftTruncatedState) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	data[i] = 0x8
-	i++
-	i = encodeVarintInternal(data, i, uint64(m.Index))
-	data[i] = 0x10
-	i++
-	i = encodeVarintInternal(data, i, uint64(m.Term))
-	return i, nil
-}
-
-func (m *RaftTombstone) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *RaftTombstone) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	data[i] = 0x8
-	i++
-	i = encodeVarintInternal(data, i, uint64(m.NextReplicaID))
-	return i, nil
-}
-
-func (m *RaftSnapshotData) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *RaftSnapshotData) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	data[i] = 0xa
-	i++
-	i = encodeVarintInternal(data, i, uint64(m.RangeDescriptor.Size()))
-	n3, err := m.RangeDescriptor.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n3
-	if len(m.KV) > 0 {
-		for _, msg := range m.KV {
-			data[i] = 0x12
-			i++
-			i = encodeVarintInternal(data, i, uint64(msg.Size()))
-			n, err := msg.MarshalTo(data[i:])
-			if err != nil {
-				return 0, err
-			}
-			i += n
-		}
-	}
-	return i, nil
-}
-
-func (m *RaftSnapshotData_KeyValue) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *RaftSnapshotData_KeyValue) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	if m.Key != nil {
-		data[i] = 0xa
-		i++
-		i = encodeVarintInternal(data, i, uint64(len(m.Key)))
-		i += copy(data[i:], m.Key)
-	}
-	if m.Value != nil {
-		data[i] = 0x12
-		i++
-		i = encodeVarintInternal(data, i, uint64(len(m.Value)))
-		i += copy(data[i:], m.Value)
-	}
-	data[i] = 0x1a
-	i++
-	i = encodeVarintInternal(data, i, uint64(m.Timestamp.Size()))
-	n4, err := m.Timestamp.MarshalTo(data[i:])
-	if err != nil {
-		return 0, err
-	}
-	i += n4
-	return i, nil
-}
-
 func encodeFixed64Internal(data []byte, offset int, v uint64) int {
 	data[offset] = uint8(v)
 	data[offset+1] = uint8(v >> 8)
@@ -413,17 +195,6 @@ func encodeVarintInternal(data []byte, offset int, v uint64) int {
 	data[offset] = uint8(v)
 	return offset + 1
 }
-func (m *RaftCommand) Size() (n int) {
-	var l int
-	_ = l
-	n += 1 + sovInternal(uint64(m.RangeID))
-	l = m.OriginReplica.Size()
-	n += 1 + l + sovInternal(uint64(l))
-	l = m.Cmd.Size()
-	n += 1 + l + sovInternal(uint64(l))
-	return n
-}
-
 func (m *InternalTimeSeriesData) Size() (n int) {
 	var l int
 	_ = l
@@ -453,51 +224,6 @@ func (m *InternalTimeSeriesSample) Size() (n int) {
 	return n
 }
 
-func (m *RaftTruncatedState) Size() (n int) {
-	var l int
-	_ = l
-	n += 1 + sovInternal(uint64(m.Index))
-	n += 1 + sovInternal(uint64(m.Term))
-	return n
-}
-
-func (m *RaftTombstone) Size() (n int) {
-	var l int
-	_ = l
-	n += 1 + sovInternal(uint64(m.NextReplicaID))
-	return n
-}
-
-func (m *RaftSnapshotData) Size() (n int) {
-	var l int
-	_ = l
-	l = m.RangeDescriptor.Size()
-	n += 1 + l + sovInternal(uint64(l))
-	if len(m.KV) > 0 {
-		for _, e := range m.KV {
-			l = e.Size()
-			n += 1 + l + sovInternal(uint64(l))
-		}
-	}
-	return n
-}
-
-func (m *RaftSnapshotData_KeyValue) Size() (n int) {
-	var l int
-	_ = l
-	if m.Key != nil {
-		l = len(m.Key)
-		n += 1 + l + sovInternal(uint64(l))
-	}
-	if m.Value != nil {
-		l = len(m.Value)
-		n += 1 + l + sovInternal(uint64(l))
-	}
-	l = m.Timestamp.Size()
-	n += 1 + l + sovInternal(uint64(l))
-	return n
-}
-
 func sovInternal(x uint64) (n int) {
 	for {
 		n++
@@ -510,135 +236,6 @@ func sovInternal(x uint64) (n int) {
 }
 func sozInternal(x uint64) (n int) {
 	return sovInternal(uint64((x << 1) ^ uint64((int64(x) >> 63))))
-}
-func (m *RaftCommand) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowInternal
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: RaftCommand: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: RaftCommand: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RangeID", wireType)
-			}
-			m.RangeID = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.RangeID |= (RangeID(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field OriginReplica", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthInternal
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.OriginReplica.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 3:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Cmd", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthInternal
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Cmd.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipInternal(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthInternal
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
 }
 func (m *InternalTimeSeriesData) Unmarshal(data []byte) error {
 	l := len(data)
@@ -733,7 +330,7 @@ func (m *InternalTimeSeriesData) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Samples = append(m.Samples, &InternalTimeSeriesSample{})
+			m.Samples = append(m.Samples, InternalTimeSeriesSample{})
 			if err := m.Samples[len(m.Samples)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -903,416 +500,6 @@ func (m *InternalTimeSeriesSample) Unmarshal(data []byte) error {
 	}
 	return nil
 }
-func (m *RaftTruncatedState) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowInternal
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: RaftTruncatedState: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: RaftTruncatedState: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Index", wireType)
-			}
-			m.Index = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.Index |= (uint64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Term", wireType)
-			}
-			m.Term = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.Term |= (uint64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		default:
-			iNdEx = preIndex
-			skippy, err := skipInternal(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthInternal
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *RaftTombstone) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowInternal
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: RaftTombstone: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: RaftTombstone: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field NextReplicaID", wireType)
-			}
-			m.NextReplicaID = 0
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				m.NextReplicaID |= (ReplicaID(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		default:
-			iNdEx = preIndex
-			skippy, err := skipInternal(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthInternal
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *RaftSnapshotData) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowInternal
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: RaftSnapshotData: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: RaftSnapshotData: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RangeDescriptor", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthInternal
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.RangeDescriptor.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field KV", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthInternal
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.KV = append(m.KV, &RaftSnapshotData_KeyValue{})
-			if err := m.KV[len(m.KV)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipInternal(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthInternal
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *RaftSnapshotData_KeyValue) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowInternal
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: KeyValue: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: KeyValue: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthInternal
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Key = append(m.Key[:0], data[iNdEx:postIndex]...)
-			if m.Key == nil {
-				m.Key = []byte{}
-			}
-			iNdEx = postIndex
-		case 2:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Value", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthInternal
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Value = append(m.Value[:0], data[iNdEx:postIndex]...)
-			if m.Value == nil {
-				m.Value = []byte{}
-			}
-			iNdEx = postIndex
-		case 3:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Timestamp", wireType)
-			}
-			var msglen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowInternal
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				msglen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if msglen < 0 {
-				return ErrInvalidLengthInternal
-			}
-			postIndex := iNdEx + msglen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			if err := m.Timestamp.Unmarshal(data[iNdEx:postIndex]); err != nil {
-				return err
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipInternal(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthInternal
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
 func skipInternal(data []byte) (n int, err error) {
 	l := len(data)
 	iNdEx := 0
@@ -1417,3 +604,27 @@ var (
 	ErrInvalidLengthInternal = fmt.Errorf("proto: negative length found during unmarshaling")
 	ErrIntOverflowInternal   = fmt.Errorf("proto: integer overflow")
 )
+
+var fileDescriptorInternal = []byte{
+	// 306 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0x74, 0x8f, 0x4f, 0x4b, 0xfb, 0x30,
+	0x18, 0xc7, 0x9b, 0x5f, 0x7f, 0xdb, 0x34, 0x22, 0x68, 0xd4, 0x11, 0x86, 0xcc, 0xba, 0xd3, 0x40,
+	0x68, 0xc1, 0x93, 0xe7, 0xb1, 0x8b, 0x08, 0x1e, 0xb6, 0x1d, 0xc4, 0x4b, 0x89, 0x35, 0x9b, 0xc1,
+	0x35, 0x29, 0x49, 0x0a, 0xbe, 0x8c, 0xbd, 0xac, 0x1e, 0x3d, 0xea, 0x45, 0xfc, 0xf3, 0x46, 0x4c,
+	0xd3, 0x67, 0x82, 0x0c, 0x0f, 0xcf, 0x78, 0xf6, 0xf9, 0x7e, 0xbe, 0xa1, 0x0f, 0x8e, 0x32, 0x95,
+	0x3d, 0x6a, 0xc5, 0xb2, 0x87, 0xc4, 0xff, 0x16, 0x77, 0x89, 0x90, 0x96, 0x6b, 0xc9, 0x96, 0x71,
+	0xa1, 0x95, 0x55, 0x64, 0xff, 0xc7, 0x88, 0xc1, 0xe8, 0x1d, 0x2e, 0xd4, 0x42, 0xf9, 0x34, 0xa9,
+	0xb7, 0x46, 0x1c, 0xbc, 0x22, 0xdc, 0xbd, 0x84, 0xee, 0x4c, 0xe4, 0x7c, 0xca, 0xb5, 0xe0, 0x66,
+	0xcc, 0x2c, 0x23, 0x17, 0xf8, 0xc8, 0x58, 0xa6, 0x6d, 0x6a, 0x1d, 0x77, 0x5b, 0x5e, 0xa4, 0x92,
+	0x49, 0x65, 0x28, 0x8a, 0xd0, 0x30, 0x1c, 0xfd, 0xaf, 0xde, 0x4e, 0x82, 0xc9, 0x81, 0x57, 0x66,
+	0x6b, 0xe3, 0xba, 0x16, 0x7c, 0xd3, 0xfd, 0x59, 0xf2, 0xf4, 0xbe, 0xd4, 0xcc, 0x0a, 0x25, 0xa1,
+	0xf9, 0xef, 0x57, 0xd3, 0x2b, 0x63, 0x30, 0x9a, 0xe6, 0x15, 0xee, 0x34, 0xd8, 0xd0, 0x30, 0x0a,
+	0x87, 0x3b, 0xe7, 0x67, 0xf1, 0xc6, 0x25, 0xf1, 0xe6, 0xf7, 0x4e, 0x7d, 0x07, 0x1e, 0x5e, 0xbf,
+	0x30, 0x58, 0x21, 0x4c, 0xff, 0x72, 0xc9, 0x31, 0x6e, 0xab, 0xf9, 0xdc, 0x70, 0xeb, 0xcf, 0x69,
+	0x41, 0x17, 0x18, 0xe9, 0xe1, 0x56, 0xa6, 0x4a, 0x69, 0x69, 0xdb, 0x85, 0xbb, 0x10, 0x36, 0x88,
+	0x74, 0x71, 0x68, 0xca, 0x9c, 0x76, 0x5c, 0x82, 0x20, 0xa9, 0x01, 0xd9, 0xc3, 0x61, 0xce, 0x9e,
+	0xe8, 0x56, 0xcd, 0x27, 0xf5, 0xea, 0x89, 0x90, 0x74, 0x1b, 0x88, 0x90, 0xa3, 0xd3, 0xea, 0xa3,
+	0x1f, 0x54, 0x9f, 0x7d, 0xf4, 0xec, 0xe6, 0xc5, 0xcd, 0xbb, 0x9b, 0xd5, 0x57, 0x3f, 0xb8, 0xed,
+	0xc0, 0x75, 0x37, 0xc1, 0x77, 0x00, 0x00, 0x00, 0xff, 0xff, 0xee, 0xa3, 0xb2, 0x20, 0xdf, 0x01,
+	0x00, 0x00,
+}

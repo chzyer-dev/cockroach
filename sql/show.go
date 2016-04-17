@@ -18,6 +18,7 @@ package sql
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/keys"
@@ -27,7 +28,7 @@ import (
 )
 
 // Show a session-local variable name.
-func (p *planner) Show(n *parser.Show) (planNode, *roachpb.Error) {
+func (p *planner) Show(n *parser.Show) (planNode, error) {
 	name := strings.ToUpper(n.Name)
 
 	v := &valuesNode{columns: []ResultColumn{{Name: name, Typ: parser.DummyString}}}
@@ -38,19 +39,20 @@ func (p *planner) Show(n *parser.Show) (planNode, *roachpb.Error) {
 	case `TIME ZONE`:
 		loc, err := p.evalCtx.GetLocation()
 		if err != nil {
-			return nil, roachpb.NewError(err)
+			return nil, err
 		}
 		v.rows = append(v.rows, []parser.Datum{parser.DString(loc.String())})
 	case `SYNTAX`:
 		v.rows = append(v.rows, []parser.Datum{parser.DString(parser.Syntax(p.session.Syntax).String())})
 	case `DEFAULT_TRANSACTION_ISOLATION`:
-		v.rows = append(v.rows, []parser.Datum{parser.DString("SERIALIZABLE")})
+		level := p.session.DefaultIsolationLevel.String()
+		v.rows = append(v.rows, []parser.Datum{parser.DString(level)})
 	case `TRANSACTION ISOLATION LEVEL`:
 		v.rows = append(v.rows, []parser.Datum{parser.DString(p.txn.Proto.Isolation.String())})
 	case `TRANSACTION PRIORITY`:
 		v.rows = append(v.rows, []parser.Datum{parser.DString(p.txn.UserPriority.String())})
 	default:
-		return nil, roachpb.NewUErrorf("unknown variable: %q", name)
+		return nil, fmt.Errorf("unknown variable: %q", name)
 	}
 
 	return v, nil
@@ -168,7 +170,7 @@ func (p *planner) ShowGrants(n *parser.ShowGrants) (planNode, *roachpb.Error) {
 
 // ShowIndex returns all the indexes for a table.
 // Privileges: None.
-//   Notes: postgres does not have a SHOW INDEX statement.
+//   Notes: postgres does not have a SHOW INDEXES statement.
 //          mysql requires some privilege for any column.
 func (p *planner) ShowIndex(n *parser.ShowIndex) (planNode, *roachpb.Error) {
 	desc, pErr := p.getTableDesc(n.Table)
@@ -225,13 +227,14 @@ func (p *planner) ShowTables(n *parser.ShowTables) (planNode, *roachpb.Error) {
 	//     WHERE parentID = (SELECT id FROM system.namespace
 	//                       WHERE parentID = 0 AND name = <database>)
 
-	if n.Name == nil {
+	name := n.Name
+	if name == nil {
 		if p.session.Database == "" {
 			return nil, roachpb.NewError(errNoDatabase)
 		}
-		n.Name = &parser.QualifiedName{Base: parser.Name(p.session.Database)}
+		name = &parser.QualifiedName{Base: parser.Name(p.session.Database)}
 	}
-	dbDesc, pErr := p.getDatabaseDesc(string(n.Name.Base))
+	dbDesc, pErr := p.getDatabaseDesc(string(name.Base))
 	if pErr != nil {
 		return nil, pErr
 	}

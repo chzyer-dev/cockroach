@@ -181,7 +181,7 @@ func (mt mutationTest) writeMutation(m csql.DescriptorMutation) {
 }
 
 func TestOperationsWithColumnMutation(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
 	defer csql.TestDisableTableLeases()()
@@ -245,6 +245,10 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i');
 		// The table only contains columns "k" and "v".
 		_ = mTest.checkQueryResponse(starQuery, [][]string{{"a", "z"}})
 
+		// The column backfill uses Put instead of CPut because it depends on
+		// an INSERT of a column in the WRITE_ONLY state failing. These two
+		// tests guarantee that.
+
 		// Inserting a row into the table while specifying column "i" results in an error.
 		if _, err := sqlDB.Exec(`INSERT INTO t.test (k, v, i) VALUES ('b', 'y', 'i')`); !testutils.IsError(err, `column "i" does not exist`) {
 			t.Fatal(err)
@@ -285,6 +289,10 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, i CHAR DEFAULT 'i');
 		// Notice that the default value of "i" is only written when the
 		// descriptor is in the WRITE_ONLY state.
 		_ = mTest.checkQueryResponse(starQuery, afterInsert)
+
+		// The column backfill uses Put instead of CPut because it depends on
+		// an UPDATE of a column in the WRITE_ONLY state failing. This test
+		// guarantees that.
 
 		// Make column "i" a mutation.
 		mTest.writeColumnMutation("i", csql.DescriptorMutation{State: state})
@@ -362,7 +370,7 @@ func (mt mutationTest) writeIndexMutation(index string, m csql.DescriptorMutatio
 }
 
 func TestOperationsWithIndexMutation(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// The descriptor changes made must have an immediate effect.
 	defer csql.TestDisableTableLeases()()
 	// Disable external processing of mutations.
@@ -401,7 +409,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 	}
 
 	starQuery := `SELECT * FROM t.test`
-	indexQuery := `SELECT * FROM t.test@foo`
+	indexQuery := `SELECT v FROM t.test@foo`
 	// See the effect of the operations depending on the state.
 	for _, state := range []csql.DescriptorMutation_State{csql.DescriptorMutation_DELETE_ONLY, csql.DescriptorMutation_WRITE_ONLY} {
 		// Init table with some entries.
@@ -492,7 +500,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR, INDEX foo (v));
 }
 
 func TestCommandsWithPendingMutations(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
 	defer csql.TestDisableTableLeases()()
@@ -674,7 +682,7 @@ CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
 	// Make "ufo" live.
 	mt.makeMutationsActive()
 	// The index has been renamed to ufo, and the column to d.
-	_ = mt.checkQueryResponse("SHOW INDEX FROM t.test", [][]string{{"test", "primary", "true", "1", "a", "ASC", "false"}, {"test", "ufo", "false", "1", "d", "ASC", "false"}})
+	_ = mt.checkQueryResponse("SHOW INDEXES FROM t.test", [][]string{{"test", "primary", "true", "1", "a", "ASC", "false"}, {"test", "ufo", "false", "1", "d", "ASC", "false"}})
 
 	// Rename column under mutation works properly.
 
@@ -692,4 +700,18 @@ CREATE TABLE t.test (a CHAR PRIMARY KEY, b CHAR, c CHAR, INDEX foo (c));
 	mt.makeMutationsActive()
 	// Column b changed to d.
 	_ = mt.checkQueryResponse("SHOW COLUMNS FROM t.test", [][]string{{"a", "STRING", "false", "NULL"}, {"d", "STRING", "true", "NULL"}, {"e", "STRING", "true", "NULL"}})
+
+	// Try to change column defaults while column is under mutation.
+	mt.writeColumnMutation("e", csql.DescriptorMutation{Direction: csql.DescriptorMutation_ADD})
+	if _, err := sqlDB.Exec(`ALTER TABLE t.test ALTER COLUMN e SET DEFAULT 'a'`); !testutils.IsError(
+		err, `column "e" in the middle of being added`) {
+		t.Fatal(err)
+	}
+	mt.makeMutationsActive()
+	mt.writeColumnMutation("e", csql.DescriptorMutation{Direction: csql.DescriptorMutation_DROP})
+	if _, err := sqlDB.Exec(`ALTER TABLE t.test ALTER COLUMN e SET DEFAULT 'a'`); !testutils.IsError(
+		err, `column "e" in the middle of being dropped`) {
+		t.Fatal(err)
+	}
+	mt.makeMutationsActive()
 }

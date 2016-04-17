@@ -27,7 +27,7 @@ Author: Bram Gruneir (bram+code@cockroachlabs.com)
     <link rel="stylesheet" href="/bower_components/nvd3/build/nv.d3.css">
     <link rel="stylesheet" href="/build/app_debug.css">
     <script src="/bower_components/d3/d3.js"></script>
-    <script src="/bower_components/lodash/lodash.js"></script>
+    <script src="/node_modules/lodash/lodash.js"></script>
     <script src="/bower_components/mithriljs/mithril.js"></script>
     <script src="/bower_components/nvd3/build/nv.d3.js"></script>
     <script src="/bower_components/moment/moment.js"></script>
@@ -35,8 +35,14 @@ Author: Bram Gruneir (bram+code@cockroachlabs.com)
     <title>Cockroach Console</title>
   </head>
   <body>
-    <div id="header"></div>
-    <div id="root"></div>
+    <div id="banner"></div>
+    <div id="content">
+      <div id="header"></div>
+      <div id="page-container">
+        <div id="root"></div>
+        <div id="footer"></div>
+      </div>
+    </div>
     <script src="/build/app.js"></script>
   </body>
 </html>

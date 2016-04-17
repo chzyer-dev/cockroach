@@ -24,113 +24,93 @@ type Attributes struct {
 	Attrs []string `protobuf:"bytes,1,rep,name=attrs" json:"attrs,omitempty" yaml:"attrs,flow"`
 }
 
-func (m *Attributes) Reset()      { *m = Attributes{} }
-func (*Attributes) ProtoMessage() {}
+func (m *Attributes) Reset()                    { *m = Attributes{} }
+func (*Attributes) ProtoMessage()               {}
+func (*Attributes) Descriptor() ([]byte, []int) { return fileDescriptorMetadata, []int{0} }
 
 // ReplicaDescriptor describes a replica location by node ID
 // (corresponds to a host:port via lookup on gossip network) and store
 // ID (identifies the device).
 type ReplicaDescriptor struct {
-	NodeID  NodeID  `protobuf:"varint,1,opt,name=node_id,casttype=NodeID" json:"node_id"`
-	StoreID StoreID `protobuf:"varint,2,opt,name=store_id,casttype=StoreID" json:"store_id"`
+	NodeID  NodeID  `protobuf:"varint,1,opt,name=node_id,json=nodeId,casttype=NodeID" json:"node_id"`
+	StoreID StoreID `protobuf:"varint,2,opt,name=store_id,json=storeId,casttype=StoreID" json:"store_id"`
 	// replica_id uniquely identifies a replica instance. If a range is removed from
 	// a store and then re-added to the same store, the new instance will have a
 	// higher replica_id.
-	ReplicaID ReplicaID `protobuf:"varint,3,opt,name=replica_id,casttype=ReplicaID" json:"replica_id"`
+	ReplicaID ReplicaID `protobuf:"varint,3,opt,name=replica_id,json=replicaId,casttype=ReplicaID" json:"replica_id"`
 }
 
-func (m *ReplicaDescriptor) Reset()         { *m = ReplicaDescriptor{} }
-func (m *ReplicaDescriptor) String() string { return proto.CompactTextString(m) }
-func (*ReplicaDescriptor) ProtoMessage()    {}
+func (m *ReplicaDescriptor) Reset()                    { *m = ReplicaDescriptor{} }
+func (m *ReplicaDescriptor) String() string            { return proto.CompactTextString(m) }
+func (*ReplicaDescriptor) ProtoMessage()               {}
+func (*ReplicaDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorMetadata, []int{1} }
 
 // RangeDescriptor is the value stored in a range metadata key.
 // A range is described using an inclusive start key, a non-inclusive end key,
 // and a list of replicas where the range is stored.
 type RangeDescriptor struct {
-	RangeID RangeID `protobuf:"varint,1,opt,name=range_id,casttype=RangeID" json:"range_id"`
+	RangeID RangeID `protobuf:"varint,1,opt,name=range_id,json=rangeId,casttype=RangeID" json:"range_id"`
 	// start_key is the first key which may be contained by this range.
-	StartKey RKey `protobuf:"bytes,2,opt,name=start_key,casttype=RKey" json:"start_key,omitempty"`
+	StartKey RKey `protobuf:"bytes,2,opt,name=start_key,json=startKey,casttype=RKey" json:"start_key,omitempty"`
 	// end_key marks the end of the range's possible keys.  EndKey itself is not
 	// contained in this range - it will be contained in the immediately
 	// subsequent range.
-	EndKey RKey `protobuf:"bytes,3,opt,name=end_key,casttype=RKey" json:"end_key,omitempty"`
+	EndKey RKey `protobuf:"bytes,3,opt,name=end_key,json=endKey,casttype=RKey" json:"end_key,omitempty"`
 	// replicas is the set of nodes/stores on which replicas of this
 	// range are stored, the ordering being arbitrary and subject to
 	// permutation.
 	Replicas []ReplicaDescriptor `protobuf:"bytes,4,rep,name=replicas" json:"replicas"`
 	// next_replica_id is a counter used to generate replica IDs.
-	NextReplicaID ReplicaID `protobuf:"varint,5,opt,name=next_replica_id,casttype=ReplicaID" json:"next_replica_id"`
+	NextReplicaID ReplicaID `protobuf:"varint,5,opt,name=next_replica_id,json=nextReplicaId,casttype=ReplicaID" json:"next_replica_id"`
 }
 
-func (m *RangeDescriptor) Reset()         { *m = RangeDescriptor{} }
-func (m *RangeDescriptor) String() string { return proto.CompactTextString(m) }
-func (*RangeDescriptor) ProtoMessage()    {}
-
-// RangeTree holds the root node of the range tree.
-type RangeTree struct {
-	RootKey RKey `protobuf:"bytes,1,opt,name=root_key,casttype=RKey" json:"root_key,omitempty"`
-}
-
-func (m *RangeTree) Reset()         { *m = RangeTree{} }
-func (m *RangeTree) String() string { return proto.CompactTextString(m) }
-func (*RangeTree) ProtoMessage()    {}
-
-// RangeTreeNode holds the configuration for each node of the Red-Black Tree that references all ranges.
-type RangeTreeNode struct {
-	Key RKey `protobuf:"bytes,1,opt,name=key,casttype=RKey" json:"key,omitempty"`
-	// Color is black if true, red if false.
-	Black bool `protobuf:"varint,2,opt,name=black" json:"black"`
-	// If the parent key is null, this is the root node.
-	ParentKey RKey `protobuf:"bytes,3,opt,name=parent_key,casttype=RKey" json:"parent_key,omitempty"`
-	LeftKey   RKey `protobuf:"bytes,4,opt,name=left_key,casttype=RKey" json:"left_key,omitempty"`
-	RightKey  RKey `protobuf:"bytes,5,opt,name=right_key,casttype=RKey" json:"right_key,omitempty"`
-}
-
-func (m *RangeTreeNode) Reset()         { *m = RangeTreeNode{} }
-func (m *RangeTreeNode) String() string { return proto.CompactTextString(m) }
-func (*RangeTreeNode) ProtoMessage()    {}
+func (m *RangeDescriptor) Reset()                    { *m = RangeDescriptor{} }
+func (m *RangeDescriptor) String() string            { return proto.CompactTextString(m) }
+func (*RangeDescriptor) ProtoMessage()               {}
+func (*RangeDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorMetadata, []int{2} }
 
 // StoreCapacity contains capacity information for a storage device.
 type StoreCapacity struct {
-	Capacity   int64 `protobuf:"varint,1,opt,name=Capacity" json:"Capacity"`
-	Available  int64 `protobuf:"varint,2,opt,name=Available" json:"Available"`
-	RangeCount int32 `protobuf:"varint,3,opt,name=RangeCount" json:"RangeCount"`
+	Capacity   int64 `protobuf:"varint,1,opt,name=capacity" json:"capacity"`
+	Available  int64 `protobuf:"varint,2,opt,name=available" json:"available"`
+	RangeCount int32 `protobuf:"varint,3,opt,name=range_count,json=rangeCount" json:"range_count"`
 }
 
-func (m *StoreCapacity) Reset()         { *m = StoreCapacity{} }
-func (m *StoreCapacity) String() string { return proto.CompactTextString(m) }
-func (*StoreCapacity) ProtoMessage()    {}
+func (m *StoreCapacity) Reset()                    { *m = StoreCapacity{} }
+func (m *StoreCapacity) String() string            { return proto.CompactTextString(m) }
+func (*StoreCapacity) ProtoMessage()               {}
+func (*StoreCapacity) Descriptor() ([]byte, []int) { return fileDescriptorMetadata, []int{3} }
 
 // NodeDescriptor holds details on node physical/network topology.
 type NodeDescriptor struct {
-	NodeID  NodeID                        `protobuf:"varint,1,opt,name=node_id,casttype=NodeID" json:"node_id"`
+	NodeID  NodeID                        `protobuf:"varint,1,opt,name=node_id,json=nodeId,casttype=NodeID" json:"node_id"`
 	Address cockroach_util.UnresolvedAddr `protobuf:"bytes,2,opt,name=address" json:"address"`
 	Attrs   Attributes                    `protobuf:"bytes,3,opt,name=attrs" json:"attrs"`
 }
 
-func (m *NodeDescriptor) Reset()         { *m = NodeDescriptor{} }
-func (m *NodeDescriptor) String() string { return proto.CompactTextString(m) }
-func (*NodeDescriptor) ProtoMessage()    {}
+func (m *NodeDescriptor) Reset()                    { *m = NodeDescriptor{} }
+func (m *NodeDescriptor) String() string            { return proto.CompactTextString(m) }
+func (*NodeDescriptor) ProtoMessage()               {}
+func (*NodeDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorMetadata, []int{4} }
 
 // StoreDescriptor holds store information including store attributes, node
 // descriptor and store capacity.
 type StoreDescriptor struct {
-	StoreID  StoreID        `protobuf:"varint,1,opt,name=store_id,casttype=StoreID" json:"store_id"`
+	StoreID  StoreID        `protobuf:"varint,1,opt,name=store_id,json=storeId,casttype=StoreID" json:"store_id"`
 	Attrs    Attributes     `protobuf:"bytes,2,opt,name=attrs" json:"attrs"`
 	Node     NodeDescriptor `protobuf:"bytes,3,opt,name=node" json:"node"`
 	Capacity StoreCapacity  `protobuf:"bytes,4,opt,name=capacity" json:"capacity"`
 }
 
-func (m *StoreDescriptor) Reset()         { *m = StoreDescriptor{} }
-func (m *StoreDescriptor) String() string { return proto.CompactTextString(m) }
-func (*StoreDescriptor) ProtoMessage()    {}
+func (m *StoreDescriptor) Reset()                    { *m = StoreDescriptor{} }
+func (m *StoreDescriptor) String() string            { return proto.CompactTextString(m) }
+func (*StoreDescriptor) ProtoMessage()               {}
+func (*StoreDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorMetadata, []int{5} }
 
 func init() {
 	proto.RegisterType((*Attributes)(nil), "cockroach.roachpb.Attributes")
 	proto.RegisterType((*ReplicaDescriptor)(nil), "cockroach.roachpb.ReplicaDescriptor")
 	proto.RegisterType((*RangeDescriptor)(nil), "cockroach.roachpb.RangeDescriptor")
-	proto.RegisterType((*RangeTree)(nil), "cockroach.roachpb.RangeTree")
-	proto.RegisterType((*RangeTreeNode)(nil), "cockroach.roachpb.RangeTreeNode")
 	proto.RegisterType((*StoreCapacity)(nil), "cockroach.roachpb.StoreCapacity")
 	proto.RegisterType((*NodeDescriptor)(nil), "cockroach.roachpb.NodeDescriptor")
 	proto.RegisterType((*StoreDescriptor)(nil), "cockroach.roachpb.StoreDescriptor")
@@ -240,80 +220,6 @@ func (m *RangeDescriptor) MarshalTo(data []byte) (int, error) {
 	data[i] = 0x28
 	i++
 	i = encodeVarintMetadata(data, i, uint64(m.NextReplicaID))
-	return i, nil
-}
-
-func (m *RangeTree) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *RangeTree) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	if m.RootKey != nil {
-		data[i] = 0xa
-		i++
-		i = encodeVarintMetadata(data, i, uint64(len(m.RootKey)))
-		i += copy(data[i:], m.RootKey)
-	}
-	return i, nil
-}
-
-func (m *RangeTreeNode) Marshal() (data []byte, err error) {
-	size := m.Size()
-	data = make([]byte, size)
-	n, err := m.MarshalTo(data)
-	if err != nil {
-		return nil, err
-	}
-	return data[:n], nil
-}
-
-func (m *RangeTreeNode) MarshalTo(data []byte) (int, error) {
-	var i int
-	_ = i
-	var l int
-	_ = l
-	if m.Key != nil {
-		data[i] = 0xa
-		i++
-		i = encodeVarintMetadata(data, i, uint64(len(m.Key)))
-		i += copy(data[i:], m.Key)
-	}
-	data[i] = 0x10
-	i++
-	if m.Black {
-		data[i] = 1
-	} else {
-		data[i] = 0
-	}
-	i++
-	if m.ParentKey != nil {
-		data[i] = 0x1a
-		i++
-		i = encodeVarintMetadata(data, i, uint64(len(m.ParentKey)))
-		i += copy(data[i:], m.ParentKey)
-	}
-	if m.LeftKey != nil {
-		data[i] = 0x22
-		i++
-		i = encodeVarintMetadata(data, i, uint64(len(m.LeftKey)))
-		i += copy(data[i:], m.LeftKey)
-	}
-	if m.RightKey != nil {
-		data[i] = 0x2a
-		i++
-		i = encodeVarintMetadata(data, i, uint64(len(m.RightKey)))
-		i += copy(data[i:], m.RightKey)
-	}
 	return i, nil
 }
 
@@ -453,6 +359,97 @@ func encodeVarintMetadata(data []byte, offset int, v uint64) int {
 	data[offset] = uint8(v)
 	return offset + 1
 }
+func NewPopulatedReplicaDescriptor(r randyMetadata, easy bool) *ReplicaDescriptor {
+	this := &ReplicaDescriptor{}
+	this.NodeID = NodeID(r.Int31())
+	if r.Intn(2) == 0 {
+		this.NodeID *= -1
+	}
+	this.StoreID = StoreID(r.Int31())
+	if r.Intn(2) == 0 {
+		this.StoreID *= -1
+	}
+	this.ReplicaID = ReplicaID(r.Int31())
+	if r.Intn(2) == 0 {
+		this.ReplicaID *= -1
+	}
+	if !easy && r.Intn(10) != 0 {
+	}
+	return this
+}
+
+type randyMetadata interface {
+	Float32() float32
+	Float64() float64
+	Int63() int64
+	Int31() int32
+	Uint32() uint32
+	Intn(n int) int
+}
+
+func randUTF8RuneMetadata(r randyMetadata) rune {
+	ru := r.Intn(62)
+	if ru < 10 {
+		return rune(ru + 48)
+	} else if ru < 36 {
+		return rune(ru + 55)
+	}
+	return rune(ru + 61)
+}
+func randStringMetadata(r randyMetadata) string {
+	v1 := r.Intn(100)
+	tmps := make([]rune, v1)
+	for i := 0; i < v1; i++ {
+		tmps[i] = randUTF8RuneMetadata(r)
+	}
+	return string(tmps)
+}
+func randUnrecognizedMetadata(r randyMetadata, maxFieldNumber int) (data []byte) {
+	l := r.Intn(5)
+	for i := 0; i < l; i++ {
+		wire := r.Intn(4)
+		if wire == 3 {
+			wire = 5
+		}
+		fieldNumber := maxFieldNumber + r.Intn(100)
+		data = randFieldMetadata(data, r, fieldNumber, wire)
+	}
+	return data
+}
+func randFieldMetadata(data []byte, r randyMetadata, fieldNumber int, wire int) []byte {
+	key := uint32(fieldNumber)<<3 | uint32(wire)
+	switch wire {
+	case 0:
+		data = encodeVarintPopulateMetadata(data, uint64(key))
+		v2 := r.Int63()
+		if r.Intn(2) == 0 {
+			v2 *= -1
+		}
+		data = encodeVarintPopulateMetadata(data, uint64(v2))
+	case 1:
+		data = encodeVarintPopulateMetadata(data, uint64(key))
+		data = append(data, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
+	case 2:
+		data = encodeVarintPopulateMetadata(data, uint64(key))
+		ll := r.Intn(100)
+		data = encodeVarintPopulateMetadata(data, uint64(ll))
+		for j := 0; j < ll; j++ {
+			data = append(data, byte(r.Intn(256)))
+		}
+	default:
+		data = encodeVarintPopulateMetadata(data, uint64(key))
+		data = append(data, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(256)))
+	}
+	return data
+}
+func encodeVarintPopulateMetadata(data []byte, v uint64) []byte {
+	for v >= 1<<7 {
+		data = append(data, uint8(uint64(v)&0x7f|0x80))
+		v >>= 7
+	}
+	data = append(data, uint8(v))
+	return data
+}
 func (m *Attributes) Size() (n int) {
 	var l int
 	_ = l
@@ -493,39 +490,6 @@ func (m *RangeDescriptor) Size() (n int) {
 		}
 	}
 	n += 1 + sovMetadata(uint64(m.NextReplicaID))
-	return n
-}
-
-func (m *RangeTree) Size() (n int) {
-	var l int
-	_ = l
-	if m.RootKey != nil {
-		l = len(m.RootKey)
-		n += 1 + l + sovMetadata(uint64(l))
-	}
-	return n
-}
-
-func (m *RangeTreeNode) Size() (n int) {
-	var l int
-	_ = l
-	if m.Key != nil {
-		l = len(m.Key)
-		n += 1 + l + sovMetadata(uint64(l))
-	}
-	n += 2
-	if m.ParentKey != nil {
-		l = len(m.ParentKey)
-		n += 1 + l + sovMetadata(uint64(l))
-	}
-	if m.LeftKey != nil {
-		l = len(m.LeftKey)
-		n += 1 + l + sovMetadata(uint64(l))
-	}
-	if m.RightKey != nil {
-		l = len(m.RightKey)
-		n += 1 + l + sovMetadata(uint64(l))
-	}
 	return n
 }
 
@@ -921,281 +885,6 @@ func (m *RangeDescriptor) Unmarshal(data []byte) error {
 					break
 				}
 			}
-		default:
-			iNdEx = preIndex
-			skippy, err := skipMetadata(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthMetadata
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *RangeTree) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowMetadata
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: RangeTree: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: RangeTree: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RootKey", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowMetadata
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthMetadata
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.RootKey = append(m.RootKey[:0], data[iNdEx:postIndex]...)
-			if m.RootKey == nil {
-				m.RootKey = []byte{}
-			}
-			iNdEx = postIndex
-		default:
-			iNdEx = preIndex
-			skippy, err := skipMetadata(data[iNdEx:])
-			if err != nil {
-				return err
-			}
-			if skippy < 0 {
-				return ErrInvalidLengthMetadata
-			}
-			if (iNdEx + skippy) > l {
-				return io.ErrUnexpectedEOF
-			}
-			iNdEx += skippy
-		}
-	}
-
-	if iNdEx > l {
-		return io.ErrUnexpectedEOF
-	}
-	return nil
-}
-func (m *RangeTreeNode) Unmarshal(data []byte) error {
-	l := len(data)
-	iNdEx := 0
-	for iNdEx < l {
-		preIndex := iNdEx
-		var wire uint64
-		for shift := uint(0); ; shift += 7 {
-			if shift >= 64 {
-				return ErrIntOverflowMetadata
-			}
-			if iNdEx >= l {
-				return io.ErrUnexpectedEOF
-			}
-			b := data[iNdEx]
-			iNdEx++
-			wire |= (uint64(b) & 0x7F) << shift
-			if b < 0x80 {
-				break
-			}
-		}
-		fieldNum := int32(wire >> 3)
-		wireType := int(wire & 0x7)
-		if wireType == 4 {
-			return fmt.Errorf("proto: RangeTreeNode: wiretype end group for non-group")
-		}
-		if fieldNum <= 0 {
-			return fmt.Errorf("proto: RangeTreeNode: illegal tag %d (wire type %d)", fieldNum, wire)
-		}
-		switch fieldNum {
-		case 1:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Key", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowMetadata
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthMetadata
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.Key = append(m.Key[:0], data[iNdEx:postIndex]...)
-			if m.Key == nil {
-				m.Key = []byte{}
-			}
-			iNdEx = postIndex
-		case 2:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field Black", wireType)
-			}
-			var v int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowMetadata
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				v |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			m.Black = bool(v != 0)
-		case 3:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field ParentKey", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowMetadata
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthMetadata
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.ParentKey = append(m.ParentKey[:0], data[iNdEx:postIndex]...)
-			if m.ParentKey == nil {
-				m.ParentKey = []byte{}
-			}
-			iNdEx = postIndex
-		case 4:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field LeftKey", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowMetadata
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthMetadata
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.LeftKey = append(m.LeftKey[:0], data[iNdEx:postIndex]...)
-			if m.LeftKey == nil {
-				m.LeftKey = []byte{}
-			}
-			iNdEx = postIndex
-		case 5:
-			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RightKey", wireType)
-			}
-			var byteLen int
-			for shift := uint(0); ; shift += 7 {
-				if shift >= 64 {
-					return ErrIntOverflowMetadata
-				}
-				if iNdEx >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[iNdEx]
-				iNdEx++
-				byteLen |= (int(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-			if byteLen < 0 {
-				return ErrInvalidLengthMetadata
-			}
-			postIndex := iNdEx + byteLen
-			if postIndex > l {
-				return io.ErrUnexpectedEOF
-			}
-			m.RightKey = append(m.RightKey[:0], data[iNdEx:postIndex]...)
-			if m.RightKey == nil {
-				m.RightKey = []byte{}
-			}
-			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipMetadata(data[iNdEx:])
@@ -1716,3 +1405,46 @@ var (
 	ErrInvalidLengthMetadata = fmt.Errorf("proto: negative length found during unmarshaling")
 	ErrIntOverflowMetadata   = fmt.Errorf("proto: integer overflow")
 )
+
+var fileDescriptorMetadata = []byte{
+	// 611 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xa4, 0x53, 0xcf, 0x8b, 0xd3, 0x40,
+	0x14, 0x6e, 0xda, 0xb4, 0x69, 0xa7, 0xd6, 0xa5, 0x83, 0x42, 0x29, 0xd8, 0x1f, 0x61, 0x85, 0x05,
+	0xa5, 0xc5, 0x05, 0x0f, 0x56, 0x54, 0x36, 0xbb, 0x08, 0x55, 0xd8, 0x43, 0x44, 0x10, 0x2f, 0x65,
+	0x9a, 0x8c, 0x35, 0x6c, 0x36, 0x53, 0x92, 0xe9, 0x6a, 0xc1, 0xa3, 0x7f, 0x80, 0x47, 0x8f, 0x7b,
+	0xf2, 0x6f, 0xf0, 0xe4, 0xc1, 0x53, 0x8f, 0x1e, 0x3d, 0x15, 0x5d, 0xff, 0x03, 0x8f, 0x9e, 0x9c,
+	0x79, 0x99, 0xa4, 0xe9, 0x6e, 0x05, 0xc5, 0xc3, 0x94, 0xd7, 0xf7, 0xbe, 0x6f, 0xf2, 0xcd, 0xf7,
+	0xde, 0x43, 0x1d, 0x87, 0x39, 0x47, 0x21, 0x23, 0xce, 0xcb, 0x3e, 0xfc, 0x4e, 0xc7, 0xfd, 0x63,
+	0xca, 0x89, 0x4b, 0x38, 0xe9, 0x4d, 0x43, 0xc6, 0x19, 0xae, 0xa7, 0x88, 0x9e, 0x42, 0x34, 0xb7,
+	0x57, 0xa4, 0x19, 0xf7, 0xfc, 0xfe, 0x2c, 0x08, 0x69, 0xc4, 0xfc, 0x13, 0xea, 0x8e, 0x88, 0xeb,
+	0x86, 0x31, 0xb1, 0x79, 0x65, 0xc2, 0x26, 0x0c, 0xc2, 0xbe, 0x8c, 0xe2, 0xac, 0xf9, 0x00, 0xa1,
+	0x3d, 0xce, 0x43, 0x6f, 0x3c, 0xe3, 0x34, 0xc2, 0x37, 0x50, 0x91, 0x88, 0x7f, 0x51, 0x43, 0xeb,
+	0x14, 0x76, 0x2a, 0xd6, 0xd5, 0x9f, 0xcb, 0x76, 0x7d, 0x4e, 0x8e, 0xfd, 0x81, 0x09, 0xe9, 0x9b,
+	0x2f, 0x7c, 0xf6, 0xca, 0xb4, 0x63, 0xcc, 0x40, 0x7f, 0x7f, 0xda, 0xce, 0x99, 0x9f, 0x35, 0x54,
+	0xb7, 0xe9, 0xd4, 0xf7, 0x1c, 0x72, 0x40, 0x23, 0x27, 0xf4, 0xa6, 0x9c, 0x85, 0xf8, 0x16, 0x32,
+	0x02, 0xe6, 0xd2, 0x91, 0xe7, 0x8a, 0xab, 0xb4, 0x9d, 0xa2, 0xd5, 0x58, 0x2c, 0xdb, 0xb9, 0xb3,
+	0x65, 0xbb, 0x74, 0x28, 0xd2, 0xc3, 0x83, 0x5f, 0x69, 0x64, 0x97, 0x24, 0x70, 0xe8, 0xe2, 0xdb,
+	0xa8, 0x1c, 0x09, 0x2a, 0x70, 0xf2, 0xc0, 0x69, 0x2a, 0x8e, 0xf1, 0x44, 0xe6, 0x81, 0x94, 0x84,
+	0xb6, 0x01, 0x58, 0x41, 0xbb, 0x87, 0x50, 0x18, 0x7f, 0x5e, 0x12, 0x0b, 0x40, 0x6c, 0x29, 0x62,
+	0x45, 0x09, 0x03, 0xea, 0xea, 0x8f, 0x5d, 0x51, 0x8c, 0xa1, 0x3b, 0xd0, 0x3f, 0x9e, 0xb6, 0x35,
+	0xf3, 0x43, 0x1e, 0x6d, 0xd9, 0x24, 0x98, 0xd0, 0xcc, 0x13, 0x84, 0x9e, 0x50, 0xa6, 0x92, 0x37,
+	0x14, 0x56, 0x7a, 0x00, 0x1a, 0xeb, 0x51, 0xa1, 0x6d, 0x00, 0x56, 0xe8, 0xb9, 0x8e, 0x2a, 0x11,
+	0x27, 0x21, 0x1f, 0x1d, 0xd1, 0x39, 0xbc, 0xe3, 0x92, 0x55, 0x16, 0x40, 0xdd, 0x7e, 0x4c, 0xe7,
+	0x76, 0x19, 0x4a, 0x22, 0xc2, 0x5d, 0x64, 0xd0, 0xc0, 0x05, 0x50, 0xe1, 0x1c, 0xa8, 0x24, 0x0a,
+	0x12, 0xf2, 0x50, 0x08, 0x88, 0x75, 0x46, 0x0d, 0x5d, 0xf4, 0xa3, 0xba, 0xbb, 0xdd, 0xbb, 0xd0,
+	0xfc, 0xde, 0x05, 0xef, 0x2d, 0x5d, 0xca, 0xb4, 0x53, 0x2e, 0x7e, 0x84, 0xb6, 0x02, 0xfa, 0x9a,
+	0x8f, 0x32, 0x36, 0x15, 0xc1, 0x26, 0x53, 0xbd, 0xa7, 0x76, 0x28, 0xca, 0x7f, 0xb0, 0xaa, 0x16,
+	0x64, 0x6a, 0xae, 0xf9, 0x06, 0xd5, 0xa0, 0x03, 0xfb, 0x64, 0x4a, 0x1c, 0x8f, 0xcf, 0x71, 0x07,
+	0x95, 0x1d, 0x15, 0x2b, 0x97, 0xd4, 0xe7, 0x93, 0x2c, 0x36, 0x51, 0x85, 0x9c, 0x10, 0xcf, 0x27,
+	0x63, 0x9f, 0x82, 0x21, 0x09, 0x64, 0x95, 0x16, 0xa6, 0x55, 0x63, 0xaf, 0x1d, 0x36, 0x0b, 0xb8,
+	0xea, 0x62, 0x8c, 0x42, 0x50, 0xd8, 0x97, 0x79, 0xf3, 0x93, 0x86, 0x2e, 0xcb, 0xa9, 0xf9, 0xbf,
+	0x41, 0xbb, 0x8f, 0x0c, 0xb9, 0x16, 0x34, 0x8a, 0x40, 0x4e, 0x75, 0xb7, 0x95, 0xb1, 0x55, 0x2e,
+	0x50, 0xef, 0x69, 0xba, 0x40, 0x7b, 0x02, 0xa8, 0x84, 0x24, 0x24, 0x7c, 0x27, 0x59, 0x92, 0x02,
+	0xb0, 0xaf, 0x6d, 0x68, 0xca, 0x6a, 0xa5, 0x14, 0x39, 0x66, 0x98, 0x6f, 0xc5, 0x9c, 0x81, 0x7f,
+	0xeb, 0x73, 0x96, 0xce, 0xbd, 0xf6, 0xf7, 0x73, 0x9f, 0xaa, 0xc8, 0xff, 0xab, 0x0a, 0x7c, 0x17,
+	0xe9, 0xd2, 0x0a, 0xa5, 0xbf, 0xbb, 0x81, 0xb9, 0x6e, 0xb2, 0x62, 0x03, 0x09, 0x5b, 0x99, 0x86,
+	0xeb, 0x70, 0x41, 0x67, 0xc3, 0x05, 0x6b, 0x43, 0x72, 0x7e, 0x24, 0xac, 0xee, 0xe2, 0x7b, 0x2b,
+	0xb7, 0x38, 0x6b, 0x69, 0x5f, 0xc4, 0xf9, 0x2a, 0xce, 0x37, 0x71, 0xde, 0xfd, 0x68, 0xe5, 0x9e,
+	0x1b, 0xea, 0x82, 0x67, 0xda, 0xef, 0x00, 0x00, 0x00, 0xff, 0xff, 0x40, 0x66, 0x24, 0x59, 0x0b,
+	0x05, 0x00, 0x00,
+}

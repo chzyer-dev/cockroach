@@ -23,14 +23,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/client"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/uuid"
 	"github.com/gogo/protobuf/proto"
 )
 
@@ -47,14 +50,14 @@ func makeTS(nanos int64, logical int32) roachpb.Timestamp {
 // Ranges are queued for GC based on two conditions. The age of bytes
 // available to be GC'd, and the age of unresolved intents.
 func TestGCQueueShouldQueue(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
 
-	cfg := tc.gossip.GetSystemConfig()
-	if cfg == nil {
-		t.Fatal("nil config")
+	cfg, ok := tc.gossip.GetSystemConfig()
+	if !ok {
+		t.Fatal("config not set")
 	}
 	desc := tc.rng.Desc()
 	zone, err := cfg.GetZoneConfigForKey(desc.StartKey)
@@ -70,7 +73,7 @@ func TestGCQueueShouldQueue(t *testing.T) {
 	bc := int64(gcByteCountNormalization)
 	ttl := int64(policy.TTLSeconds)
 
-	now := makeTS(iaN, 0) // at time of stats object
+	now := makeTS(considerThreshold*iaN, 0) // at time of stats object
 
 	testCases := []struct {
 		gcBytes     int64
@@ -106,13 +109,13 @@ func TestGCQueueShouldQueue(t *testing.T) {
 		// Queues solely because of gc'able bytes.
 		{bc, 5 * bc * ttl, 10 * ia, 0, now, true, 5},
 		// A contribution of 1 from gc, 10/5 from intents.
-		{bc, bc * ttl, 5, 10 * ia, now, true, 1 + 2},
+		{bc, bc * ttl, 5, 10 * ia, now, true, (1 + 2)},
 
 		// Some tests where the ages increase since we call shouldNow with
 		// a later timestamp.
 
 		// One normalized unit of unaged gc'able bytes at time zero.
-		{ttl * bc, 0, 0, 0, roachpb.ZeroTimestamp, true, float64(now.WallTime) / 1E9},
+		{ttl * bc, 0, 0, 0, roachpb.ZeroTimestamp, true, float64(now.WallTime) / (1E9 * considerThreshold)},
 
 		// 2 intents aging from zero to now (which is exactly the intent age
 		// normalization).
@@ -129,8 +132,8 @@ func TestGCQueueShouldQueue(t *testing.T) {
 		stats := engine.MVCCStats{
 			KeyBytes:        test.gcBytes,
 			IntentCount:     test.intentCount,
-			IntentAge:       test.intentAge,
-			GCBytesAge:      test.gcBytesAge,
+			IntentAge:       test.intentAge * considerThreshold,
+			GCBytesAge:      test.gcBytesAge * considerThreshold,
 			LastUpdateNanos: test.now.WallTime,
 		}
 		if err := tc.rng.stats.SetMVCCStats(tc.rng.store.Engine(), stats); err != nil {
@@ -140,8 +143,8 @@ func TestGCQueueShouldQueue(t *testing.T) {
 		if shouldQ != test.shouldQ {
 			t.Errorf("%d: should queue expected %t; got %t", i, test.shouldQ, shouldQ)
 		}
-		if math.Abs(priority-test.priority) > 0.00001 {
-			t.Errorf("%d: priority expected %f; got %f", i, test.priority, priority)
+		if scaledExpPri := test.priority * considerThreshold; math.Abs(priority-scaledExpPri) > 0.00001 {
+			t.Errorf("%d: priority expected %f; got %f", i, scaledExpPri, priority)
 		}
 	}
 }
@@ -149,7 +152,7 @@ func TestGCQueueShouldQueue(t *testing.T) {
 // TestGCQueueProcess creates test data in the range over various time
 // scales and verifies that scan queue process properly GCs test data.
 func TestGCQueueProcess(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
@@ -218,7 +221,7 @@ func TestGCQueueProcess(t *testing.T) {
 				txn.OrigTimestamp = datum.ts
 				txn.Timestamp = datum.ts
 			}
-			if _, err := client.SendWrappedWith(tc.Sender(), tc.rng.context(), roachpb.Header{
+			if _, err := tc.SendWrappedWith(roachpb.Header{
 				Timestamp: datum.ts,
 				Txn:       txn,
 			}, &dArgs); err != nil {
@@ -232,7 +235,7 @@ func TestGCQueueProcess(t *testing.T) {
 				txn.OrigTimestamp = datum.ts
 				txn.Timestamp = datum.ts
 			}
-			if _, err := client.SendWrappedWith(tc.Sender(), tc.rng.context(), roachpb.Header{
+			if _, err := tc.SendWrappedWith(roachpb.Header{
 				Timestamp: datum.ts,
 				Txn:       txn,
 			}, &pArgs); err != nil {
@@ -241,9 +244,9 @@ func TestGCQueueProcess(t *testing.T) {
 		}
 	}
 
-	cfg := tc.gossip.GetSystemConfig()
-	if cfg == nil {
-		t.Fatal("nil config")
+	cfg, ok := tc.gossip.GetSystemConfig()
+	if !ok {
+		t.Fatal("config not set")
 	}
 
 	// Process through a scan queue.
@@ -296,111 +299,178 @@ func TestGCQueueProcess(t *testing.T) {
 	}
 
 	// Verify that the last verification timestamp was updated as whole range was scanned.
-	if _, err := tc.rng.GetLastVerificationTimestamp(); err != nil {
+	if _, err := tc.rng.getLastVerificationTimestamp(); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestGCQueueTransactionTable(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	const now time.Duration = 3 * 24 * time.Hour
-	const tTxnThreshold = now - txnCleanupThreshold
+
+	const gcTxnAndAC = now - txnCleanupThreshold
+	const gcACOnly = now - abortCacheAgeThreshold
+	if gcTxnAndAC >= gcACOnly {
+		t.Fatalf("test assumption violated due to changing constants; needs adjustment")
+	}
+
 	type spec struct {
 		status      roachpb.TransactionStatus
-		ts          time.Duration
-		heartbeatTS time.Duration
+		orig        time.Duration
+		hb          time.Duration             // last heartbeat (none if ZeroTimestamp)
 		newStatus   roachpb.TransactionStatus // -1 for GCed
 		failResolve bool                      // do we want to fail resolves in this trial?
 		expResolve  bool                      // expect attempt at removing txn-persisted intents?
-		expSeqGC    bool                      // expect sequence cache entries removed?
+		expAbortGC  bool                      // expect abort cache entries removed?
 	}
 	// Describes the state of the Txn table before the test.
+	// Many of the abort cache entries deleted wouldn't even be there, so don't
+	// be confused by that.
 	testCases := map[string]spec{
 		// Too young, should not touch.
-		"a": {roachpb.PENDING, tTxnThreshold + 1, 0, roachpb.PENDING, false, false, false},
+		"aa": {
+			status:    roachpb.PENDING,
+			orig:      gcACOnly + 1,
+			newStatus: roachpb.PENDING,
+		},
+		// A little older, so the AbortCache gets cleaned up.
+		"ab": {
+			status:     roachpb.PENDING,
+			orig:       gcTxnAndAC + 1,
+			newStatus:  roachpb.PENDING,
+			expAbortGC: true,
+		},
 		// Old and pending, but still heartbeat (so no Push attempted; it would succeed).
-		// No GC.
-		"b": {roachpb.PENDING, 0, tTxnThreshold + 1, roachpb.PENDING, false, false, false},
+		// It's old enough to delete the abort cache entry though.
+		"ba": {
+			status:     roachpb.PENDING,
+			hb:         gcTxnAndAC + 1,
+			newStatus:  roachpb.PENDING,
+			expAbortGC: true,
+		},
+		// Not old enough for Txn GC, but old enough to remove the abort cache entry.
+		"bb": {
+			status:     roachpb.ABORTED,
+			orig:       gcACOnly - 1,
+			newStatus:  roachpb.ABORTED,
+			expAbortGC: true,
+		},
 		// Old, pending and abandoned. Should push and abort it successfully,
 		// but not GC it just yet (this is an artifact of the implementation).
-		// The sequence cache gets cleaned up though.
-		"c": {roachpb.PENDING, tTxnThreshold - 1, 0, roachpb.ABORTED, false, false, true},
+		// The abort cache gets cleaned up though.
+		"c": {
+			status:     roachpb.PENDING,
+			orig:       gcTxnAndAC - 1,
+			newStatus:  roachpb.ABORTED,
+			expAbortGC: true,
+		},
 		// Old and aborted, should delete.
-		"d": {roachpb.ABORTED, tTxnThreshold - 1, 0, -1, false, true, true},
-		// Committed and fresh, so no action.
-		"e": {roachpb.COMMITTED, tTxnThreshold + 1, 0, roachpb.COMMITTED, false, false, false},
+		"d": {
+			status:     roachpb.ABORTED,
+			orig:       gcTxnAndAC - 1,
+			newStatus:  -1,
+			expResolve: true,
+			expAbortGC: true,
+		},
+		// Committed and fresh, so no action. But the abort cache entry is old
+		// enough to be discarded.
+		"e": {
+			status:     roachpb.COMMITTED,
+			orig:       gcTxnAndAC + 1,
+			newStatus:  roachpb.COMMITTED,
+			expAbortGC: true,
+		},
 		// Committed and old. It has an intent (like all tests here), which is
 		// resolvable and hence we can GC.
-		"f": {roachpb.COMMITTED, tTxnThreshold - 1, 0, -1, false, true, true},
+		"f": {
+			status:     roachpb.COMMITTED,
+			orig:       gcTxnAndAC - 1,
+			newStatus:  -1,
+			expResolve: true,
+			expAbortGC: true,
+		},
 		// Same as the previous one, but we've rigged things so that the intent
 		// resolution here will fail and consequently no GC is expected.
-		"g": {roachpb.COMMITTED, tTxnThreshold - 1, 0, roachpb.COMMITTED, true, true, true},
+		"g": {
+			status:      roachpb.COMMITTED,
+			orig:        gcTxnAndAC - 1,
+			newStatus:   roachpb.COMMITTED,
+			failResolve: true,
+			expResolve:  true,
+			expAbortGC:  true,
+		},
 	}
 
 	resolved := map[string][]roachpb.Span{}
-	TestingCommandFilter = func(_ roachpb.StoreID, req roachpb.Request, _ roachpb.Header) error {
-		if resArgs, ok := req.(*roachpb.ResolveIntentRequest); ok {
-			id := string(resArgs.IntentTxn.Key)
-			resolved[id] = append(resolved[id], roachpb.Span{
-				Key:    resArgs.Key,
-				EndKey: resArgs.EndKey,
-			})
-			// We've special cased one test case. Note that the intent is still
-			// counted in `resolved`.
-			if testCases[id].failResolve {
-				return util.Errorf("boom")
-			}
-		}
-		return nil
-	}
-	defer func() { TestingCommandFilter = nil }()
 
 	tc := testContext{}
-	tc.Start(t)
+	tsc := TestStoreContext()
+	tsc.TestingKnobs.TestingCommandFilter =
+		func(filterArgs storageutils.FilterArgs) *roachpb.Error {
+			if resArgs, ok := filterArgs.Req.(*roachpb.ResolveIntentRequest); ok {
+				id := string(resArgs.IntentTxn.Key)
+				resolved[id] = append(resolved[id], roachpb.Span{
+					Key:    resArgs.Key,
+					EndKey: resArgs.EndKey,
+				})
+				// We've special cased one test case. Note that the intent is still
+				// counted in `resolved`.
+				if testCases[id].failResolve {
+					return roachpb.NewErrorWithTxn(util.Errorf("boom"), filterArgs.Hdr.Txn)
+				}
+			}
+			return nil
+		}
+	tc.StartWithStoreContext(t, tsc)
 	defer tc.Stop()
 	tc.manualClock.Set(int64(now))
 
+	outsideKey := tc.rng.Desc().EndKey.Next().AsRawKey()
 	testIntents := []roachpb.Span{{Key: roachpb.Key("intent")}}
 
 	txns := map[string]roachpb.Transaction{}
-	var epo uint32
 	for strKey, test := range testCases {
-		epo++
 		baseKey := roachpb.Key(strKey)
-		txnClock := hlc.NewClock(hlc.NewManualClock(int64(test.ts)).UnixNano)
+		txnClock := hlc.NewClock(hlc.NewManualClock(int64(test.orig)).UnixNano)
 		txn := newTransaction("txn1", baseKey, 1, roachpb.SERIALIZABLE, txnClock)
 		txn.Status = test.status
 		txn.Intents = testIntents
-		txn.LastHeartbeat = &roachpb.Timestamp{WallTime: int64(test.heartbeatTS)}
-		txns[strKey] = *txn
-		key := keys.TransactionKey(baseKey, txn.ID)
-		if err := engine.MVCCPutProto(tc.engine, nil, key, roachpb.ZeroTimestamp, nil, txn); err != nil {
-			t.Fatal(err)
+		if test.hb > 0 {
+			txn.LastHeartbeat = &roachpb.Timestamp{WallTime: int64(test.hb)}
 		}
-		seqTS := txn.Timestamp
-		seqTS.Forward(*txn.LastHeartbeat)
-		if err := tc.rng.sequence.Put(tc.engine, txn.ID, epo, 2*epo, txn.Key, seqTS, nil /* err */); err != nil {
+		// Set a high Timestamp to make sure it does not matter. Only
+		// OrigTimestamp (and heartbeat) are used for GC decisions.
+		txn.Timestamp.Forward(roachpb.MaxTimestamp)
+		txns[strKey] = *txn
+		for _, addrKey := range []roachpb.Key{baseKey, outsideKey} {
+			key := keys.TransactionKey(addrKey, txn.ID)
+			if err := engine.MVCCPutProto(context.Background(), tc.engine, nil, key, roachpb.ZeroTimestamp, nil, txn); err != nil {
+				t.Fatal(err)
+			}
+		}
+		entry := roachpb.AbortCacheEntry{Key: txn.Key, Timestamp: txn.LastActive()}
+		if err := tc.rng.abortCache.Put(context.Background(), tc.engine, nil, txn.ID, &entry); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// Run GC.
 	gcQ := newGCQueue(tc.gossip)
-	cfg := tc.gossip.GetSystemConfig()
-	if cfg == nil {
-		t.Fatal("nil config")
+	cfg, ok := tc.gossip.GetSystemConfig()
+	if !ok {
+		t.Fatal("config not set")
 	}
 
 	if err := gcQ.process(tc.clock.Now(), tc.rng, cfg); err != nil {
 		t.Fatal(err)
 	}
 
-	util.SucceedsWithin(t, time.Second, func() error {
+	util.SucceedsSoon(t, func() error {
 		for strKey, sp := range testCases {
 			txn := &roachpb.Transaction{}
 			key := keys.TransactionKey(roachpb.Key(strKey), txns[strKey].ID)
-			ok, err := engine.MVCCGetProto(tc.engine, key, roachpb.ZeroTimestamp, true, nil, txn)
+			ok, err := engine.MVCCGetProto(context.Background(), tc.engine, key, roachpb.ZeroTimestamp, true, nil, txn)
 			if err != nil {
 				return err
 			}
@@ -419,20 +489,38 @@ func TestGCQueueTransactionTable(t *testing.T) {
 				return fmt.Errorf("%s: unexpected intent resolutions:\nexpected: %s\nobserved: %s",
 					strKey, expIntents, resolved[strKey])
 			}
-			if kvs, err := tc.rng.sequence.GetAllTransactionID(tc.store.Engine(), txns[strKey].ID); err != nil {
+			entry := &roachpb.AbortCacheEntry{}
+			abortExists, err := tc.rng.abortCache.Get(context.Background(), tc.store.Engine(), txns[strKey].ID, entry)
+			if err != nil {
 				t.Fatal(err)
-			} else if (len(kvs) != 0) == sp.expSeqGC {
-				return fmt.Errorf("%s: expected sequence cache gc: %t, found %+v", strKey, sp.expSeqGC, kvs)
+			}
+			if (abortExists == false) != sp.expAbortGC {
+				return fmt.Errorf("%s: expected abort cache gc: %t, found %+v", strKey, sp.expAbortGC, entry)
 			}
 		}
 		return nil
 	})
+
+	outsideTxnPrefix := keys.TransactionKey(outsideKey, uuid.EmptyUUID)
+	outsideTxnPrefixEnd := keys.TransactionKey(outsideKey.Next(), uuid.EmptyUUID)
+	var count int
+	if _, err := engine.MVCCIterate(context.Background(), tc.store.Engine(), outsideTxnPrefix, outsideTxnPrefixEnd, roachpb.ZeroTimestamp,
+		true, nil, false, func(roachpb.KeyValue) (bool, error) {
+			count++
+			return false, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if exp := len(testCases); exp != count {
+		t.Fatalf("expected the %d external transaction entries to remain untouched, "+
+			"but only %d are left", exp, count)
+	}
 }
 
 // TestGCQueueIntentResolution verifies intent resolution with many
 // intents spanning just two transactions.
 func TestGCQueueIntentResolution(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
@@ -456,7 +544,7 @@ func TestGCQueueIntentResolution(t *testing.T) {
 		// TODO(spencerkimball): benchmark with ~50k.
 		for j := 0; j < 5; j++ {
 			pArgs := putArgs(roachpb.Key(fmt.Sprintf("%d-%05d", i, j)), []byte("value"))
-			if _, err := client.SendWrappedWith(tc.Sender(), tc.rng.context(), roachpb.Header{
+			if _, err := tc.SendWrappedWith(roachpb.Header{
 				Txn: txns[i],
 			}, &pArgs); err != nil {
 				t.Fatalf("%d: could not put data: %s", i, err)
@@ -465,9 +553,9 @@ func TestGCQueueIntentResolution(t *testing.T) {
 		}
 	}
 
-	cfg := tc.gossip.GetSystemConfig()
-	if cfg == nil {
-		t.Fatal("nil config")
+	cfg, ok := tc.gossip.GetSystemConfig()
+	if !ok {
+		t.Fatal("config not set")
 	}
 
 	// Process through a scan queue.

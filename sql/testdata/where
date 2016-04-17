@@ -43,7 +43,7 @@ SELECT * FROM kv WHERE (k,v) IN (SELECT * FROM kv)
 5 6
 7 8
 
-query error qualified name "kv.nonexistent" not found
+query error qualified name "nonexistent" not found
 SELECT * FROM kv WHERE nonexistent = 1
 
 query B
@@ -57,3 +57,11 @@ SELECT 'hello' SIMILAR TO v FROM kvString WHERE k SIMILAR TO 'like[1-2]'
 ----
 true
 false
+
+# Test mixed type tuple comparison.
+
+query II
+SELECT * FROM kv WHERE k IN (1, 5.0, 9)
+----
+1 2
+5 6

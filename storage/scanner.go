@@ -21,10 +21,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/stop"
+	"github.com/cockroachdb/cockroach/util/timeutil"
 )
 
 // A replicaQueue is a prioritized queue of replicas for which work is
@@ -56,13 +57,6 @@ type replicaSet interface {
 	EstimatedCount() int
 }
 
-// A storeStats holds statistics over the entire store. Stats is an
-// aggregation of MVCC stats across all replicas in the store.
-type storeStats struct {
-	RangeCount int
-	MVCC       engine.MVCCStats
-}
-
 // A replicaScanner iterates over replicas at a measured pace in order to
 // complete approximately one full scan per target interval in a large
 // store (in small stores it may complete faster than the target
@@ -71,6 +65,7 @@ type storeStats struct {
 type replicaScanner struct {
 	targetInterval time.Duration  // Target duration interval for scan loop
 	maxIdleTime    time.Duration  // Max idle time for scan loop
+	waitTimer      util.Timer     // Shared timer to avoid allocations.
 	replicas       replicaSet     // Replicas to be scanned
 	queues         []replicaQueue // Replica queues managed by this scanner
 	removed        chan *Replica  // Replicas to remove from queues
@@ -85,6 +80,9 @@ type replicaScanner struct {
 // replica set, and replica queues.  If scanFn is not nil, after a complete
 // loop that function will be called.
 func newReplicaScanner(targetInterval, maxIdleTime time.Duration, replicas replicaSet) *replicaScanner {
+	if targetInterval <= 0 {
+		log.Fatalf("scanner interval must be greater than zero")
+	}
 	return &replicaScanner{
 		targetInterval: targetInterval,
 		maxIdleTime:    maxIdleTime,
@@ -100,7 +98,7 @@ func (rs *replicaScanner) AddQueues(queues ...replicaQueue) {
 	rs.queues = append(rs.queues, queues...)
 }
 
-// Start spins up the scanning loop. Call Stop() to exit the loop.
+// Start spins up the scanning loop.
 func (rs *replicaScanner) Start(clock *hlc.Clock, stopper *stop.Stopper) {
 	for _, queue := range rs.queues {
 		queue.Start(clock, stopper)
@@ -130,18 +128,6 @@ func (rs *replicaScanner) RemoveReplica(repl *Replica) {
 	rs.removed <- repl
 }
 
-// WaitForScanCompletion waits until the end of the next scan and returns the
-// total number of scans completed so far.
-func (rs *replicaScanner) WaitForScanCompletion() int64 {
-	rs.completedScan.L.Lock()
-	defer rs.completedScan.L.Unlock()
-	initalValue := rs.count
-	for rs.count == initalValue {
-		rs.completedScan.Wait()
-	}
-	return rs.count
-}
-
 // paceInterval returns a duration between iterations to allow us to pace
 // the scan.
 func (rs *replicaScanner) paceInterval(start, now time.Time) time.Duration {
@@ -167,14 +153,15 @@ func (rs *replicaScanner) paceInterval(start, now time.Time) time.Duration {
 // is signaled via the removed channel.
 func (rs *replicaScanner) waitAndProcess(start time.Time, clock *hlc.Clock, stopper *stop.Stopper,
 	repl *Replica) bool {
-	waitInterval := rs.paceInterval(start, time.Now())
-	nextTime := time.After(waitInterval)
+	waitInterval := rs.paceInterval(start, timeutil.Now())
+	rs.waitTimer.Reset(waitInterval)
 	if log.V(6) {
 		log.Infof("Wait time interval set to %s", waitInterval)
 	}
 	for {
 		select {
-		case <-nextTime:
+		case <-rs.waitTimer.C:
+			rs.waitTimer.Read = true
 			if repl == nil {
 				return false
 			}
@@ -204,7 +191,10 @@ func (rs *replicaScanner) waitAndProcess(start time.Time, clock *hlc.Clock, stop
 // is paced to complete a full scan in approximately the scan interval.
 func (rs *replicaScanner) scanLoop(clock *hlc.Clock, stopper *stop.Stopper) {
 	stopper.RunWorker(func() {
-		start := time.Now()
+		start := timeutil.Now()
+
+		// waitTimer is reset in each call to waitAndProcess.
+		defer rs.waitTimer.Stop()
 
 		for {
 			var shouldStop bool
@@ -223,7 +213,7 @@ func (rs *replicaScanner) scanLoop(clock *hlc.Clock, stopper *stop.Stopper) {
 				// Increment iteration count.
 				rs.completedScan.L.Lock()
 				rs.count++
-				rs.total += time.Now().Sub(start)
+				rs.total += timeutil.Now().Sub(start)
 				rs.completedScan.Broadcast()
 				rs.completedScan.L.Unlock()
 				if log.V(6) {
@@ -231,7 +221,7 @@ func (rs *replicaScanner) scanLoop(clock *hlc.Clock, stopper *stop.Stopper) {
 				}
 
 				// Reset iteration and start time.
-				start = time.Now()
+				start = timeutil.Now()
 			})
 			if shouldStop {
 				return

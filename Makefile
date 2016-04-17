@@ -32,11 +32,22 @@ TESTTIMEOUT  := 1m10s
 RACETIMEOUT  := 5m
 BENCHTIMEOUT := 5m
 TESTFLAGS    :=
-STRESSFLAGS  :=
+STRESSFLAGS  := -stderr -maxfails 1
 DUPLFLAGS    := -t 100
 BUILDMODE    := install
+CURRENTDIR   := $(realpath .)
 export GOPATH := $(realpath ../../../..)
+# Prefer tools from $GOPATH/bin over those elsewhere on the path.
+# This ensures that we get the versions pinned in the GLOCKFILE.
 export PATH := $(GOPATH)/bin:$(PATH)
+# HACK: Make has a fast path and a slow path for command execution,
+# but the fast path uses the PATH variable from when make was started,
+# not the one we set on the previous line. In order for the above
+# line to have any effect, we must force make to always take the slow path.
+# Setting the SHELL variable to a value other than the default (/bin/sh)
+# is one way to do this globally.
+# http://stackoverflow.com/questions/8941110/how-i-could-add-dir-to-path-in-makefile/13468229#13468229
+SHELL := $(shell which bash)
 export GIT_PAGER :=
 
 # Note: We pass `-v` to `go build` and `go test -i` so that warnings
@@ -58,6 +69,14 @@ all: build test check
 .PHONY: release
 release: build
 
+# The uidebug build tag is used to turn off embedding of UI assets into the
+# cockroach binary, loading them from the local filesystem at run time instead.
+# This build target is intended for use by UI developers, as it provides a
+# faster iteration cycle which doesn't require recompilation of the binary.
+.PHONY: uidebug
+uidebug: TAGS += uidebug
+uidebug: build
+
 .PHONY: build
 build: GOFLAGS += -i -o cockroach
 build: BUILDMODE = build
@@ -69,7 +88,7 @@ install:
 	@echo "GOPATH set to $$GOPATH"
 	@echo "$$GOPATH/bin added to PATH"
 	@echo $(GO) $(BUILDMODE) -v $(GOFLAGS)
-	@$(GO) $(BUILDMODE) -v $(GOFLAGS) -ldflags '$(LDFLAGS)'
+	@$(GO) $(BUILDMODE) -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LDFLAGS)'
 
 # Build, but do not run the tests.
 # PKG is expanded and all packages are built and moved to their directory.
@@ -77,10 +96,9 @@ install:
 # eg: to statically build the sql tests, run:
 #   make testbuild PKG=./sql STATIC=1
 .PHONY: testbuild
-testbuild: TESTS := $(shell $(GO) list -tags '$(TAGS)' $(PKG))
 testbuild: GOFLAGS += -c
 testbuild:
-	for p in $(TESTS); do \
+	for p in $(shell $(GO) list -tags '$(TAGS)' $(PKG)); do \
 	  NAME=$$(basename "$$p"); \
 	  OUT="$$NAME.test"; \
 	  DIR=$$($(GO) list -f {{.Dir}} -tags '$(TAGS)' $$p); \
@@ -90,18 +108,20 @@ testbuild:
 # Build all tests into DIR and strips each.
 # DIR is required.
 .PHONY: testbuildall
-testbuildall: TESTS := $(shell $(GO) list $(PKG))
 testbuildall: GOFLAGS += -c
 testbuildall:
 ifndef DIR
 	$(error DIR is undefined)
 endif
-	for p in $(TESTS); do \
+	for p in $(shell $(GO) list $(PKG)); do \
 	  NAME=$$(basename "$$p"); \
 	  PKGDIR=$$($(GO) list -f {{.ImportPath}} $$p); \
-		OUTPUT_FILE="$(DIR)/$${PKGDIR}/$${NAME}.test"; \
+	  OUTPUT_FILE="$(DIR)/$${PKGDIR}/$${NAME}.test"; \
 	  $(GO) test -v $(GOFLAGS) -o $${OUTPUT_FILE} -ldflags '$(LDFLAGS)' "$$p" $(TESTFLAGS) || exit 1; \
-	  if [ -s $${OUTPUT_FILE} ]; then strip -S $${OUTPUT_FILE}; fi \
+	  if [ -s $${OUTPUT_FILE} ]; then strip -S $${OUTPUT_FILE}; fi; \
+	  if [ $${NAME} = "sql" ]; then \
+	     cp -r sql/testdata sql/partestdata "$(DIR)/$${PKGDIR}/" || exit 1; \
+	  fi \
 	done
 
 # Similar to "testrace", we want to cache the build before running the
@@ -148,12 +168,12 @@ coverage:
 .PHONY: stress
 stress:
 	$(GO) test -v $(GOFLAGS) -i -c $(PKG) -o stress.test
-	stress $(STRESSFLAGS) ./stress.test -test.run $(TESTS) -test.timeout $(TESTTIMEOUT) $(TESTFLAGS)
+	cd $(PKG) && stress $(STRESSFLAGS) $(CURRENTDIR)/stress.test -test.run $(TESTS) -test.timeout $(TESTTIMEOUT) $(TESTFLAGS)
 
 .PHONY: stressrace
 stressrace:
 	$(GO) test $(GOFLAGS) -race -v -i -c $(PKG) -o stress.test
-	stress $(STRESSFLAGS) ./stress.test -test.run $(TESTS) -test.timeout $(TESTTIMEOUT) $(TESTFLAGS)
+	cd $(PKG) && stress $(STRESSFLAGS) $(CURRENTDIR)/stress.test -test.run $(TESTS) -test.timeout $(TESTTIMEOUT) $(TESTFLAGS)
 
 .PHONY: acceptance
 acceptance:
@@ -165,8 +185,18 @@ dupl:
 
 .PHONY: check
 check:
-	@echo "checking for proto.Clone calls (use util.CloneProto instead)"
-	@! git grep -E '\.Clone\([^)]+\)' | grep -vE '^util/clone_proto(_test)?\.go:'
+	@echo "checking for time.Now calls (use timeutil.Now() instead)"
+	@! git grep -E 'time\.Now' -- '*.go' | grep -vE '^util/(log|timeutil)/\w+\.go:'
+	@echo "checking for os.Getenv calls (use envutil.EnvOrDefault*() instead)"
+	@! git grep -e 'os\.Getenv' -- '*.go' | grep -vE '^(util/(log|envutil)|acceptance/.*)/\w+\.go:'
+	@echo "checking for proto.Clone calls (use protoutil.Clone instead)"
+	@! git grep -E '\.Clone\([^)]+\)' -- '*.go' | grep -vF 'protoutil.Clone' | grep -vE '^util/protoutil/clone(_test)?\.go:'
+	@echo "checking for proto.Marshal calls (use protoutil.Marshal instead)"
+	@! git grep -E '\.Marshal\([^)]+\)' -- '*.go' | grep -vE '(json|yaml|protoutil)\.Marshal' | grep -vE '^util/protoutil/marshal(_test)?\.go:'
+	@echo "checking for grpc.NewServer calls (use rpc.NewServer instead)"
+	@! git grep -E 'grpc\.NewServer\(\)' -- '*.go' | grep -vE '^rpc/context(_test)?\.go:'
+	@echo "checking for missing defer leaktest.AfterTest"
+	@util/leaktest/check-leaktest.sh
 	@echo "misspell"
 	@! git ls-files | xargs misspell | grep -vF 'No Exceptions'
 	@echo "checking for tabs in shell scripts"
@@ -174,7 +204,7 @@ check:
 	@echo "checking for forbidden imports"
 	@$(GO) list -f '{{ $$ip := .ImportPath }}{{ range .Imports}}{{ $$ip }}: {{ println . }}{{end}}{{ range .TestImports}}{{ $$ip }}: {{ println . }}{{end}}{{ range .XTestImports}}{{ $$ip }}: {{ println . }}{{end}}' $(PKG) | \
 		grep -E ' (github.com/golang/protobuf/proto|github.com/satori/go\.uuid|log|path)$$' | \
-		grep -Ev '(base|security|sql/driver|util(/(log|randutil|stop))?): log$$' | \
+		grep -Ev 'cockroach/(base|security|util/(log|randutil|stop)): log$$' | \
 		grep -vF 'util/uuid: github.com/satori/go.uuid' | tee forbidden.log; \
 	   if grep -E ' path$$' forbidden.log >/dev/null; then \
 	        echo; echo "Consider using 'path/filepath' instead of 'path'."; echo; \
@@ -191,20 +221,25 @@ check:
            test ! -s forbidden.log
 	@rm -f forbidden.log
 	@echo "ineffassign"
-	@! ineffassign . | grep -vF gossip/gossip.pb.go
+	@! ineffassign . | grep -vF '.pb.go' # gogo/protobuf#152
 	@echo "errcheck"
 	@errcheck -ignore 'bytes:Write.*,io:Close,net:Close,net/http:Close,net/rpc:Close,os:Close,database/sql:Close' $(PKG)
 	@echo "returncheck"
 	@returncheck $(PKG)
 	@echo "vet"
 	@! $(GO) tool vet . 2>&1 | \
-	  grep -vE '^vet: cannot process directory .git'
+	  grep -vE '^vet: cannot process directory .git' | \
+	  grep -vE '^server/admin\..*\go:.+: constant [0-9]+ not a string in call to Errorf' \
+	  # To return proper HTTP error codes (e.g. 404 Not Found), we need to use \
+	  # grpc.Errorf, which has an error code as its first parameter. 'go vet' \
+	  # doesn't like that the first parameter isn't a format string.
 	@echo "vet --shadow"
 	@! $(GO) tool vet --shadow . 2>&1 | \
-	  grep -vE '(declaration of (pE|e)rr shadows|^vet: cannot process directory \.git)'
+	  grep -vE '(declaration of (pE|e)rr shadows|^vet: cannot process directory \.git)' | \
+	  grep -vE '\.pb\.gw\.go'
 	@echo "golint"
 	@! golint $(PKG) | \
-	  grep -vE '(\.pb\.go|embedded\.go|_string\.go|LastInsertId|sql/parser/(yaccpar|sql\.y):)' \
+	  grep -vE '(\.pb\.go|\.pb\.gw\.go|embedded\.go|_string\.go|LastInsertId|sql/parser/(yaccpar|sql\.y):)' \
 	  # https://golang.org/pkg/database/sql/driver/#Result :(
 	@echo "varcheck"
 	@! varcheck -e $(PKG) | \
@@ -213,6 +248,10 @@ check:
 	@! gofmt -s -d -l . 2>&1 | grep -vE '^\.git/'
 	@echo "goimports"
 	@! goimports -l . | grep -vF 'No Exceptions'
+
+.PHONY: unused
+unused:
+	-unused -exported ./... | grep -v -E '(\.pb\.go:|/C:|_string.go:|embedded.go:|parser/(yacc|sql.y)|util/interval/interval.go:|_cgo|Mutex)'
 
 .PHONY: clean
 clean:
@@ -224,6 +263,15 @@ clean:
 .PHONY: protobuf
 protobuf:
 	$(MAKE) -C .. -f cockroach/build/protobuf.mk
+
+# The .go-version target is phony so that it is rebuilt every time.
+.PHONY: .go-version
+.go-version:
+	@actual=$$($(GO) version); \
+	echo "$${actual}" | grep -q '\b$(GOVERS)\b' || \
+	  (echo "$(GOVERS) required (see CONTRIBUTING.md): $${actual}" && false)
+
+include .go-version
 
 ifneq ($(SKIP_BOOTSTRAP),1)
 
@@ -246,7 +294,7 @@ $(GLOCK):
 # Update the git hooks and run the bootstrap script whenever any
 # of them (or their dependencies) change.
 .bootstrap: $(GITHOOKS) $(GLOCK) GLOCKFILE
-	@$(GLOCK) sync github.com/cockroachdb/cockroach
+	@unset GIT_WORK_TREE; $(GLOCK) sync github.com/cockroachdb/cockroach
 	touch $@
 
 include .bootstrap

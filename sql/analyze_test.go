@@ -45,7 +45,8 @@ func testTableDesc() *TableDescriptor {
 			Name: "primary", Unique: true, ColumnNames: []string{"a"},
 			ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
 		},
-		Privileges: NewDefaultPrivilegeDescriptor(),
+		Privileges:    NewDefaultPrivilegeDescriptor(),
+		FormatVersion: BaseFormatVersion,
 	}
 }
 
@@ -104,7 +105,7 @@ func checkEquivExpr(a, b parser.Expr, qvals qvalMap) error {
 }
 
 func TestSplitOrExpr(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		expr     string
@@ -125,7 +126,7 @@ func TestSplitOrExpr(t *testing.T) {
 }
 
 func TestSplitAndExpr(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		expr     string
@@ -146,7 +147,7 @@ func TestSplitAndExpr(t *testing.T) {
 }
 
 func TestSimplifyExpr(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		expr     string
@@ -256,7 +257,7 @@ func TestSimplifyExpr(t *testing.T) {
 }
 
 func TestSimplifyNotExpr(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		expr       string
@@ -298,7 +299,7 @@ func TestSimplifyNotExpr(t *testing.T) {
 }
 
 func TestSimplifyAndExpr(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		expr     string
@@ -325,7 +326,7 @@ func TestSimplifyAndExpr(t *testing.T) {
 }
 
 func TestSimplifyAndExprCheck(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		expr       string
@@ -358,6 +359,7 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 		{`a IS NULL AND a = 1`, `false`, true},
 		{`a = 1 AND a IS NOT NULL`, `a = 1`, true},
 		{`a IS NOT NULL AND a = 1`, `a = 1`, true},
+		{`a = 1 AND a = 1.0`, `a = 1`, true},
 
 		{`a != 1 AND a = 1`, `false`, true},
 		{`a != 1 AND a = 2`, `a = 2`, true},
@@ -377,10 +379,15 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 		{`a != 1 AND a <= 1`, `a < 1`, true},
 		{`a != 1 AND a <= 2`, `a <= 2`, false},
 		{`a != 2 AND a <= 1`, `a <= 1`, true},
+		{`a != 1 AND a IN (1)`, `false`, true},
+		{`a != 1 AND a IN (2)`, `a IN (2)`, true},
+		{`a != 1 AND a IN (1, 2)`, `a IN (2)`, true},
 		{`a != 1 AND a IS NULL`, `false`, true},
 		{`a IS NULL AND a != 1`, `false`, true},
 		{`a != 1 AND a IS NOT NULL`, `a != 1 AND a IS NOT NULL`, true},
 		{`a IS NOT NULL AND a != 1`, `a IS NOT NULL AND a != 1`, true},
+		{`a != 1 AND a = 1.0`, `false`, true},
+		{`a != 1 AND a != 1.0`, `a != 1`, true},
 
 		{`a > 1 AND a = 1`, `false`, true},
 		{`a > 1 AND a = 2`, `a = 2`, true},
@@ -408,6 +415,8 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 		{`a IS NULL AND a > 1`, `false`, true},
 		{`a > 1 AND a IS NOT NULL`, `a > 1`, true},
 		{`a IS NOT NULL AND a > 1`, `a > 1`, true},
+		{`a > 1.0 AND a = 2`, `a = 2`, true},
+		{`a > 1 AND a = 2.0`, `a = 2.0`, true},
 
 		{`a >= 1 AND a = 1`, `a = 1`, true},
 		{`a >= 1 AND a = 2`, `a = 2`, true},
@@ -492,7 +501,6 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 
 		{`a IN (1) AND a IN (1)`, `a IN (1)`, true},
 		{`a IN (1) AND a IN (2)`, `false`, true},
-		{`a IN (2) AND a IN (1)`, `false`, true},
 		{`a IN (1) AND a IN (1, 2, 3, 4, 5)`, `a IN (1)`, true},
 		{`a IN (2, 4) AND a IN (1, 2, 3, 4, 5)`, `a IN (2, 4)`, true},
 		{`a IN (4, 2) AND a IN (5, 4, 3, 2, 1)`, `a IN (2, 4)`, true},
@@ -503,6 +511,7 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 
 		{`a IS NULL AND a IS NULL`, `a IS NULL`, true},
 		{`a IS NOT NULL AND a IS NOT NULL`, `a IS NOT NULL`, true},
+		{`a IS NULL AND a IS NOT NULL`, `false`, true},
 	}
 	for _, d := range testData {
 		expr1, qvals := parseAndNormalizeExpr(t, d.expr)
@@ -523,8 +532,9 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 		}
 
 		if _, ok := expr2.(*parser.AndExpr); !ok {
-			// The result was not an AND expression. Verify that the analysis is
-			// commutative.
+			// The result was not an AND expression. Re-parse to re-resolve QNames
+			// and verify that the analysis is commutative.
+			expr1, _ = parseAndNormalizeExpr(t, d.expr)
 			andExpr := expr1.(*parser.AndExpr)
 			andExpr.Left, andExpr.Right = andExpr.Right, andExpr.Left
 			expr3, equiv := simplifyExpr(andExpr)
@@ -539,7 +549,7 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 }
 
 func TestSimplifyOrExpr(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		expr     string
@@ -560,7 +570,7 @@ func TestSimplifyOrExpr(t *testing.T) {
 }
 
 func TestSimplifyOrExprCheck(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testData := []struct {
 		expr     string
@@ -594,6 +604,7 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 		{`a = 1 OR a IN (1)`, `a IN (1)`},
 		{`a = 1 OR a IN (2)`, `a IN (1, 2)`},
 		{`a = 2 OR a IN (1)`, `a IN (1, 2)`},
+		{`a = 1 OR a = 1.0`, `a = 1`},
 
 		{`a != 1 OR a = 1`, `a IS NOT NULL`},
 		{`a != 1 OR a = 2`, `a != 1`},
@@ -613,6 +624,11 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 		{`a != 1 OR a <= 1`, `a IS NOT NULL`},
 		{`a != 1 OR a <= 2`, `a IS NOT NULL`},
 		{`a != 2 OR a <= 1`, `a != 2`},
+		{`a != 1 OR a IN (1)`, `a IS NOT NULL`},
+		{`a != 1 OR a IN (2)`, `a != 1`},
+		{`a != 2 OR a IN (1, 2)`, `a IS NOT NULL`},
+		{`a != 1 OR a = 1.0`, `a IS NOT NULL`},
+		{`a != 1 OR a != 1.0`, `a != 1`},
 
 		{`a > 1 OR a = 1`, `a >= 1`},
 		{`a > 1 OR a = 2`, `a > 1`},
@@ -635,6 +651,8 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 		{`a > 1 OR a IN (1)`, `a >= 1`},
 		{`a > 1 OR a IN (2)`, `a > 1`},
 		{`a > 2 OR a IN (1)`, `a > 2 OR a IN (1)`},
+		{`a > 1.0 OR a = 1`, `a >= 1`},
+		{`a > 1 OR a = 1.0`, `a >= 1`},
 
 		{`a >= 1 OR a = 1`, `a >= 1`},
 		{`a >= 1 OR a = 2`, `a >= 1`},
@@ -701,6 +719,16 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 		{`a <= 1 OR a IN (1)`, `a <= 1`},
 		{`a <= 1 OR a IN (2)`, `a <= 1 OR a IN (2)`},
 		{`a <= 2 OR a IN (1)`, `a <= 2`},
+
+		{`a IN (1) OR a IN (1)`, `a IN (1)`},
+		{`a IN (1) OR a IN (2)`, `a IN (1, 2)`},
+		{`a IN (1) OR a IN (1, 2, 3, 4, 5)`, `a IN (1, 2, 3, 4, 5)`},
+		{`a IN (4, 2) OR a IN (5, 4, 3, 2, 1)`, `a IN (1, 2, 3, 4, 5)`},
+		{`a IN (1) OR a IS NULL`, `a IN (1) OR a IS NULL`},
+
+		{`a IS NULL OR a IS NULL`, `a IS NULL`},
+		{`a IS NOT NULL OR a IS NOT NULL`, `a IS NOT NULL`},
+		{`a IS NULL OR a IS NOT NULL`, `true`},
 	}
 	for _, d := range testData {
 		expr1, qvals := parseAndNormalizeExpr(t, d.expr)
@@ -718,8 +746,9 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 		}
 
 		if _, ok := expr2.(*parser.OrExpr); !ok {
-			// The result was not an OR expression. Verify that the analysis is
-			// commutative.
+			// The result was not an OR expression. Re-parse to re-resolve QNames
+			// and verify that the analysis is commutative.
+			expr1, _ = parseAndNormalizeExpr(t, d.expr)
 			orExpr := expr1.(*parser.OrExpr)
 			orExpr.Left, orExpr.Right = orExpr.Right, orExpr.Left
 			expr3, equiv := simplifyExpr(orExpr)

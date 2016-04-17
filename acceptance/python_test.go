@@ -14,8 +14,6 @@
 //
 // Author: Matt Jibson (mjibson@cockroachlabs.com)
 
-// +build acceptance
-
 package acceptance
 
 import (
@@ -23,11 +21,9 @@ import (
 	"testing"
 )
 
-// TestPython connects to a cluster with python.
-func TestPython(t *testing.T) {
-	t.Skip("https://github.com/cockroachdb/cockroach/issues/3826")
-	testDockerSuccess(t, "python", []string{"-c", strings.Replace(python, "%v", "3", 1)})
-	testDockerFail(t, "python", []string{"-c", strings.Replace(python, "%v", `"a"`, 1)})
+func TestDockerPython(t *testing.T) {
+	testDockerSuccess(t, "python", []string{"python", "-c", strings.Replace(python, "%v", "3", 1)})
+	testDockerFail(t, "python", []string{"python", "-c", strings.Replace(python, "%v", `"a"`, 1)})
 }
 
 const python = `

@@ -22,10 +22,12 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/gogo/protobuf/proto"
+
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 	"github.com/cockroachdb/cockroach/util/stop"
-	"github.com/gogo/protobuf/proto"
 )
 
 func mvccKey(k interface{}) MVCCKey {
@@ -46,7 +48,7 @@ func mvccKey(k interface{}) MVCCKey {
 // TestBatchBasics verifies that all commands work in a batch, aren't
 // visible until commit, and then are all visible after commit.
 func TestBatchBasics(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := NewInMem(roachpb.Attributes{}, 1<<20, stopper)
@@ -114,7 +116,7 @@ func TestBatchBasics(t *testing.T) {
 }
 
 func TestBatchGet(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := NewInMem(roachpb.Attributes{}, 1<<20, stopper)
@@ -168,7 +170,7 @@ func compareMergedValues(t *testing.T, result, expected []byte) bool {
 }
 
 func TestBatchMerge(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := NewInMem(roachpb.Attributes{}, 1<<20, stopper)
@@ -225,7 +227,7 @@ func TestBatchMerge(t *testing.T) {
 }
 
 func TestBatchProto(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := NewInMem(roachpb.Attributes{}, 1<<20, stopper)
@@ -245,7 +247,7 @@ func TestBatchProto(t *testing.T) {
 	if keySize != 6 {
 		t.Errorf("expected key size 6; got %d", keySize)
 	}
-	data, err := val.Marshal()
+	data, err := protoutil.Marshal(&val)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +274,7 @@ func TestBatchProto(t *testing.T) {
 }
 
 func TestBatchScan(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := NewInMem(roachpb.Attributes{}, 1<<20, stopper)
@@ -365,7 +367,7 @@ func TestBatchScan(t *testing.T) {
 // TestBatchScanWithDelete verifies that a scan containing
 // a single deleted value returns nothing.
 func TestBatchScanWithDelete(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := NewInMem(roachpb.Attributes{}, 1<<20, stopper)
@@ -393,7 +395,7 @@ func TestBatchScanWithDelete(t *testing.T) {
 // in the updates map shadows an entry from the engine, the
 // max on a scan is still reached.
 func TestBatchScanMaxWithDeleted(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := NewInMem(roachpb.Attributes{}, 1<<20, stopper)
@@ -427,7 +429,7 @@ func TestBatchScanMaxWithDeleted(t *testing.T) {
 // keys. This should never happen with the way Cockroach uses
 // batches, but worth verifying.
 func TestBatchConcurrency(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	e := NewInMem(roachpb.Attributes{}, 1<<20, stopper)
@@ -461,7 +463,7 @@ func TestBatchConcurrency(t *testing.T) {
 }
 
 func TestBatchDefer(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
 	defer stopper.Stop()

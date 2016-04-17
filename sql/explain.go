@@ -22,6 +22,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql/parser"
+	"github.com/cockroachdb/cockroach/util/encoding"
+	"github.com/cockroachdb/cockroach/util/tracing"
+	basictracer "github.com/opentracing/basictracer-go"
+	opentracing "github.com/opentracing/opentracing-go"
 )
 
 type explainMode int
@@ -30,16 +34,21 @@ const (
 	explainNone explainMode = iota
 	explainDebug
 	explainPlan
+	explainTrace
 )
 
 // Explain executes the explain statement, providing debugging and analysis
 // info about a DELETE, INSERT, SELECT or UPDATE statement.
 //
 // Privileges: the same privileges as the statement being explained.
-func (p *planner) Explain(n *parser.Explain) (planNode, *roachpb.Error) {
+func (p *planner) Explain(n *parser.Explain, autoCommit bool) (planNode, *roachpb.Error) {
 	mode := explainNone
-	if len(n.Options) == 1 && strings.EqualFold(n.Options[0], "DEBUG") {
-		mode = explainDebug
+	if len(n.Options) == 1 {
+		if strings.EqualFold(n.Options[0], "DEBUG") {
+			mode = explainDebug
+		} else if strings.EqualFold(n.Options[0], "TRACE") {
+			mode = explainTrace
+		}
 	} else if len(n.Options) == 0 {
 		mode = explainPlan
 	}
@@ -47,16 +56,25 @@ func (p *planner) Explain(n *parser.Explain) (planNode, *roachpb.Error) {
 		return nil, roachpb.NewUErrorf("unsupported EXPLAIN options: %s", n)
 	}
 
-	plan, err := p.makePlan(n.Statement, false)
+	if mode == explainTrace {
+		sp, err := tracing.JoinOrNewSnowball("coordinator", nil, func(sp basictracer.RawSpan) {
+			p.txn.CollectedSpans = append(p.txn.CollectedSpans, sp)
+		})
+		if err != nil {
+			return nil, roachpb.NewError(err)
+		}
+		p.txn.Context = opentracing.ContextWithSpan(p.txn.Context, sp)
+
+	}
+
+	plan, err := p.makePlan(n.Statement, autoCommit)
 	if err != nil {
 		return nil, err
 	}
 	switch mode {
 	case explainDebug:
-		plan, err = markDebug(plan, mode)
-		if err != nil {
-			return nil, roachpb.NewUErrorf("%v: %s", err, n)
-		}
+		plan.MarkDebug(mode)
+
 		// Wrap the plan in an explainDebugNode.
 		return &explainDebugNode{plan}, nil
 
@@ -70,62 +88,15 @@ func (p *planner) Explain(n *parser.Explain) (planNode, *roachpb.Error) {
 		populateExplain(v, plan, 0)
 		return v, nil
 
+	case explainTrace:
+		plan.MarkDebug(explainDebug)
+		return (&sortNode{
+			ordering: []columnOrderInfo{{len(traceColumns), encoding.Ascending}, {2, encoding.Ascending}},
+			columns:  traceColumns,
+		}).wrap(&explainTraceNode{plan: plan, txn: p.txn}), nil
+
 	default:
 		return nil, roachpb.NewUErrorf("unsupported EXPLAIN mode: %d", mode)
-	}
-}
-
-func markDebug(plan planNode, mode explainMode) (planNode, *roachpb.Error) {
-	switch t := plan.(type) {
-	case *selectNode:
-		t.explain = mode
-
-		if _, ok := t.table.node.(*indexJoinNode); ok {
-			// We will replace the indexJoinNode with the index node; we cannot
-			// process filter or render expressions (we don't have all the values).
-			// TODO(radu): this should go away once indexJoinNode properly
-			// implements explainDebug.
-			t.filter = nil
-			t.render = nil
-			t.qvals = nil
-		}
-		// Mark the from node as debug (and potentially replace it).
-		newNode, err := markDebug(t.table.node, mode)
-		t.table.node = newNode
-		return t, err
-
-	case *scanNode:
-		t.explain = mode
-		return t, nil
-
-	case *indexJoinNode:
-		t.explain = mode
-		// Mark both the index and the table scan nodes as debug.
-		_, err := markDebug(t.index, mode)
-		if err != nil {
-			return t, err
-		}
-		_, err = markDebug(t.table, mode)
-		return t, err
-
-	case *sortNode:
-		// Replace the sort node with the node it wraps.
-		return markDebug(t.plan, mode)
-
-	case *groupNode:
-		// Replace the group node with the node it wraps.
-		return markDebug(t.plan, mode)
-
-	case *emptyNode:
-		// emptyNode supports DebugValues without any explicit enablement.
-		return t, nil
-
-	case *valuesNode:
-		// valuesNode supports DebugValues without any explicit enablement.
-		return t, nil
-
-	default:
-		return nil, roachpb.NewErrorf("TODO(pmattis): unimplemented %T", plan)
 	}
 }
 
@@ -153,6 +124,10 @@ const (
 	// The debug values refer to a full result row but the row was filtered out.
 	debugValueFiltered
 
+	// The debug value refers to a full result row that has been stored in a buffer
+	// and will be emitted later.
+	debugValueBuffered
+
 	// The debug values refer to a full result row.
 	debugValueRow
 )
@@ -164,6 +139,9 @@ func (t debugValueType) String() string {
 
 	case debugValueFiltered:
 		return "FILTERED"
+
+	case debugValueBuffered:
+		return "BUFFERED"
 
 	case debugValueRow:
 		return "ROW"
@@ -179,6 +157,32 @@ type debugValues struct {
 	key    string
 	value  string
 	output debugValueType
+}
+
+func (vals *debugValues) AsRow() parser.DTuple {
+	keyVal := parser.DNull
+	if vals.key != "" {
+		keyVal = parser.DString(vals.key)
+	}
+
+	// The "output" value is NULL for partial rows, or a DBool indicating if the row passed the
+	// filtering.
+	outputVal := parser.DNull
+
+	switch vals.output {
+	case debugValueFiltered:
+		outputVal = parser.DBool(false)
+
+	case debugValueRow:
+		outputVal = parser.DBool(true)
+	}
+
+	return parser.DTuple{
+		parser.DInt(vals.rowIdx),
+		keyVal,
+		parser.DString(vals.value),
+		outputVal,
+	}
 }
 
 // explainDebugNode is a planNode that wraps another node and converts DebugValues() results to a
@@ -221,6 +225,12 @@ func (n *explainDebugNode) Values() parser.DTuple {
 	}
 }
 
+func (*explainDebugNode) MarkDebug(_ explainMode) {
+	panic("debug mode not implemented in explainDebugNode")
+}
+
 func (*explainDebugNode) DebugValues() debugValues {
 	panic("debug mode not implemented in explainDebugNode")
 }
+
+func (*explainDebugNode) SetLimitHint(_ int64, _ bool) {}

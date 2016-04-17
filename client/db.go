@@ -19,17 +19,12 @@ package client
 import (
 	"bytes"
 	"fmt"
-	"net/url"
-	"strconv"
-	"time"
 
 	"golang.org/x/net/context"
 
-	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
-	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/cockroachdb/cockroach/util/tracing"
 	"github.com/gogo/protobuf/proto"
 )
@@ -39,7 +34,7 @@ import (
 // nil.
 type KeyValue struct {
 	Key   roachpb.Key
-	Value *roachpb.Value
+	Value *roachpb.Value // Timestamp will always be zero
 }
 
 func (kv *KeyValue) String() string {
@@ -83,20 +78,6 @@ func (kv *KeyValue) PrettyValue() string {
 		return fmt.Sprintf("%s", v)
 	}
 	return fmt.Sprintf("%q", kv.Value.RawBytes)
-}
-
-func (kv *KeyValue) setTimestamp(t roachpb.Timestamp) {
-	if kv.Value != nil {
-		kv.Value.Timestamp = t
-	}
-}
-
-// Timestamp returns the timestamp the value was written at.
-func (kv *KeyValue) Timestamp() time.Time {
-	if kv.Value == nil {
-		return time.Time{}
-	}
-	return kv.Value.Timestamp.GoTime()
 }
 
 // ValueBytes returns the value as a byte slice. This method will panic if the
@@ -146,6 +127,9 @@ type Result struct {
 	// rows returned is the number or rows matching the scan capped by the
 	// maxRows parameter. For DelRange Rows is nil.
 	Rows []KeyValue
+
+	// Keys is set by some operations instead of returning the rows themselves.
+	Keys []roachpb.Key
 }
 
 func (r Result) String() string {
@@ -195,71 +179,6 @@ func NewDBWithPriority(sender Sender, userPriority roachpb.UserPriority) *DB {
 	return db
 }
 
-// TODO(pmattis): Allow setting the sender/txn retry options.
-
-// Open creates a new database handle to the cockroach cluster specified by
-// addr. The cluster is identified by a URL with the format:
-//
-//   [<sender>:]//[<user>@]<host>:<port>[?certs=<dir>,priority=<val>]
-//
-// The URL scheme (<sender>) specifies which transport to use for talking to
-// the cockroach cluster. Currently allowable values are: http, https, rpc,
-// rpcs. The rpc and rpcs senders use a variant of Go's builtin rpc library for
-// communication with the cluster. This protocol is lower overhead and more
-// efficient than http. The decision between the encrypted (https, rpcs) and
-// unencrypted senders (http, rpc) depends on the settings of the cluster. A
-// given cluster supports either encrypted or unencrypted traffic, but not
-// both.
-//
-// If not specified, the <user> field defaults to "root".
-//
-// The certs parameter can be used to override the default directory to use for
-// client certificates. In tests, the directory "test_certs" uses the embedded
-// test certificates.
-//
-// The priority parameter can be used to override the default priority for
-// operations.
-func Open(stopper *stop.Stopper, addr string) (*DB, error) {
-	u, err := url.Parse(addr)
-	if err != nil {
-		return nil, err
-	}
-	ctx := &base.Context{}
-	ctx.InitDefaults()
-	if u.User != nil {
-		ctx.User = u.User.Username()
-	}
-
-	q := u.Query()
-	if dir := q["certs"]; len(dir) > 0 {
-		ctx.Certs = dir[0]
-	}
-
-	sender, err := newSender(u, ctx, stopper)
-	if err != nil {
-		return nil, err
-	}
-	if sender == nil {
-		return nil, fmt.Errorf("\"%s\" no sender specified", addr)
-	}
-
-	db := &DB{
-		sender:          sender,
-		userPriority:    roachpb.NormalUserPriority,
-		txnRetryOptions: DefaultTxnRetryOptions,
-	}
-
-	if priority := q["priority"]; len(priority) > 0 {
-		p, err := strconv.ParseFloat(priority[0], 64)
-		if err != nil {
-			return nil, err
-		}
-		db.userPriority = roachpb.UserPriority(p)
-	}
-
-	return db, nil
-}
-
 // NewBatch creates and returns a new empty batch object for use with the DB.
 // TODO(tschottdorf): it appears this can be unexported.
 func (db *DB) NewBatch() *Batch {
@@ -279,12 +198,29 @@ func (db *DB) Get(key interface{}) (KeyValue, *roachpb.Error) {
 	return runOneRow(db, b)
 }
 
+// GetInconsistent is Get with an inconsistent read.
+func (db *DB) GetInconsistent(key interface{}) (KeyValue, *roachpb.Error) {
+	b := db.NewBatch()
+	b.ReadConsistency = roachpb.INCONSISTENT
+	b.Get(key)
+	return runOneRow(db, b)
+}
+
 // GetProto retrieves the value for a key and decodes the result as a proto
 // message.
 //
 // key can be either a byte slice or a string.
 func (db *DB) GetProto(key interface{}, msg proto.Message) *roachpb.Error {
 	r, pErr := db.Get(key)
+	if pErr != nil {
+		return pErr
+	}
+	return roachpb.NewError(r.ValueProto(msg))
+}
+
+// GetProtoInconsistent is GetProto with an inconsistent read.
+func (db *DB) GetProtoInconsistent(key interface{}, msg proto.Message) *roachpb.Error {
+	r, pErr := db.GetInconsistent(key)
 	if pErr != nil {
 		return pErr
 	}
@@ -298,6 +234,20 @@ func (db *DB) GetProto(key interface{}, msg proto.Message) *roachpb.Error {
 func (db *DB) Put(key, value interface{}) *roachpb.Error {
 	b := db.NewBatch()
 	b.Put(key, value)
+	_, pErr := runOneResult(db, b)
+	return pErr
+}
+
+// PutInline sets the value for a key, but does not maintain
+// multi-version values. The most recent value is always overwritten.
+// Inline values cannot be mutated transactionally and should be used
+// with caution.
+//
+// key can be either a byte slice or a string. value can be any key type, a
+// proto.Message or any Go primitive type (bool, int, etc).
+func (db *DB) PutInline(key, value interface{}) *roachpb.Error {
+	b := db.NewBatch()
+	b.PutInline(key, value)
 	_, pErr := runOneResult(db, b)
 	return pErr
 }
@@ -327,8 +277,14 @@ func (db *DB) Inc(key interface{}, value int64) (KeyValue, *roachpb.Error) {
 	return runOneRow(db, b)
 }
 
-func (db *DB) scan(begin, end interface{}, maxRows int64, isReverse bool) ([]KeyValue, *roachpb.Error) {
+func (db *DB) scan(
+	begin, end interface{},
+	maxRows int64,
+	isReverse bool,
+	readConsistency roachpb.ReadConsistencyType,
+) ([]KeyValue, *roachpb.Error) {
 	b := db.NewBatch()
+	b.ReadConsistency = readConsistency
 	if !isReverse {
 		b.Scan(begin, end, maxRows)
 	} else {
@@ -345,7 +301,12 @@ func (db *DB) scan(begin, end interface{}, maxRows int64, isReverse bool) ([]Key
 //
 // key can be either a byte slice or a string.
 func (db *DB) Scan(begin, end interface{}, maxRows int64) ([]KeyValue, *roachpb.Error) {
-	return db.scan(begin, end, maxRows, false)
+	return db.scan(begin, end, maxRows, false, roachpb.CONSISTENT)
+}
+
+// ScanInconsistent is Scan with an inconsistent read.
+func (db *DB) ScanInconsistent(begin, end interface{}, maxRows int64) ([]KeyValue, *roachpb.Error) {
+	return db.scan(begin, end, maxRows, false, roachpb.INCONSISTENT)
 }
 
 // ReverseScan retrieves the rows between begin (inclusive) and end (exclusive)
@@ -355,7 +316,7 @@ func (db *DB) Scan(begin, end interface{}, maxRows int64) ([]KeyValue, *roachpb.
 //
 // key can be either a byte slice or a string.
 func (db *DB) ReverseScan(begin, end interface{}, maxRows int64) ([]KeyValue, *roachpb.Error) {
-	return db.scan(begin, end, maxRows, true)
+	return db.scan(begin, end, maxRows, true, roachpb.CONSISTENT)
 }
 
 // Del deletes one or more keys.
@@ -375,7 +336,7 @@ func (db *DB) Del(keys ...interface{}) *roachpb.Error {
 // key can be either a byte slice or a string.
 func (db *DB) DelRange(begin, end interface{}) *roachpb.Error {
 	b := db.NewBatch()
-	b.DelRange(begin, end)
+	b.DelRange(begin, end, false)
 	_, pErr := runOneResult(db, b)
 	return pErr
 }
@@ -403,16 +364,26 @@ func (db *DB) AdminSplit(splitKey interface{}) *roachpb.Error {
 	return pErr
 }
 
+// CheckConsistency runs a consistency check on all the ranges containing
+// the key span. It logs a diff of all the keys that are inconsistent
+// when withDiff is set to true.
+func (db *DB) CheckConsistency(begin, end interface{}, withDiff bool) *roachpb.Error {
+	b := db.NewBatch()
+	b.CheckConsistency(begin, end, withDiff)
+	_, pErr := runOneResult(db, b)
+	return pErr
+}
+
 // sendAndFill is a helper which sends the given batch and fills its results,
 // returning the appropriate error which is either from the first failing call,
 // or an "internal" error.
-func sendAndFill(send func(...roachpb.Request) (*roachpb.BatchResponse, *roachpb.Error), b *Batch) (*roachpb.BatchResponse, *roachpb.Error) {
+func sendAndFill(send func(int64, roachpb.ReadConsistencyType, ...roachpb.Request) (*roachpb.BatchResponse, *roachpb.Error), b *Batch) (*roachpb.BatchResponse, *roachpb.Error) {
 	// Errors here will be attached to the results, so we will get them from
 	// the call to fillResults in the regular case in which an individual call
 	// fails. But send() also returns its own errors, so there's some dancing
 	// here to do because we want to run fillResults() so that the individual
 	// result gets initialized with an error from the corresponding call.
-	br, pErr := send(b.reqs...)
+	br, pErr := send(b.MaxScanResults, b.ReadConsistency, b.reqs...)
 	if pErr != nil {
 		// Discard errors from fillResults.
 		_ = b.fillResults(nil, pErr)
@@ -456,26 +427,47 @@ func (db *DB) RunWithResponse(b *Batch) (*roachpb.BatchResponse, *roachpb.Error)
 // otherwise. The retryable function should have no side effects which could
 // cause problems in the event it must be run more than once.
 //
-// TODO(pmattis): Allow transaction options to be specified.
+// If you need more control over how the txn is executed, check out txn.Exec().
 func (db *DB) Txn(retryable func(txn *Txn) *roachpb.Error) *roachpb.Error {
-	txn := NewTxn(*db)
+	// TODO(dan): This context should, at longest, live for the lifetime of this
+	// method. Add a defered cancel.
+	txn := NewTxn(context.TODO(), *db)
 	txn.SetDebugName("", 1)
-	return txn.exec(retryable)
+	pErr := txn.Exec(TxnExecOptions{AutoRetry: true, AutoCommit: true},
+		func(txn *Txn, _ *TxnExecOptions) *roachpb.Error {
+			return retryable(txn)
+		})
+	if pErr != nil {
+		txn.CleanupOnError(pErr)
+	}
+	return pErr
 }
 
 // send runs the specified calls synchronously in a single batch and returns
 // any errors. Returns a nil response for empty input (no requests).
-func (db *DB) send(reqs ...roachpb.Request) (*roachpb.BatchResponse, *roachpb.Error) {
+func (db *DB) send(maxScanResults int64, readConsistency roachpb.ReadConsistencyType,
+	reqs ...roachpb.Request) (*roachpb.BatchResponse, *roachpb.Error) {
 	if len(reqs) == 0 {
 		return nil, nil
+	}
+
+	if readConsistency == roachpb.INCONSISTENT {
+		for _, req := range reqs {
+			if req.Method() != roachpb.Get && req.Method() != roachpb.Scan &&
+				req.Method() != roachpb.ReverseScan {
+				return nil, roachpb.NewErrorf("method %s not allowed with INCONSISTENT batch", req.Method)
+			}
+		}
 	}
 
 	ba := roachpb.BatchRequest{}
 	ba.Add(reqs...)
 
-	if ba.UserPriority == 0 && db.userPriority != 1 {
+	ba.MaxScanResults = maxScanResults
+	if db.userPriority != 1 {
 		ba.UserPriority = db.userPriority
 	}
+	ba.ReadConsistency = readConsistency
 
 	tracing.AnnotateTrace()
 

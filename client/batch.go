@@ -43,8 +43,17 @@ type Batch struct {
 	//   _ = db.Run(b)
 	//   // string(b.Results[0].Rows[0].Key) == "a"
 	//   // string(b.Results[1].Rows[0].Key) == "b"
-	Results    []Result
-	reqs       []roachpb.Request
+	Results []Result
+	reqs    []roachpb.Request
+	// If nonzero, limits the total amount of key/values returned by all Scan/ReverseScan operations
+	// in the batch. This can only be used if all requests are of the same type, and that type is
+	// Scan or ReverseScan.
+	MaxScanResults int64
+	// ReadConsistency specifies the consistency for read operations. The default
+	// is CONSISTENT. This value is ignored for write operations.
+	ReadConsistency roachpb.ReadConsistencyType
+
+	// We use pre-allocated buffers to avoid dynamic allocations for small batches.
 	resultsBuf [8]Result
 	rowsBuf    [8]KeyValue
 	rowsIdx    int
@@ -112,14 +121,12 @@ func (b *Batch) fillResults(br *roachpb.BatchResponse, pErr *roachpb.Error) *roa
 				row.Key = []byte(req.Key)
 				if result.PErr == nil {
 					row.Value = &req.Value
-					row.setTimestamp(reply.(*roachpb.PutResponse).Timestamp)
 				}
 			case *roachpb.ConditionalPutRequest:
 				row := &result.Rows[k]
 				row.Key = []byte(req.Key)
 				if result.PErr == nil {
 					row.Value = &req.Value
-					row.setTimestamp(reply.(*roachpb.ConditionalPutResponse).Timestamp)
 				}
 			case *roachpb.IncrementRequest:
 				row := &result.Rows[k]
@@ -128,7 +135,6 @@ func (b *Batch) fillResults(br *roachpb.BatchResponse, pErr *roachpb.Error) *roa
 					t := reply.(*roachpb.IncrementResponse)
 					row.Value = &roachpb.Value{}
 					row.Value.SetInt(t.NewValue)
-					row.setTimestamp(t.Timestamp)
 				}
 			case *roachpb.ScanRequest:
 				if result.PErr == nil {
@@ -157,6 +163,10 @@ func (b *Batch) fillResults(br *roachpb.BatchResponse, pErr *roachpb.Error) *roa
 				row.Key = []byte(args.(*roachpb.DeleteRequest).Key)
 
 			case *roachpb.DeleteRangeRequest:
+				if result.PErr == nil {
+					result.Keys = reply.(*roachpb.DeleteRangeResponse).Keys
+				}
+
 			case *roachpb.BeginTransactionRequest:
 			case *roachpb.EndTransactionRequest:
 			case *roachpb.AdminMergeRequest:
@@ -170,6 +180,7 @@ func (b *Batch) fillResults(br *roachpb.BatchResponse, pErr *roachpb.Error) *roa
 			case *roachpb.MergeRequest:
 			case *roachpb.TruncateLogRequest:
 			case *roachpb.LeaderLeaseRequest:
+			case *roachpb.CheckConsistencyRequest:
 				// Nothing to do for these methods as they do not generate any
 				// rows.
 
@@ -226,14 +237,7 @@ func (b *Batch) Get(key interface{}) {
 	b.initResult(1, 1, nil)
 }
 
-// Put sets the value for a key.
-//
-// A new result will be appended to the batch which will contain a single row
-// and Result.Err will indicate success or failure.
-//
-// key can be either a byte slice or a string. value can be any key type, a
-// proto.Message or any Go primitive type (bool, int, etc).
-func (b *Batch) Put(key, value interface{}) {
+func (b *Batch) put(key, value interface{}, inline bool) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 1, err)
@@ -244,8 +248,37 @@ func (b *Batch) Put(key, value interface{}) {
 		b.initResult(0, 1, err)
 		return
 	}
-	b.reqs = append(b.reqs, roachpb.NewPut(k, v))
+	if inline {
+		b.reqs = append(b.reqs, roachpb.NewPutInline(k, v))
+	} else {
+		b.reqs = append(b.reqs, roachpb.NewPut(k, v))
+	}
 	b.initResult(1, 1, nil)
+}
+
+// Put sets the value for a key.
+//
+// A new result will be appended to the batch which will contain a single row
+// and Result.Err will indicate success or failure.
+//
+// key can be either a byte slice or a string. value can be any key type, a
+// proto.Message or any Go primitive type (bool, int, etc).
+func (b *Batch) Put(key, value interface{}) {
+	b.put(key, value, false)
+}
+
+// PutInline sets the value for a key, but does not maintain
+// multi-version values. The most recent value is always overwritten.
+// Inline values cannot be mutated transactionally and should be used
+// with caution.
+//
+// A new result will be appended to the batch which will contain a single row
+// and Result.Err will indicate success or failure.
+//
+// key can be either a byte slice or a string. value can be any key type, a
+// proto.Message or any Go primitive type (bool, int, etc).
+func (b *Batch) PutInline(key, value interface{}) {
+	b.put(key, value, true)
 }
 
 // CPut conditionally sets the value for a key if the existing value is equal
@@ -315,11 +348,12 @@ func (b *Batch) scan(s, e interface{}, maxRows int64, isReverse bool) {
 	b.initResult(1, 0, nil)
 }
 
-// Scan retrieves the rows between begin (inclusive) and end (exclusive) in
+// Scan retrieves the key/values between begin (inclusive) and end (exclusive) in
 // ascending order.
 //
 // A new result will be appended to the batch which will contain up to maxRows
-// rows and Result.Err will indicate success or failure.
+// "rows" (each row is a key/value pair) and Result.Err will indicate success or
+// failure.
 //
 // key can be either a byte slice or a string.
 func (b *Batch) Scan(s, e interface{}, maxRows int64) {
@@ -330,11 +364,30 @@ func (b *Batch) Scan(s, e interface{}, maxRows int64) {
 // in descending order.
 //
 // A new result will be appended to the batch which will contain up to maxRows
-// rows and Result.Err will indicate success or failure.
+// rows (each "row" is a key/value pair) and Result.Err will indicate success or
+// failure.
 //
 // key can be either a byte slice or a string.
 func (b *Batch) ReverseScan(s, e interface{}, maxRows int64) {
 	b.scan(s, e, maxRows, true)
+}
+
+// CheckConsistency creates a batch request to check the consistency of the
+// ranges holding the span of keys from s to e. It logs a diff of all the
+// keys that are inconsistent when withDiff is set to true.
+func (b *Batch) CheckConsistency(s, e interface{}, withDiff bool) {
+	begin, err := marshalKey(s)
+	if err != nil {
+		b.initResult(0, 0, err)
+		return
+	}
+	end, err := marshalKey(e)
+	if err != nil {
+		b.initResult(0, 0, err)
+		return
+	}
+	b.reqs = append(b.reqs, roachpb.NewCheckConsistency(roachpb.Key(begin), roachpb.Key(end), withDiff))
+	b.initResult(1, 0, nil)
 }
 
 // Del deletes one or more keys.
@@ -363,7 +416,7 @@ func (b *Batch) Del(keys ...interface{}) {
 // Result.Err will indicate success or failure.
 //
 // key can be either a byte slice or a string.
-func (b *Batch) DelRange(s, e interface{}) {
+func (b *Batch) DelRange(s, e interface{}, returnKeys bool) {
 	begin, err := marshalKey(s)
 	if err != nil {
 		b.initResult(0, 0, err)
@@ -374,7 +427,7 @@ func (b *Batch) DelRange(s, e interface{}) {
 		b.initResult(0, 0, err)
 		return
 	}
-	b.reqs = append(b.reqs, roachpb.NewDeleteRange(roachpb.Key(begin), roachpb.Key(end)))
+	b.reqs = append(b.reqs, roachpb.NewDeleteRange(roachpb.Key(begin), roachpb.Key(end), returnKeys))
 	b.initResult(1, 0, nil)
 }
 

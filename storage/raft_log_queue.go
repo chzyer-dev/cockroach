@@ -97,7 +97,8 @@ func getTruncatableIndexes(r *Replica) (uint64, uint64, error) {
 	}
 
 	if oldestIndex < firstIndex {
-		return 0, 0, util.Errorf("raft log's oldest index is less than the first index for range %d", rangeID)
+		return 0, 0, util.Errorf("raft log's oldest index (%d) is less than the first index (%d) for range %d",
+			oldestIndex, firstIndex, rangeID)
 	}
 
 	// Return the number of truncatable indexes.
@@ -107,7 +108,7 @@ func getTruncatableIndexes(r *Replica) (uint64, uint64, error) {
 // shouldQueue determines whether a range should be queued for truncating. This
 // is true only if the replica is the raft leader and if the total number of
 // the range's raft log's stale entries exceeds RaftLogQueueStaleThreshold.
-func (*raftLogQueue) shouldQueue(now roachpb.Timestamp, r *Replica, _ *config.SystemConfig) (shouldQ bool,
+func (*raftLogQueue) shouldQueue(now roachpb.Timestamp, r *Replica, _ config.SystemConfig) (shouldQ bool,
 	priority float64) {
 
 	truncatableIndexes, _, err := getTruncatableIndexes(r)
@@ -122,7 +123,7 @@ func (*raftLogQueue) shouldQueue(now roachpb.Timestamp, r *Replica, _ *config.Sy
 // process truncates the raft log of the range if the replica is the raft
 // leader and if the total number of the range's raft log's stale entries
 // exceeds RaftLogQueueStaleThreshold.
-func (rlq *raftLogQueue) process(now roachpb.Timestamp, r *Replica, _ *config.SystemConfig) error {
+func (rlq *raftLogQueue) process(now roachpb.Timestamp, r *Replica, _ config.SystemConfig) error {
 
 	truncatableIndexes, oldestIndex, err := getTruncatableIndexes(r)
 	if err != nil {

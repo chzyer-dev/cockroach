@@ -13,12 +13,17 @@
 // permissions and limitations under the License.
 //
 // Author: Vivek Menezes (vivek@cockroachlabs.com)
+// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package parser
 
 import (
 	"bytes"
 	"fmt"
+	"strings"
+
+	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/util"
 )
 
 // IsolationLevel holds the isolation level for a transaction.
@@ -56,10 +61,10 @@ const (
 )
 
 var userPriorityNames = [...]string{
-	UnspecifiedIsolation: "UNSPECIFIED",
-	Low:                  "LOW",
-	Normal:               "NORMAL",
-	High:                 "HIGH",
+	UnspecifiedUserPriority: "UNSPECIFIED",
+	Low:    "LOW",
+	Normal: "NORMAL",
+	High:   "HIGH",
 }
 
 func (up UserPriority) String() string {
@@ -101,4 +106,47 @@ type RollbackTransaction struct{}
 
 func (node *RollbackTransaction) String() string {
 	return "ROLLBACK TRANSACTION"
+}
+
+// RestartSavepointName is the only savepoint name that we accept, modulo
+// capitalization.
+const RestartSavepointName string = "COCKROACH_RESTART"
+
+// ValidateRestartCheckpoint checks that a checkpoint name is our magic restart
+// value.
+// We accept everything with the desired prefix because at least the C++ libpqxx
+// appends sequence numbers to the savepoint name specified by the user.
+func ValidateRestartCheckpoint(savepoint string) *roachpb.Error {
+	if !strings.HasPrefix(strings.ToUpper(savepoint), RestartSavepointName) {
+		return roachpb.NewError(util.Errorf(
+			"SAVEPOINT not supported except for %s", RestartSavepointName))
+	}
+	return nil
+}
+
+// Savepoint represents a SAVEPOINT <name> statement.
+type Savepoint struct {
+	Name string
+}
+
+func (node *Savepoint) String() string {
+	return "SAVEPOINT " + node.Name
+}
+
+// ReleaseSavepoint represents a RELEASE SAVEPOINT <name> statement.
+type ReleaseSavepoint struct {
+	Savepoint string
+}
+
+func (node *ReleaseSavepoint) String() string {
+	return "RELEASE SAVEPOINT " + node.Savepoint
+}
+
+// RollbackToSavepoint represents a ROLLBACK TO SAVEPOINT <name> statement.
+type RollbackToSavepoint struct {
+	Savepoint string
+}
+
+func (node *RollbackToSavepoint) String() string {
+	return "ROLLBACK TRANSACTION TO SAVEPOINT " + node.Savepoint
 }

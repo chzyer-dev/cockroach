@@ -19,10 +19,10 @@
 package engine
 
 import (
-	"sync"
+	"github.com/gogo/protobuf/proto"
 
 	"github.com/cockroachdb/cockroach/roachpb"
-	"github.com/gogo/protobuf/proto"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 )
 
 // Iterator is an interface for iterating over key/value pairs in an
@@ -150,36 +150,53 @@ type Engine interface {
 	// with the defer statement, the last callback to be deferred is the
 	// first to be executed.
 	Defer(fn func())
+	// Closed returns true if the engine has been close or not usable.
+	// Objects backed by this engine (e.g. Iterators) can check this to ensure
+	// that they are not using an closed engine.
+	Closed() bool
+	// GetStats retrieves stats from the engine.
+	GetStats() (*Stats, error)
 }
 
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return proto.NewBuffer(nil)
-	},
+// Stats is a set of RocksDB stats. These are all described in RocksDB
+//
+// Currently, we collect stats from the following sources:
+// 1. RocksDB's internal "tickers" (i.e. counters). They're defined in
+//    rocksdb/statistics.h
+// 2. DBEventListener, which implements RocksDB's EventListener interface.
+// 3. rocksdb::DB::GetProperty().
+//
+// This is a good resource describing RocksDB's memory-related stats:
+// https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB
+type Stats struct {
+	BlockCacheHits           int64
+	BlockCacheMisses         int64
+	BlockCacheUsage          int64
+	BlockCachePinnedUsage    int64
+	BloomFilterPrefixChecked int64
+	BloomFilterPrefixUseful  int64
+	MemtableHits             int64
+	MemtableMisses           int64
+	MemtableTotalSize        int64
+	Flushes                  int64
+	Compactions              int64
+	TableReadersMemEstimate  int64
 }
 
 // PutProto sets the given key to the protobuf-serialized byte string
 // of msg and the provided timestamp. Returns the length in bytes of
 // key and the value.
 func PutProto(engine Engine, key MVCCKey, msg proto.Message) (keyBytes, valBytes int64, err error) {
-	buf := bufferPool.Get().(*proto.Buffer)
-	buf.Reset()
-
-	if err = buf.Marshal(msg); err != nil {
-		bufferPool.Put(buf)
-		return
-	}
-	data := buf.Bytes()
-	if err = engine.Put(key, data); err != nil {
-		bufferPool.Put(buf)
-		return
+	bytes, err := protoutil.Marshal(msg)
+	if err != nil {
+		return 0, 0, err
 	}
 
-	keyBytes = int64(key.EncodedSize())
-	valBytes = int64(len(data))
+	if err := engine.Put(key, bytes); err != nil {
+		return 0, 0, err
+	}
 
-	bufferPool.Put(buf)
-	return
+	return int64(key.EncodedSize()), int64(len(bytes)), nil
 }
 
 // Scan returns up to max key/value objects starting from

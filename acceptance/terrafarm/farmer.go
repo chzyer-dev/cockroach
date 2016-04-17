@@ -28,34 +28,31 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/base"
+	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/util/retry"
+	"github.com/cockroachdb/cockroach/util/stop"
 )
 
 // A Farmer sets up and manipulates a test cluster via terraform.
 type Farmer struct {
 	Output         io.Writer
 	Cwd, LogDir    string
-	Args           []string
 	KeyName        string
 	Stores         string
 	nodes, writers []string
-	elb            string
 }
 
 func (f *Farmer) refresh() {
 	f.nodes = f.output("instances")
 	f.writers = f.output("example_block_writer")
-	if elbs := f.output("elb_address"); len(elbs) > 0 {
-		f.elb = elbs[0]
-	}
 }
 
-// LoadBalancer returns the load balancer address.
-func (f *Farmer) LoadBalancer() string {
-	if f.elb == "" {
+// FirstInstance returns the address of the first instance.
+func (f *Farmer) FirstInstance() string {
+	if len(f.nodes) == 0 {
 		f.refresh()
 	}
-	return f.elb
+	return f.nodes[0]
 }
 
 // Nodes returns a (copied) slice of provisioned nodes' host names.
@@ -166,21 +163,13 @@ func (f *Farmer) Exec(i int, cmd string) error {
 	return nil
 }
 
-// ConnString returns a connection string to pass to client.Open().
-func (f *Farmer) ConnString(i int) string {
-	// TODO(tschottdorf,mberhault): TLS all the things!
-	return "rpc://" + "root" + "@" +
-		net.JoinHostPort(f.Nodes()[i], base.CockroachPort) +
-		"?certs=" + "certswhocares"
+// NewClient implements the Cluster interface.
+func (f *Farmer) NewClient(t *testing.T, i int) (*client.DB, *stop.Stopper) {
+	panic("unimplemented")
 }
 
 // PGUrl returns a URL string for the given node postgres server.
 func (f *Farmer) PGUrl(i int) string {
-	panic("unimplemented")
-}
-
-// PGAddr returns the Postgres address for the given node.
-func (f *Farmer) PGAddr(i int) *net.TCPAddr {
 	panic("unimplemented")
 }
 
@@ -195,14 +184,13 @@ func (f *Farmer) WaitReady(d time.Duration) error {
 	}
 	var err error
 	for r := retry.Start(rOpts); r.Next(); {
-		var elb string
-		elb, _, err = net.SplitHostPort(f.LoadBalancer())
-		if err != nil || elb == "" {
-			err = fmt.Errorf("ELB not found: %v", err)
+		instance := f.FirstInstance()
+		if err != nil || instance == "" {
+			err = fmt.Errorf("no nodes found: %v", err)
 			continue
 		}
 		for i := range f.Nodes() {
-			if err = f.Exec(i, "nslookup "+elb); err != nil {
+			if err = f.Exec(i, "nslookup "+instance); err != nil {
 				break
 			}
 		}
@@ -263,7 +251,12 @@ func (f *Farmer) Restart(i int) error {
 
 // URL returns the HTTP(s) endpoint.
 func (f *Farmer) URL(i int) string {
-	return "http://" + net.JoinHostPort(f.Nodes()[i], base.CockroachPort)
+	return "http://" + net.JoinHostPort(f.Nodes()[i], base.DefaultHTTPPort)
+}
+
+// Addr returns the host and port from the node in the format HOST:PORT.
+func (f *Farmer) Addr(i int) string {
+	return net.JoinHostPort(f.Nodes()[i], base.DefaultHTTPPort)
 }
 
 func (f *Farmer) logf(format string, args ...interface{}) {

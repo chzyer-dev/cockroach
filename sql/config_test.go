@@ -19,7 +19,6 @@ package sql_test
 import (
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
@@ -28,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
-	"github.com/gogo/protobuf/proto"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 )
 
 var configID = sql.ID(1)
@@ -37,7 +36,7 @@ var configDescKey = sql.MakeDescMetadataKey(keys.MaxReservedDescID)
 // forceNewConfig forces a system config update by writing a bogus descriptor with an
 // incremented value inside. It then repeatedly fetches the gossip config until the
 // just-written descriptor is found.
-func forceNewConfig(t *testing.T, s *testServer) (*config.SystemConfig, error) {
+func forceNewConfig(t *testing.T, s *testServer) config.SystemConfig {
 	configID++
 	configDesc := &sql.Descriptor{
 		Union: &sql.Descriptor_Database{
@@ -59,26 +58,30 @@ func forceNewConfig(t *testing.T, s *testServer) (*config.SystemConfig, error) {
 	return waitForConfigChange(t, s)
 }
 
-func waitForConfigChange(t *testing.T, s *testServer) (*config.SystemConfig, error) {
+func waitForConfigChange(t *testing.T, s *testServer) config.SystemConfig {
 	var foundDesc sql.Descriptor
-	var cfg *config.SystemConfig
-	return cfg, util.IsTrueWithin(func() bool {
-		if cfg = s.Gossip().GetSystemConfig(); cfg != nil {
+	var cfg config.SystemConfig
+	util.SucceedsSoon(t, func() error {
+		var ok bool
+		if cfg, ok = s.Gossip().GetSystemConfig(); ok {
 			if val := cfg.GetValue(configDescKey); val != nil {
 				if err := val.GetProto(&foundDesc); err != nil {
 					t.Fatal(err)
 				}
-				return foundDesc.GetDatabase().GetID() == configID
+				if id := foundDesc.GetDatabase().GetID(); id != configID {
+					return util.Errorf("expected database id %d; got %d", configID, id)
+				}
+				return nil
 			}
 		}
-
-		return false
-	}, 10*time.Second)
+		return util.Errorf("got nil system config")
+	})
+	return cfg
 }
 
 // TestGetZoneConfig exercises config.GetZoneConfig and the sql hook for it.
 func TestGetZoneConfig(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	// Disable splitting. We're using bad attributes in zone configs
 	// to be able to match.
 	defer config.TestingDisableTableSplits()()
@@ -86,6 +89,22 @@ func TestGetZoneConfig(t *testing.T) {
 	defer cleanup(s, sqlDB)
 
 	expectedCounter := uint32(keys.MaxReservedDescID + 1)
+
+	defaultZoneConfig := config.DefaultZoneConfig()
+	defaultZoneConfig.RangeMinBytes = 1 << 20
+	defaultZoneConfig.RangeMaxBytes = 1 << 20
+	defaultZoneConfig.GC.TTLSeconds = 60
+
+	{
+		buf, err := protoutil.Marshal(&defaultZoneConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		objID := keys.RootNamespaceID
+		if _, err = sqlDB.Exec(`UPDATE system.zones SET config = $2 WHERE id = $1`, objID, buf); err != nil {
+			t.Fatalf("problem writing zone %+v: %s", defaultZoneConfig, err)
+		}
+	}
 
 	// Naming scheme for database and tables:
 	// db1 has tables tb11 and tb12
@@ -127,26 +146,23 @@ func TestGetZoneConfig(t *testing.T) {
 	}
 	expectedCounter++
 
-	cfg, err := forceNewConfig(t, s)
-	if err != nil {
-		t.Fatalf("failed to get latest system config: %s", err)
-	}
+	cfg := forceNewConfig(t, s)
 
 	// We have no custom zone configs.
 	testCases := []struct {
 		key     roachpb.RKey
-		zoneCfg config.ZoneConfig
+		zoneCfg *config.ZoneConfig
 	}{
-		{roachpb.RKeyMin, *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(0), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(1), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(keys.MaxReservedDescID), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(db1), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(db2), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(tb11), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(tb12), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(tb21), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(tb22), *config.DefaultZoneConfig},
+		{roachpb.RKeyMin, &defaultZoneConfig},
+		{keys.MakeTablePrefix(0), &defaultZoneConfig},
+		{keys.MakeTablePrefix(1), &defaultZoneConfig},
+		{keys.MakeTablePrefix(keys.MaxReservedDescID), &defaultZoneConfig},
+		{keys.MakeTablePrefix(db1), &defaultZoneConfig},
+		{keys.MakeTablePrefix(db2), &defaultZoneConfig},
+		{keys.MakeTablePrefix(tb11), &defaultZoneConfig},
+		{keys.MakeTablePrefix(tb12), &defaultZoneConfig},
+		{keys.MakeTablePrefix(tb21), &defaultZoneConfig},
+		{keys.MakeTablePrefix(tb22), &defaultZoneConfig},
 	}
 
 	for tcNum, tc := range testCases {
@@ -155,7 +171,7 @@ func TestGetZoneConfig(t *testing.T) {
 			t.Fatalf("#%d: err=%s", tcNum, err)
 		}
 
-		if !reflect.DeepEqual(*zoneCfg, tc.zoneCfg) {
+		if !reflect.DeepEqual(zoneCfg, tc.zoneCfg) {
 			t.Errorf("#%d: bad zone config.\nexpected: %+v\ngot: %+v", tcNum, tc.zoneCfg, zoneCfg)
 		}
 	}
@@ -177,7 +193,7 @@ func TestGetZoneConfig(t *testing.T) {
 		tb11: tb11Cfg,
 		tb21: tb21Cfg,
 	} {
-		buf, err := proto.Marshal(&objZone)
+		buf, err := protoutil.Marshal(&objZone)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -186,25 +202,22 @@ func TestGetZoneConfig(t *testing.T) {
 		}
 	}
 
-	cfg, err = forceNewConfig(t, s)
-	if err != nil {
-		t.Fatalf("failed to get latest system config: %s", err)
-	}
+	cfg = forceNewConfig(t, s)
 
 	testCases = []struct {
 		key     roachpb.RKey
-		zoneCfg config.ZoneConfig
+		zoneCfg *config.ZoneConfig
 	}{
-		{roachpb.RKeyMin, *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(0), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(1), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(keys.MaxReservedDescID), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(db1), db1Cfg},
-		{keys.MakeTablePrefix(db2), *config.DefaultZoneConfig},
-		{keys.MakeTablePrefix(tb11), tb11Cfg},
-		{keys.MakeTablePrefix(tb12), db1Cfg},
-		{keys.MakeTablePrefix(tb21), tb21Cfg},
-		{keys.MakeTablePrefix(tb22), *config.DefaultZoneConfig},
+		{roachpb.RKeyMin, &defaultZoneConfig},
+		{keys.MakeTablePrefix(0), &defaultZoneConfig},
+		{keys.MakeTablePrefix(1), &defaultZoneConfig},
+		{keys.MakeTablePrefix(keys.MaxReservedDescID), &defaultZoneConfig},
+		{keys.MakeTablePrefix(db1), &db1Cfg},
+		{keys.MakeTablePrefix(db2), &defaultZoneConfig},
+		{keys.MakeTablePrefix(tb11), &tb11Cfg},
+		{keys.MakeTablePrefix(tb12), &db1Cfg},
+		{keys.MakeTablePrefix(tb21), &tb21Cfg},
+		{keys.MakeTablePrefix(tb22), &defaultZoneConfig},
 	}
 
 	for tcNum, tc := range testCases {
@@ -213,7 +226,7 @@ func TestGetZoneConfig(t *testing.T) {
 			t.Fatalf("#%d: err=%s", tcNum, err)
 		}
 
-		if !reflect.DeepEqual(*zoneCfg, tc.zoneCfg) {
+		if !reflect.DeepEqual(zoneCfg, tc.zoneCfg) {
 			t.Errorf("#%d: bad zone config.\nexpected: %+v\ngot: %+v", tcNum, tc.zoneCfg, zoneCfg)
 		}
 	}

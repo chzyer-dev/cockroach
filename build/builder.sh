@@ -4,6 +4,16 @@ set -eu
 
 image="cockroachdb/builder"
 
+# Grab the builder tag from the acceptance tests. We're looking for a
+# variable named builderTag, splitting the line on double quotes (")
+# and taking the second component.
+version=$(awk -F\" '/builderTag *=/ {print $2}' \
+            $(dirname $0)/../acceptance/cluster/localcluster.go)
+if [ -z "${version}" ]; then
+  echo "unable to determine builder tag"
+  exit 1
+fi
+
 function init() {
   docker build --tag="${image}" "$(dirname $0)"
 }
@@ -23,6 +33,11 @@ if [ "${1-}" = "push" ]; then
   tag="$(date +%Y%m%d-%H%M%S)"
   docker tag "${image}" "${image}:${tag}"
   docker push "${image}"
+  exit 0
+fi
+
+if [ "${1-}" = "version" ]; then
+  echo "${version}"
   exit 0
 fi
 
@@ -75,4 +90,4 @@ docker run -i ${tty-} ${rm} \
   --env="TSD_GITHUB_TOKEN=${TSD_GITHUB_TOKEN-}" \
   --env="CIRCLE_NODE_INDEX=${CIRCLE_NODE_INDEX-0}" \
   --env="CIRCLE_NODE_TOTAL=${CIRCLE_NODE_TOTAL-1}" \
-  "${image}" "$@"
+  "${image}:${version}" "$@"

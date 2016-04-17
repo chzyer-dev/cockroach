@@ -19,6 +19,7 @@ package kv
 import (
 	"time"
 
+	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/client"
@@ -30,10 +31,10 @@ import (
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
+	"github.com/cockroachdb/cockroach/util/metric"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/cockroachdb/cockroach/util/tracing"
-	"github.com/gogo/protobuf/proto"
-	"github.com/opentracing/opentracing-go"
 )
 
 // A LocalTestCluster encapsulates an in-memory instantiation of a
@@ -74,20 +75,20 @@ func (ltc *LocalTestCluster) Start(t util.Tester) {
 	ltc.Clock = hlc.NewClock(ltc.Manual.UnixNano)
 	ltc.Stopper = stop.NewStopper()
 	rpcContext := rpc.NewContext(testutils.NewNodeTestBaseContext(), ltc.Clock, ltc.Stopper)
-	ltc.Gossip = gossip.New(rpcContext, gossip.TestBootstrap, ltc.Stopper)
+	ltc.Gossip = gossip.New(rpcContext, nil, ltc.Stopper)
 	ltc.Eng = engine.NewInMem(roachpb.Attributes{}, 50<<20, ltc.Stopper)
 
 	ltc.stores = storage.NewStores(ltc.Clock)
 	tracer := tracing.NewTracer()
 	var rpcSend rpcSendFn = func(_ SendOptions, _ ReplicaSlice,
-		args roachpb.BatchRequest, _ *rpc.Context) (proto.Message, error) {
+		args roachpb.BatchRequest, _ *rpc.Context) (*roachpb.BatchResponse, error) {
 		if ltc.Latency > 0 {
 			time.Sleep(ltc.Latency)
 		}
 		sp := tracer.StartSpan("node")
 		defer sp.Finish()
-		ctx, _ := opentracing.ContextWithSpan(context.Background(), sp)
-		sp.LogEvent(args.String())
+		ctx := opentracing.ContextWithSpan(context.Background(), sp)
+		log.Trace(ctx, args.String())
 		br, pErr := ltc.stores.Send(ctx, args)
 		if br == nil {
 			br = &roachpb.BatchResponse{}
@@ -97,7 +98,7 @@ func (ltc *LocalTestCluster) Start(t util.Tester) {
 		}
 		br.Error = pErr
 		if pErr != nil {
-			sp.LogEvent("error: " + pErr.String())
+			log.Trace(ctx, "error: "+pErr.String())
 		}
 		return br, nil
 	}
@@ -114,11 +115,11 @@ func (ltc *LocalTestCluster) Start(t util.Tester) {
 		RangeDescriptorDB:        ltc.stores, // for descriptor lookup
 	}, ltc.Gossip)
 
-	ltc.Sender = NewTxnCoordSender(ltc.distSender, ltc.Clock, false /* !linearizable */, tracer, ltc.Stopper)
+	ltc.Sender = NewTxnCoordSender(ltc.distSender, ltc.Clock, false /* !linearizable */, tracer,
+		ltc.Stopper, NewTxnMetrics(metric.NewRegistry()))
 	ltc.DB = client.NewDB(ltc.Sender)
-	transport := storage.NewLocalRPCTransport(ltc.Stopper)
-	ltc.Stopper.AddCloser(transport)
-	ctx := storage.TestStoreContext
+	transport := storage.NewDummyRaftTransport()
+	ctx := storage.TestStoreContext()
 	ctx.Clock = ltc.Clock
 	ctx.DB = ltc.DB
 	ctx.Gossip = ltc.Gossip

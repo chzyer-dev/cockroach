@@ -16,7 +16,7 @@
 // Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 #include <algorithm>
-#include <limits>
+#include <atomic>
 #include <stdarg.h>
 #include <google/protobuf/repeated_field.h>
 #include <google/protobuf/stubs/stringprintf.h>
@@ -31,12 +31,12 @@
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
-#include "cockroach/roachpb/api.pb.h"
 #include "cockroach/roachpb/data.pb.h"
 #include "cockroach/roachpb/internal.pb.h"
 #include "cockroach/storage/engine/mvcc.pb.h"
 #include "db.h"
 #include "encoding.h"
+#include "eventlistener.h"
 
 extern "C" {
 #include "_cgo_export.h"
@@ -55,20 +55,26 @@ struct DBEngine {
   virtual DBStatus WriteBatch() = 0;
   virtual DBStatus Get(DBKey key, DBString* value) = 0;
   virtual DBIterator* NewIter(DBSlice prefix) = 0;
+  virtual DBStatus GetStats(DBStatsResult* stats) = 0;
 };
 
 struct DBImpl : public DBEngine {
   std::unique_ptr<rocksdb::Env> memenv;
   std::unique_ptr<rocksdb::DB> rep_deleter;
   rocksdb::ReadOptions const read_opts;
+  std::shared_ptr<rocksdb::Cache> block_cache;
+  std::shared_ptr<DBEventListener> event_listener;
 
   // Construct a new DBImpl from the specified DB and Env. Both the DB
   // and Env will be deleted when the DBImpl is deleted. It is ok to
   // pass NULL for the Env.
-  DBImpl(rocksdb::DB* r, rocksdb::Env* m)
+  DBImpl(rocksdb::DB* r, rocksdb::Env* m, std::shared_ptr<rocksdb::Cache> bc,
+    std::shared_ptr<DBEventListener> event_listener)
       : DBEngine(r),
         memenv(m),
-        rep_deleter(r) {
+        rep_deleter(r),
+        block_cache(bc),
+        event_listener(event_listener) {
   }
   virtual ~DBImpl() {
     const rocksdb::Options &opts = rep->GetOptions();
@@ -84,6 +90,7 @@ struct DBImpl : public DBEngine {
   virtual DBStatus WriteBatch();
   virtual DBStatus Get(DBKey key, DBString* value);
   virtual DBIterator* NewIter(DBSlice prefix);
+  virtual DBStatus GetStats(DBStatsResult* stats);
 };
 
 struct DBBatch : public DBEngine {
@@ -101,6 +108,7 @@ struct DBBatch : public DBEngine {
   virtual DBStatus WriteBatch();
   virtual DBStatus Get(DBKey key, DBString* value);
   virtual DBIterator* NewIter(DBSlice prefix);
+  virtual DBStatus GetStats(DBStatsResult* stats);
 };
 
 struct DBSnapshot : public DBEngine {
@@ -122,6 +130,7 @@ struct DBSnapshot : public DBEngine {
   virtual DBStatus WriteBatch();
   virtual DBStatus Get(DBKey key, DBString* value);
   virtual DBIterator* NewIter(DBSlice prefix);
+  virtual DBStatus GetStats(DBStatsResult* stats);
 };
 
 struct DBIterator {
@@ -432,20 +441,6 @@ class DBPrefixExtractor : public rocksdb::SliceTransform {
   }
 };
 
-bool WillOverflow(int64_t a, int64_t b) {
-  // Morally MinInt64 < a+b < MaxInt64, but without overflows.
-  // First make sure that a <= b. If not, swap them.
-  if (a > b) {
-    std::swap(a, b);
-  }
-  // Now b is the larger of the numbers, and we compare sizes
-  // in a way that can never over- or underflow.
-  if (b > 0) {
-    return a > (std::numeric_limits<int64_t>::max() - b);
-  }
-  return (std::numeric_limits<int64_t>::min() - b) > a;
-}
-
 // Method used to sort InternalTimeSeriesSamples.
 bool TimeSeriesSampleOrdering(const cockroach::roachpb::InternalTimeSeriesSample* a,
         const cockroach::roachpb::InternalTimeSeriesSample* b) {
@@ -460,32 +455,37 @@ bool IsTimeSeriesData(const std::string &val) {
 
 double GetMax(const cockroach::roachpb::InternalTimeSeriesSample *sample) {
   if (sample->has_max()) return sample->max();
-  if (sample->has_sum()) return sample->sum();
-  return std::numeric_limits<double>::min();
+  return sample->sum();
 }
 
 double GetMin(const cockroach::roachpb::InternalTimeSeriesSample *sample) {
   if (sample->has_min()) return sample->min();
-  if (sample->has_sum()) return sample->sum();
-  return std::numeric_limits<double>::max();
+  return sample->sum();
 }
 
 // AccumulateTimeSeriesSamples accumulates the individual values of two
 // InternalTimeSeriesSamples which have a matching timestamp. The dest parameter
-// is modified to contain the accumulated values.
+// is modified to contain the accumulated values. Message src MUST have a
+// non-zero count of samples; it is assumed that no system will attempt to merge
+// a sample with zero datapoints.
 void AccumulateTimeSeriesSamples(cockroach::roachpb::InternalTimeSeriesSample* dest,
                                  const cockroach::roachpb::InternalTimeSeriesSample &src) {
-  // Accumulate integer values
-  int total_count = dest->count() + src.count();
-  if (total_count > 1) {
-    // Keep explicit max and min values.
-    dest->set_max(std::max(GetMax(dest), GetMax(&src)));
-    dest->set_min(std::min(GetMin(dest), GetMin(&src)));
+  assert(src.has_sum());
+  assert(src.count() > 0);
+
+  // If dest is empty, just copy from the src.
+  if (dest->count() == 0) {
+    dest->CopyFrom(src);
+    return;
   }
-  if (total_count > 0) {
-    dest->set_sum(dest->sum() + src.sum());
-  }
-  dest->set_count(total_count);
+  assert(dest->has_sum());
+
+  // Keep explicit max and min values.
+  dest->set_max(std::max(GetMax(dest), GetMax(&src)));
+  dest->set_min(std::min(GetMin(dest), GetMin(&src)));
+  // Accumulate sum and count.
+  dest->set_sum(dest->sum() + src.sum());
+  dest->set_count(dest->count() + src.count());
 }
 
 void SerializeTimeSeriesToValue(
@@ -544,9 +544,9 @@ bool MergeTimeSeriesValues(
   new_ts.set_sample_duration_nanos(left_ts.sample_duration_nanos());
 
   // Sort values in right_ts. Assume values in left_ts have been sorted.
-  std::sort(right_ts.mutable_samples()->pointer_begin(),
-            right_ts.mutable_samples()->pointer_end(),
-            TimeSeriesSampleOrdering);
+  std::stable_sort(right_ts.mutable_samples()->pointer_begin(),
+                   right_ts.mutable_samples()->pointer_end(),
+                   TimeSeriesSampleOrdering);
 
   // Merge sample values of left and right into new_ts.
   auto left_front = left_ts.samples().begin();
@@ -568,20 +568,24 @@ bool MergeTimeSeriesValues(
       next_offset = right_front->offset();
     }
 
-    // Create an empty sample in the output collection with the selected
-    // offset.  Accumulate data from all samples at the front of either left
-    // or right which match the selected timestamp. This behavior is needed
-    // because each side may individually have duplicated offsets.
+    // Create an empty sample in the output collection.
     cockroach::roachpb::InternalTimeSeriesSample* ns = new_ts.add_samples();
-    ns->set_offset(next_offset);
-    while (left_front != left_end && left_front->offset() == ns->offset()) {
-      AccumulateTimeSeriesSamples(ns, *left_front);
+
+    // Only the most recently merged value with a given sample offset is kept;
+    // samples merged earlier at the same offset are discarded. We will now
+    // parse through the left and right sample sets, finding the most recently
+    // merged sample at the current offset.
+    cockroach::roachpb::InternalTimeSeriesSample src;
+    while (left_front != left_end && left_front->offset() == next_offset) {
+      src = *left_front;
       left_front++;
     }
-    while (right_front != right_end && right_front->offset() == ns->offset()) {
-      AccumulateTimeSeriesSamples(ns, *right_front);
+    while (right_front != right_end && right_front->offset() == next_offset) {
+      src = *right_front;
       right_front++;
     }
+
+    ns->CopyFrom(src);
   }
 
   // Serialize the new TimeSeriesData into the left value's byte field.
@@ -610,9 +614,9 @@ bool ConsolidateTimeSeriesValue(std::string *val, rocksdb::Logger* logger) {
   new_ts.set_sample_duration_nanos(val_ts.sample_duration_nanos());
 
   // Sort values in the ts value.
-  std::sort(val_ts.mutable_samples()->pointer_begin(),
-            val_ts.mutable_samples()->pointer_end(),
-            TimeSeriesSampleOrdering);
+  std::stable_sort(val_ts.mutable_samples()->pointer_begin(),
+                   val_ts.mutable_samples()->pointer_end(),
+                   TimeSeriesSampleOrdering);
 
   // Merge sample values of left and right into new_ts.
   auto front = val_ts.samples().begin();
@@ -627,7 +631,7 @@ bool ConsolidateTimeSeriesValue(std::string *val, rocksdb::Logger* logger) {
     cockroach::roachpb::InternalTimeSeriesSample* ns = new_ts.add_samples();
     ns->set_offset(front->offset());
     while (front != end && front->offset() == ns->offset()) {
-      AccumulateTimeSeriesSamples(ns, *front);
+      ns->CopyFrom(*front);
       ++front;
     }
   }
@@ -645,24 +649,13 @@ bool MergeValues(cockroach::storage::engine::MVCCMetadata *left,
       rocksdb::Warn(logger, "inconsistent value types for merge (left = bytes, right = ?)");
       return false;
     }
-    // Check for replay; if left merge_timestamp is equal to right,
-    // then ignore the merge request. Replays can happen on merges as
-    // there is no higher-level replay protection and Raft may
-    // duplicate commands. The replay protection here is imperfect.
-    // Raft may duplicate and replay commands out of order, in which
-    // case the same command may be re-merged.
-    //
-    // NOTE: there are test cases in storage/engine/merge_test and in
-    //   ts/db_test which will send MVCCMetadata with empty
-    //   merge_timestamps and should always be merged; thus the check
-    //   for non-empty merge_timestamps.
-    if (left->has_merge_timestamp() && right.has_merge_timestamp()) {
-      if (left->merge_timestamp().wall_time() == right.merge_timestamp().wall_time() &&
-          left->merge_timestamp().logical() == right.merge_timestamp().logical()) {
-        return true;
-      }
-      left->mutable_merge_timestamp()->CopyFrom(right.merge_timestamp());
-    }
+
+    // Replay Advisory: Because merge commands pass through raft, it is possible
+    // for merging values to be "replayed". Currently, the only actual use of
+    // the merge system is for time series data, which is safe against replay;
+    // however, this property is not general for all potential mergeable types.
+    // If a future need arises to merge another type of data, replay protection
+    // will likely need to be a consideration.
 
     if (IsTimeSeriesData(left->raw_bytes()) || IsTimeSeriesData(right.raw_bytes())) {
       // The right operand must also be a time series.
@@ -990,12 +983,16 @@ DBStatus ProcessDeltaKey(Getter* base, rocksdb::WBWIIterator* delta,
 // records.
 class BaseDeltaIterator : public rocksdb::Iterator {
  public:
-  BaseDeltaIterator(rocksdb::Iterator* base_iterator, rocksdb::WBWIIterator* delta_iterator)
+  BaseDeltaIterator(rocksdb::Iterator* base_iterator,
+                    rocksdb::WBWIIterator* delta_iterator,
+                    const rocksdb::Slice* upper_bound)
       : current_at_base_(true),
         equal_keys_(false),
+        done_(false),
         status_(rocksdb::Status::OK()),
         base_iterator_(base_iterator),
-        delta_iterator_(delta_iterator) {
+        delta_iterator_(delta_iterator),
+        upper_bound_(upper_bound) {
     merged_.data = NULL;
   }
 
@@ -1004,22 +1001,25 @@ class BaseDeltaIterator : public rocksdb::Iterator {
   }
 
   bool Valid() const override {
-    return current_at_base_ ? BaseValid() : DeltaValid();
+    return !done_ && (current_at_base_ ? BaseValid() : DeltaValid());
   }
 
   void SeekToFirst() override {
+    done_ = false;
     base_iterator_->SeekToFirst();
     delta_iterator_->SeekToFirst();
     UpdateCurrent();
   }
 
   void SeekToLast() override {
+    done_ = false;
     base_iterator_->SeekToLast();
     delta_iterator_->SeekToLast();
     UpdateCurrent();
   }
 
   void Seek(const rocksdb::Slice& k) override {
+    done_ = false;
     base_iterator_->Seek(k);
     delta_iterator_->Seek(k);
     UpdateCurrent();
@@ -1037,8 +1037,7 @@ class BaseDeltaIterator : public rocksdb::Iterator {
   }
 
   rocksdb::Slice key() const override {
-    return current_at_base_ ? base_iterator_->key()
-                            : delta_iterator_->Entry().key;
+    return current_at_base_ ? base_iterator_->key() : delta_key_;
   }
 
   rocksdb::Slice value() const override {
@@ -1116,9 +1115,12 @@ class BaseDeltaIterator : public rocksdb::Iterator {
   }
   bool ProcessDelta() {
     IteratorGetter base(equal_keys_ ? base_iterator_.get() : NULL);
+    // The contents of WBWIIterator.Entry() are only valid until the
+    // next mutation to the write batch. So keep a copy of the key
+    // we're pointing at.
+    delta_key_ = delta_iterator_->Entry().key.ToString();
     DBStatus status = ProcessDeltaKey(&base, delta_iterator_.get(),
-                                      delta_iterator_->Entry().key.ToString(),
-                                      &merged_);
+                                      delta_key_, &merged_);
     if (status.data != NULL) {
       status_ = rocksdb::Status::Corruption("unable to merge records");
       free(status.data);
@@ -1136,11 +1138,31 @@ class BaseDeltaIterator : public rocksdb::Iterator {
 
     return merged_.data == NULL;
   }
+
   void AdvanceBase() {
     base_iterator_->Next();
   }
-  bool BaseValid() const { return base_iterator_->Valid(); }
-  bool DeltaValid() const { return delta_iterator_->Valid(); }
+
+  // CheckUpperBound checks the specified key against the iteration
+  // upper-bound (if present), returning true if the key exceeds the
+  // upper-bound and false otherwise.
+  bool CheckUpperBound(const rocksdb::Slice key) {
+    if (upper_bound_ != NULL &&
+        kComparator.Compare(key, *upper_bound_) >= 0) {
+      done_ = true;
+      return true;
+    }
+    return false;
+  }
+
+  bool BaseValid() const {
+    return base_iterator_->Valid();
+  }
+
+  bool DeltaValid() const {
+    return delta_iterator_->Valid();
+  }
+
   void UpdateCurrent() {
     ClearMerged();
 
@@ -1149,7 +1171,10 @@ class BaseDeltaIterator : public rocksdb::Iterator {
       if (!BaseValid()) {
         // Base has finished.
         if (!DeltaValid()) {
-          // Finished
+          // Both base and delta have finished.
+          return;
+        }
+        if (CheckUpperBound(delta_iterator_->Entry().key)) {
           return;
         }
         if (!ProcessDelta()) {
@@ -1167,11 +1192,20 @@ class BaseDeltaIterator : public rocksdb::Iterator {
       }
 
       int compare = Compare();
-      if (compare > 0) {   // delta less than base
+      if (compare > 0) {
+        // Delta is greater than base.
+        if (CheckUpperBound(base_iterator_->key())) {
+          return;
+        }
         current_at_base_ = true;
         return;
       }
+      // Delta is less than or equal to base.
+      if (CheckUpperBound(delta_iterator_->Entry().key)) {
+        return;
+      }
       if (compare == 0) {
+        // Delta is equal to base.
         equal_keys_ = true;
       }
       if (!ProcessDelta()) {
@@ -1179,7 +1213,8 @@ class BaseDeltaIterator : public rocksdb::Iterator {
         return;
       }
 
-      // Delta is less advanced and is delete.
+      // Delta is less than or equal to base and is a deletion
+      // tombstone.
       AdvanceDelta();
       if (equal_keys_) {
         AdvanceBase();
@@ -1199,10 +1234,13 @@ class BaseDeltaIterator : public rocksdb::Iterator {
 
   bool current_at_base_;
   bool equal_keys_;
+  bool done_;
   mutable rocksdb::Status status_;
   mutable DBString merged_;
   std::unique_ptr<rocksdb::Iterator> base_iterator_;
   std::unique_ptr<rocksdb::WBWIIterator> delta_iterator_;
+  std::string delta_key_;
+  const rocksdb::Slice* upper_bound_;
 };
 
 }  // namespace
@@ -1252,10 +1290,22 @@ DBStatus DBOpen(DBEngine **db, DBSlice dir, DBOptions db_opts) {
   options.prefix_extractor.reset(new DBPrefixExtractor);
   options.statistics = rocksdb::CreateDBStatistics();
   options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
+
+  // File size settings: TODO(marc): investigate and determine better long-term settings:
+  // https://github.com/cockroachdb/cockroach/issues/5852
+  options.target_file_size_base = 64 << 20;
+  options.target_file_size_multiplier = 8;
+  options.max_bytes_for_level_base = 512 << 20;
+  options.max_bytes_for_level_multiplier = 8;
+
   if (row_cache_size > 0) {
     options.row_cache = rocksdb::NewLRUCache(
         row_cache_size, num_cache_shard_bits);
   }
+
+  // Register listener for tracking RocksDB stats.
+  std::shared_ptr<DBEventListener> event_listener(new DBEventListener);
+  options.listeners.emplace_back(event_listener);
 
   std::unique_ptr<rocksdb::Env> memenv;
   if (dir.len == 0) {
@@ -1268,7 +1318,7 @@ DBStatus DBOpen(DBEngine **db, DBSlice dir, DBOptions db_opts) {
   if (!status.ok()) {
     return ToDBStatus(status);
   }
-  *db = new DBImpl(db_ptr, memenv.release());
+  *db = new DBImpl(db_ptr, memenv.release(), table_options.block_cache, event_listener);
   return kSuccess;
 }
 
@@ -1287,24 +1337,8 @@ DBStatus DBFlush(DBEngine* db) {
   return ToDBStatus(db->rep->Flush(options));
 }
 
-DBStatus DBCompactRange(DBEngine* db, DBKey* start, DBKey* end) {
-  std::string sbuf;
-  std::string ebuf;
-  rocksdb::Slice s;
-  rocksdb::Slice e;
-  rocksdb::Slice* sPtr = NULL;
-  rocksdb::Slice* ePtr = NULL;
-  if (start != NULL) {
-    sPtr = &s;
-    sbuf = EncodeKey(*start);
-    s = sbuf;
-  }
-  if (end != NULL) {
-    ePtr = &e;
-    ebuf = EncodeKey(*end);
-    e = ebuf;
-  }
-  return ToDBStatus(db->rep->CompactRange(rocksdb::CompactRangeOptions(), sPtr, ePtr));
+DBStatus DBCompact(DBEngine* db) {
+  return ToDBStatus(db->rep->CompactRange(rocksdb::CompactRangeOptions(), NULL, NULL));
 }
 
 uint64_t DBApproximateSize(DBEngine* db, DBKey start, DBKey end) {
@@ -1440,12 +1474,8 @@ DBIterator* DBBatch::NewIter(DBSlice prefix) {
   opts.iterate_upper_bound = iter->upper_bound();
   opts.total_order_seek = iter->upper_bound() == NULL;
   rocksdb::Iterator* base = rep->NewIterator(opts);
-  if (updates == 0) {
-    iter->rep.reset(base);
-  } else {
-    rocksdb::WBWIIterator* delta = batch.NewIterator();
-    iter->rep.reset(new BaseDeltaIterator(base, delta));
-  }
+  rocksdb::WBWIIterator* delta = batch.NewIterator();
+  iter->rep.reset(new BaseDeltaIterator(base, delta, opts.iterate_upper_bound));
   return iter;
 }
 
@@ -1456,6 +1486,43 @@ DBIterator* DBSnapshot::NewIter(DBSlice prefix) {
   opts.total_order_seek = iter->upper_bound() == NULL;
   iter->rep.reset(rep->NewIterator(opts));
   return iter;
+}
+
+// GetStats retrieves a subset of RocksDB stats that are relevant to
+// CockroachDB.
+DBStatus DBImpl::GetStats(DBStatsResult* stats) {
+  const rocksdb::Options &opts = rep->GetOptions();
+  const std::shared_ptr<rocksdb::Statistics> &s = opts.statistics;
+
+  std::string memtable_total_size;
+  rep->GetProperty("rocksdb.cur-size-all-mem-tables", &memtable_total_size);
+
+  std::string table_readers_mem_estimate;
+  rep->GetProperty("rocksdb.estimate-table-readers-mem", &table_readers_mem_estimate);
+
+  stats->block_cache_hits = (int64_t)s->getTickerCount(rocksdb::BLOCK_CACHE_HIT);
+  stats->block_cache_misses = (int64_t)s->getTickerCount(rocksdb::BLOCK_CACHE_MISS);
+  stats->block_cache_usage = (int64_t)block_cache->GetUsage();
+  stats->block_cache_pinned_usage = (int64_t)block_cache->GetPinnedUsage();
+  stats->bloom_filter_prefix_checked =
+    (int64_t)s->getTickerCount(rocksdb::BLOOM_FILTER_PREFIX_CHECKED);
+  stats->bloom_filter_prefix_useful =
+    (int64_t)s->getTickerCount(rocksdb::BLOOM_FILTER_PREFIX_USEFUL);
+  stats->memtable_hits = (int64_t)s->getTickerCount(rocksdb::MEMTABLE_HIT);
+  stats->memtable_misses = (int64_t)s->getTickerCount(rocksdb::MEMTABLE_MISS);
+  stats->memtable_total_size = std::stoll(memtable_total_size);
+  stats->flushes = (int64_t)event_listener->GetFlushes();
+  stats->compactions = (int64_t)event_listener->GetCompactions();
+  stats->table_readers_mem_estimate = std::stoll(table_readers_mem_estimate);
+  return kSuccess;
+}
+
+DBStatus DBBatch::GetStats(DBStatsResult* stats) {
+  return FmtStatus("unsupported");
+}
+
+DBStatus DBSnapshot::GetStats(DBStatsResult* stats) {
+  return FmtStatus("unsupported");
 }
 
 DBIterator::DBIterator(DBSlice prefix)
@@ -1642,4 +1709,10 @@ MVCCStatsResult MVCCComputeStats(
 
   stats.last_update_nanos = now_nanos;
   return stats;
+}
+
+// DBGetStats queries the given DBEngine for various operational stats and
+// write them to the provided DBStatsResult instance.
+DBStatus DBGetStats(DBEngine* db, DBStatsResult* stats) {
+  return db->GetStats(stats);
 }

@@ -59,7 +59,7 @@ CREATE TABLE system.rangelog (
   eventType     STRING     NOT NULL,
   otherRangeID  INT,
   info          STRING,
-  uniqueID      INT        DEFAULT experimental_unique_int(),
+  uniqueID      INT        DEFAULT unique_rowid(),
   PRIMARY KEY (timestamp, uniqueID)
 );`
 
@@ -94,6 +94,18 @@ VALUES(
 	}
 	if event.info != nil {
 		args[5] = *event.info
+	}
+
+	// Update range event metrics. We do this close to the insertion of the
+	// corresponding range log entry to reduce potential skew between metrics and
+	// range log.
+	switch event.eventType {
+	case RangeEventLogSplit:
+		s.metrics.rangeSplits.Inc(1)
+	case RangeEventLogAdd:
+		s.metrics.rangeAdds.Inc(1)
+	case RangeEventLogRemove:
+		s.metrics.rangeRemoves.Inc(1)
 	}
 
 	rows, err := s.ctx.SQLExecutor.ExecuteStatementInTransaction(txn, insertEventTableStmt, args...)

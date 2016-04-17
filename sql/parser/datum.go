@@ -28,6 +28,7 @@ import (
 	"gopkg.in/inf.v0"
 
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/util/duration"
 )
 
 var (
@@ -86,6 +87,7 @@ type Datum interface {
 	TypeEqual(other Datum) bool
 	// Compare returns -1 if the receiver is less than other, 0 if receiver is
 	// equal to other and +1 if receiver is greater than other.
+	// TODO(nvanbenschoten) Should we look into merging this with cmpOps?
 	Compare(other Datum) int
 	// HasPrev specifies if Prev() can be used to compute a previous value for
 	// a datum. For example, DBytes doesn't support it (the previous for BB is BAZZZ..).
@@ -211,7 +213,11 @@ func (d DInt) Compare(other Datum) int {
 	}
 	v, ok := other.(DInt)
 	if !ok {
-		panic(fmt.Sprintf("unsupported comparison: %s to %s", d.Type(), other.Type()))
+		cmp, ok := mixedTypeCompare(d, other)
+		if !ok {
+			panic(fmt.Sprintf("unsupported comparison: %s to %s", d.Type(), other.Type()))
+		}
+		return cmp
 	}
 	if d < v {
 		return -1
@@ -278,7 +284,11 @@ func (d DFloat) Compare(other Datum) int {
 	}
 	v, ok := other.(DFloat)
 	if !ok {
-		panic(fmt.Sprintf("unsupported comparison: %s to %s", d.Type(), other.Type()))
+		cmp, ok := mixedTypeCompare(d, other)
+		if !ok {
+			panic(fmt.Sprintf("unsupported comparison: %s to %s", d.Type(), other.Type()))
+		}
+		return cmp
 	}
 	if d < v {
 		return -1
@@ -363,7 +373,11 @@ func (d *DDecimal) Compare(other Datum) int {
 	}
 	v, ok := other.(*DDecimal)
 	if !ok {
-		panic(fmt.Sprintf("unsupported comparison: %s to %s", d.Type(), other.Type()))
+		cmp, ok := mixedTypeCompare(d, other)
+		if !ok {
+			panic(fmt.Sprintf("unsupported comparison: %s to %s", d.Type(), other.Type()))
+		}
+		return cmp
 	}
 	return d.Cmp(&v.Dec)
 }
@@ -673,12 +687,12 @@ func (d DTimestamp) IsMin() bool {
 }
 
 func (d DTimestamp) String() string {
-	return d.UTC().Format(TimestampWithOffsetZoneFormat)
+	return d.UTC().Format(timestampWithOffsetZoneFormat)
 }
 
 // DInterval is the interval Datum.
 type DInterval struct {
-	time.Duration
+	duration.Duration
 }
 
 // Type implements the Datum interface.
@@ -702,43 +716,45 @@ func (d DInterval) Compare(other Datum) int {
 	if !ok {
 		panic(fmt.Sprintf("unsupported comparison: %s to %s", d.Type(), other.Type()))
 	}
-	if d.Duration < v.Duration {
-		return -1
-	}
-	if v.Duration < d.Duration {
-		return 1
-	}
-	return 0
+	return d.Duration.Compare(v.Duration)
 }
 
 // HasPrev implements the Datum interface.
 func (d DInterval) HasPrev() bool {
-	return true
+	return false
 }
 
 // Prev implements the Datum interface.
 func (d DInterval) Prev() Datum {
-	return DInterval{Duration: d.Duration - 1}
+	panic(d.Type() + ".Prev() not supported")
 }
 
 // HasNext implements the Datum interface.
 func (d DInterval) HasNext() bool {
-	return true
+	return false
 }
 
 // Next implements the Datum interface.
 func (d DInterval) Next() Datum {
-	return DInterval{Duration: d.Duration + 1}
+	panic(d.Type() + ".Next() not supported")
 }
 
 // IsMax implements the Datum interface.
 func (d DInterval) IsMax() bool {
-	return d.Duration == math.MaxInt64
+	return d.Months == math.MaxInt64 && d.Days == math.MaxInt64 && d.Nanos == math.MaxInt64
 }
 
 // IsMin implements the Datum interface.
 func (d DInterval) IsMin() bool {
-	return d.Duration == math.MinInt64
+	return d.Months == math.MinInt64 && d.Days == math.MinInt64 && d.Nanos == math.MinInt64
+}
+
+// String implements the Datum interface.
+func (d DInterval) String() string {
+	if d.Months != 0 || d.Days != 0 {
+		return d.String()
+	}
+	return (time.Duration(d.Duration.Nanos) * time.Nanosecond).String()
 }
 
 // DTuple is the tuple Datum.
@@ -1015,4 +1031,39 @@ func (DValArg) IsMin() bool {
 
 func (d DValArg) String() string {
 	return "$" + d.name
+}
+
+// Temporary workaround for #3633, allowing comparisons between
+// heterogeneous types.
+// TODO(andreimatei) Remove when type inference improves.
+func mixedTypeCompare(l, r Datum) (int, bool) {
+	lType := reflect.TypeOf(l)
+	rType := reflect.TypeOf(r)
+
+	// Check equality.
+	eqOp, ok := CmpOps[CmpArgs{EQ, lType, rType}]
+	if !ok {
+		return 0, false
+	}
+	eq, err := eqOp.fn(EvalContext{}, l, r)
+	if err != nil {
+		panic(err)
+	}
+	if eq {
+		return 0, true
+	}
+
+	// Check less than.
+	ltOp, ok := CmpOps[CmpArgs{LT, lType, rType}]
+	if !ok {
+		return 0, false
+	}
+	lt, err := ltOp.fn(EvalContext{}, l, r)
+	if err != nil {
+		panic(err)
+	}
+	if lt {
+		return -1, true
+	}
+	return 1, true
 }

@@ -63,6 +63,11 @@ module Components {
       return m("div", [b.value.toFixed(1), " ", m("span.units", b.units), " (", count , ")"]);
     }
 
+    export function FormatBytes(bytes: number): MithrilElement {
+      let b: UnitValue = Utils.Format.BytesToUnitValue(bytes);
+      return m("div", [b.value.toFixed(1), " ", m("span.units", b.units)]);
+    }
+
     /**
      * TableData is the argument for creating a table component.
      */
@@ -85,7 +90,7 @@ module Components {
     interface SectionWidth {
       name: string;
       width: number;
-    };
+    }
 
     class Controller<T> {
       data: TableData<T>;
@@ -233,7 +238,7 @@ module Components {
           let renderedCols = cols.map((col: TableColumn<T>) =>
             m("td",
               {
-                className: this.IsSortColumn(col) ? "sorted" : ""
+                className: this.IsSortColumn(col) ? "sorted" : "",
               },
               col.view(row)));
           return m("tr", renderedCols);

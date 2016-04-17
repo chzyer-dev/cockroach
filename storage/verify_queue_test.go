@@ -20,6 +20,9 @@ import (
 	"math"
 	"testing"
 
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/storage/engine"
@@ -30,14 +33,14 @@ import (
 // indicates that a range should be queued for verification if the
 // time since last verification exceeds the threshold limit.
 func TestVerifyQueueShouldQueue(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
 
 	// Put empty verification timestamp
 	key := keys.RangeLastVerificationTimestampKey(tc.rng.RangeID)
-	if err := engine.MVCCPutProto(tc.rng.store.Engine(), nil, key, roachpb.ZeroTimestamp, nil, &roachpb.Timestamp{}); err != nil {
+	if err := engine.MVCCPutProto(context.Background(), tc.rng.store.Engine(), nil, key, roachpb.ZeroTimestamp, nil, &roachpb.Timestamp{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -53,9 +56,10 @@ func TestVerifyQueueShouldQueue(t *testing.T) {
 	}
 
 	verifyQ := newVerifyQueue(tc.gossip, nil)
+	emptyConfig := config.SystemConfig{}
 
 	for i, test := range testCases {
-		shouldQ, priority := verifyQ.shouldQueue(test.now, tc.rng, nil /* system config not used */)
+		shouldQ, priority := verifyQ.shouldQueue(test.now, tc.rng, emptyConfig)
 		if shouldQ != test.shouldQ {
 			t.Errorf("%d: should queue expected %t; got %t", i, test.shouldQ, shouldQ)
 		}

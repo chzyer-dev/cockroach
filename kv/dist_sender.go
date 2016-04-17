@@ -23,8 +23,10 @@ import (
 	"time"
 	"unsafe"
 
+	opentracing "github.com/opentracing/opentracing-go"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/keys"
@@ -34,16 +36,12 @@ import (
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
 	"github.com/cockroachdb/cockroach/util/tracing"
-	"github.com/gogo/protobuf/proto"
-	"github.com/opentracing/opentracing-go"
 )
 
 // Default constants for timeouts.
 const (
 	defaultSendNextTimeout = 10 * time.Second // for now; see #2500
 	defaultClientTimeout   = 10 * time.Second
-	retryBackoff           = 250 * time.Millisecond
-	maxRetryBackoff        = 30 * time.Second
 
 	// The default maximum number of ranges to return from a range
 	// lookup.
@@ -55,8 +53,12 @@ const (
 )
 
 var defaultRPCRetryOptions = retry.Options{
-	InitialBackoff: retryBackoff,
-	MaxBackoff:     maxRetryBackoff,
+	// This is an aggressive initial backoff to support situations where retries
+	// which are expected to succeed in a low number of iterations should occur in
+	// quick succession. An example of this is when the rangeDescriptorCache returns
+	// a lookupMismatchError.
+	InitialBackoff: 100 * time.Microsecond,
+	MaxBackoff:     30 * time.Second,
 	Multiplier:     2,
 }
 
@@ -98,6 +100,7 @@ func (n noNodeAddrsAvailError) CanRetry() bool { return true }
 // ranges. RPCs are sent to one or more of the replicas to satisfy
 // the method invocation.
 type DistSender struct {
+	opentracing.Tracer
 	// nodeDescriptor, if set, holds the descriptor of the node the
 	// DistSender lives on. It should be accessed via getNodeDescriptor(),
 	// which tries to obtain the value from the Gossip network if the
@@ -127,7 +130,7 @@ var _ client.Sender = &DistSender{}
 
 // rpcSendFn is the function type used to dispatch RPC calls.
 type rpcSendFn func(SendOptions, ReplicaSlice,
-	roachpb.BatchRequest, *rpc.Context) (proto.Message, error)
+	roachpb.BatchRequest, *rpc.Context) (*roachpb.BatchResponse, error)
 
 // DistSenderContext holds auxiliary objects that can be passed to
 // NewDistSender.
@@ -148,6 +151,7 @@ type DistSenderContext struct {
 	RPCSend           rpcSendFn
 	RPCContext        *rpc.Context
 	RangeDescriptorDB RangeDescriptorDB
+	Tracer            opentracing.Tracer
 }
 
 // NewDistSender returns a batch.Sender instance which connects to the
@@ -197,12 +201,17 @@ func NewDistSender(ctx *DistSenderContext, gossip *gossip.Gossip) *DistSender {
 	if ctx.RPCRetryOptions != nil {
 		ds.rpcRetryOptions = *ctx.RPCRetryOptions
 	}
+	if ctx.Tracer != nil {
+		ds.Tracer = ctx.Tracer
+	} else {
+		ds.Tracer = tracing.NewTracer()
+	}
 
 	return ds
 }
 
-// RangeLookup dispatches an RangeLookup request for the given
-// metadata key to the replicas of the given range. Note that we allow
+// RangeLookup dispatches a RangeLookup request for the given metadata
+// key to the replicas of the given range. Note that we allow
 // inconsistent reads when doing range lookups for efficiency. Getting
 // stale data is not a correctness problem but instead may
 // infrequently result in additional latency as additional range
@@ -210,7 +219,9 @@ func NewDistSender(ctx *DistSenderContext, gossip *gossip.Gossip) *DistSender {
 // DistSender's Send() method, so there is no error inspection and
 // retry logic here; this is not an issue since the lookup performs a
 // single inconsistent read only.
-func (ds *DistSender) RangeLookup(key roachpb.RKey, desc *roachpb.RangeDescriptor, considerIntents, useReverseScan bool) ([]roachpb.RangeDescriptor, *roachpb.Error) {
+func (ds *DistSender) RangeLookup(
+	key roachpb.RKey, desc *roachpb.RangeDescriptor, considerIntents, useReverseScan bool,
+) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, *roachpb.Error) {
 	ba := roachpb.BatchRequest{}
 	ba.ReadConsistency = roachpb.INCONSISTENT
 	ba.Add(&roachpb.RangeLookupRequest{
@@ -224,17 +235,17 @@ func (ds *DistSender) RangeLookup(key roachpb.RKey, desc *roachpb.RangeDescripto
 		Reverse:         useReverseScan,
 	})
 	replicas := newReplicaSlice(ds.gossip, desc)
-	// TODO(tschottdorf) consider a Trace here, potentially that of the request
-	// that had the cache miss and waits for the result.
-	sp := tracing.NoopSpan()
-	br, err := ds.sendRPC(sp, desc.RangeID, replicas, orderRandom, ba)
+	// TODO(tschottdorf): Ideally we would use the trace of the request which
+	// caused this lookup.
+	br, err := ds.sendRPC(context.Background(), desc.RangeID, replicas, orderRandom, ba)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if br.Error != nil {
-		return nil, br.Error
+		return nil, nil, br.Error
 	}
-	return br.Responses[0].GetInner().(*roachpb.RangeLookupResponse).Ranges, nil
+	resp := br.Responses[0].GetInner().(*roachpb.RangeLookupResponse)
+	return resp.Ranges, resp.PrefetchedRanges, nil
 }
 
 // FirstRange returns the RangeDescriptor for the first range on the cluster,
@@ -252,7 +263,7 @@ func (ds *DistSender) FirstRange() (*roachpb.RangeDescriptor, *roachpb.Error) {
 
 func (ds *DistSender) optimizeReplicaOrder(replicas ReplicaSlice) orderingPolicy {
 	// Unless we know better, send the RPCs randomly.
-	order := orderingPolicy(orderRandom)
+	order := orderRandom
 	nodeDesc := ds.getNodeDescriptor()
 	// If we don't know which node we're on, don't optimize anything.
 	if nodeDesc == nil {
@@ -310,7 +321,7 @@ func (ds *DistSender) getNodeDescriptor() *roachpb.NodeDescriptor {
 // must succeed. Returns an RPC error if the request could not be sent. Note
 // that the reply may contain a higher level error and must be checked in
 // addition to the RPC error.
-func (ds *DistSender) sendRPC(trace opentracing.Span, rangeID roachpb.RangeID, replicas ReplicaSlice,
+func (ds *DistSender) sendRPC(ctx context.Context, rangeID roachpb.RangeID, replicas ReplicaSlice,
 	order orderingPolicy, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 	if len(replicas) == 0 {
 		return nil, roachpb.NewError(noNodeAddrsAvailError{})
@@ -325,8 +336,8 @@ func (ds *DistSender) sendRPC(trace opentracing.Span, rangeID roachpb.RangeID, r
 	rpcOpts := SendOptions{
 		Ordering:        order,
 		SendNextTimeout: defaultSendNextTimeout,
-		Timeout:         rpc.DefaultRPCTimeout,
-		Trace:           trace,
+		Timeout:         base.NetworkTimeout,
+		Context:         ctx,
 	}
 	tracing.AnnotateTrace()
 	defer tracing.AnnotateTrace()
@@ -335,54 +346,96 @@ func (ds *DistSender) sendRPC(trace opentracing.Span, rangeID roachpb.RangeID, r
 	if err != nil {
 		return nil, roachpb.NewError(err)
 	}
-	return reply.(*roachpb.BatchResponse), nil
+	return reply, nil
+}
+
+// CountRanges returns the number of ranges that encompass the given key span.
+func (ds *DistSender) CountRanges(rs roachpb.RSpan) (int64, *roachpb.Error) {
+	var count int64
+	for {
+		desc, needAnother, _, pErr := ds.getDescriptors(rs, evictionToken{}, false /*useReverseScan*/)
+		if pErr != nil {
+			return -1, pErr
+		}
+		count++
+		if !needAnother {
+			break
+		}
+		rs.Key = desc.EndKey
+	}
+	return count, nil
 }
 
 // getDescriptors looks up the range descriptor to use for a query over the
-// key range span rs, with the given LookupOptions. The range descriptor
-// which contains the range in which the request should start its query is
-// returned first; the returned bool is true in case the given range reaches
-// outside the first descriptor.
-// In case either of the descriptors is discovered stale, the returned closure
-// should be called; it evicts the cache appropriately.
-// Note that `from` and `to` are not necessarily Key and EndKey from a
-// RequestHeader; it's assumed that they've been translated to key addresses
-// already (via KeyAddress).
-func (ds *DistSender) getDescriptors(rs roachpb.RSpan, considerIntents, useReverseScan bool) (*roachpb.RangeDescriptor, bool, func(), *roachpb.Error) {
-	var desc *roachpb.RangeDescriptor
-	var pErr *roachpb.Error
+// key range span rs with the given options. The lookup takes into consideration
+// the last range descriptor that the caller had used for this key range span,
+// if any, and if the last range descriptor has been evicted because it was
+// found to be stale, which is all managed through the evictionToken. The
+// function should be provided with an evictionToken if one was acquired from
+// this function on a previous call. If not, an empty evictionToken can be provided.
+//
+// The range descriptor which contains the range in which the request should
+// start its query is returned first. Next returned is an evictionToken. In
+// case the descriptor is discovered stale, the returned evictionToken's evict
+// method should be called; it evicts the cache appropriately. Finally, the
+// returned bool is true in case the given range reaches outside the returned
+// descriptor.
+func (ds *DistSender) getDescriptors(
+	rs roachpb.RSpan, evictToken evictionToken, useReverseScan bool,
+) (*roachpb.RangeDescriptor, bool, evictionToken, *roachpb.Error) {
 	var descKey roachpb.RKey
 	if !useReverseScan {
 		descKey = rs.Key
 	} else {
 		descKey = rs.EndKey
 	}
-	desc, pErr = ds.rangeCache.LookupRangeDescriptor(descKey, considerIntents, useReverseScan)
 
+	// When a previous descriptor has been used (when not warming
+	// the cache), allow [uncommitted] intents on range descriptor
+	// lookups to be returned in addition to live range descriptors.
+	// We cannot know with complete certainty whether a current
+	// intent or a previously committed value should be used to
+	// direct requests, but by looking up both, we can try both out
+	// without issuing a second lookup. This balances between
+	// the two cases where an intent's txn hasn't yet been
+	// committed (the previous value is correct), or an intent's
+	// txn has been committed (the intent value is correct).
+	//
+	// Note that with the current implementation of replica.RangeLookup,
+	// this will disable prefetching.
+	considerIntents := evictToken.prevDesc != nil
+
+	desc, returnToken, pErr := ds.rangeCache.LookupRangeDescriptor(descKey, evictToken, considerIntents, useReverseScan)
 	if pErr != nil {
-		return nil, false, nil, pErr
+		return nil, false, returnToken, pErr
 	}
 
-	// Checks whether need to get next range descriptor. If so, returns true.
-	needAnother := func(desc *roachpb.RangeDescriptor, isReverse bool) bool {
-		if isReverse {
-			return rs.Key.Less(desc.StartKey)
-		}
-		return desc.EndKey.Less(rs.EndKey)
+	// Checks whether need to get next range descriptor.
+	var needAnother bool
+	if useReverseScan {
+		needAnother = rs.Key.Less(desc.StartKey)
+	} else {
+		needAnother = desc.EndKey.Less(rs.EndKey)
 	}
 
-	evict := func() {
-		ds.rangeCache.EvictCachedRangeDescriptor(descKey, desc, useReverseScan)
-	}
-
-	return desc, needAnother(desc, useReverseScan), evict, nil
+	return desc, needAnother, returnToken, nil
 }
 
 // sendSingleRange gathers and rearranges the replicas, and makes an RPC call.
-func (ds *DistSender) sendSingleRange(trace opentracing.Span, ba roachpb.BatchRequest, desc *roachpb.RangeDescriptor) (*roachpb.BatchResponse, *roachpb.Error) {
-	trace.LogEvent("sending RPC")
-
-	leader := ds.leaderCache.Lookup(roachpb.RangeID(desc.RangeID))
+func (ds *DistSender) sendSingleRange(
+	ctx context.Context, ba roachpb.BatchRequest, desc *roachpb.RangeDescriptor,
+) (*roachpb.BatchResponse, *roachpb.Error) {
+	// Hack: avoid formatting the message passed to Span.LogEvent for
+	// opentracing.noopSpans. We can't actually tell if we have a noopSpan, but
+	// we can see if the span as a NoopTracer. Note that this particular
+	// invocation is expensive because we're pretty-printing keys.
+	//
+	// TODO(tschottdorf): This hack can go away when something like
+	// Span.LogEventf is added.
+	sp := opentracing.SpanFromContext(ctx)
+	if sp != nil && sp.Tracer() != (opentracing.NoopTracer{}) {
+		sp.LogEvent(fmt.Sprintf("sending RPC to [%s, %s)", desc.StartKey, desc.EndKey))
+	}
 
 	// Try to send the call.
 	replicas := newReplicaSlice(ds.gossip, desc)
@@ -394,25 +447,28 @@ func (ds *DistSender) sendSingleRange(trace opentracing.Span, ba roachpb.BatchRe
 
 	// If this request needs to go to a leader and we know who that is, move
 	// it to the front.
-	if !(ba.IsReadOnly() && ba.ReadConsistency == roachpb.INCONSISTENT) &&
-		leader.StoreID > 0 {
-		if i := replicas.FindReplica(leader.StoreID); i >= 0 {
-			replicas.MoveToFront(i)
-			order = orderStable
+	if !(ba.IsReadOnly() && ba.ReadConsistency == roachpb.INCONSISTENT) {
+		if leader := ds.leaderCache.Lookup(roachpb.RangeID(desc.RangeID)); leader.StoreID > 0 {
+			if i := replicas.FindReplica(leader.StoreID); i >= 0 {
+				replicas.MoveToFront(i)
+				order = orderStable
+			}
 		}
 	}
 
-	// Increase the sequence counter in the per-range loop (not
-	// outside) since we might hit the same range twice by
-	// accident. For example, we might send multiple requests to
-	// the same Replica if (1) the descriptor cache has post-split
-	// descriptors that are still write intents and (2) the split
-	// has not yet been completed.
-	ba.SetNewRequest()
-	br, pErr := ds.sendRPC(trace, desc.RangeID, replicas, order, ba)
+	// TODO(tschottdorf): should serialize the trace here, not higher up.
+	br, pErr := ds.sendRPC(ctx, desc.RangeID, replicas, order, ba)
 	if pErr != nil {
 		return nil, pErr
 	}
+
+	// If the reply contains a timestamp, update the local HLC with it.
+	if br.Error != nil && br.Error.Now != roachpb.ZeroTimestamp {
+		ds.clock.Update(br.Error.Now)
+	} else if br.Now != roachpb.ZeroTimestamp {
+		ds.clock.Update(br.Now)
+	}
+
 	// Untangle the error from the received response.
 	pErr = br.Error
 	br.Error = nil // scrub the response error
@@ -439,26 +495,37 @@ func (ds *DistSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*roach
 		ba.Timestamp = ds.clock.Now()
 	}
 
-	if ba.Txn != nil && len(ba.Txn.CertainNodes.Nodes) == 0 {
-		// Ensure the local NodeID is marked as free from clock offset;
-		// the transaction's timestamp was taken off the local clock.
-		if nDesc := ds.getNodeDescriptor(); nDesc != nil {
-			// TODO(tschottdorf): future refactoring should move this to txn
-			// creation in TxnCoordSender, which is currently unaware of the
-			// NodeID (and wraps *DistSender through client.Sender since it
-			// also needs test compatibility with *LocalSender).
-			//
-			// Taking care below to not modify any memory referenced from
-			// our BatchRequest which may be shared with others.
-			// First, get a shallow clone of our txn (since that holds the
-			// NodeList struct).
-			txnShallow := *ba.Txn
-			// Next, zero out the NodeList pointer. That makes sure that
-			// if we had something of size zero but with capacity, we don't
-			// re-use the existing space (which others may also use).
-			txnShallow.CertainNodes.Nodes = nil
-			txnShallow.CertainNodes.Add(nDesc.NodeID)
-			ba.Txn = &txnShallow
+	if ba.Txn != nil {
+		// Make a copy here since the code below modifies it in different places.
+		// TODO(tschottdorf): be smarter about this - no need to do it for
+		// requests that don't get split.
+		txnClone := ba.Txn.Clone()
+		ba.Txn = &txnClone
+
+		if len(ba.Txn.ObservedTimestamps) == 0 {
+			// Ensure the local NodeID is marked as free from clock offset;
+			// the transaction's timestamp was taken off the local clock.
+			if nDesc := ds.getNodeDescriptor(); nDesc != nil {
+				// TODO(tschottdorf): future refactoring should move this to txn
+				// creation in TxnCoordSender, which is currently unaware of the
+				// NodeID (and wraps *DistSender through client.Sender since it
+				// also needs test compatibility with *LocalSender).
+				//
+				// Taking care below to not modify any memory referenced from
+				// our BatchRequest which may be shared with others.
+				//
+				// We already have a clone of our txn (see above), so we can
+				// modify it freely.
+				//
+				// Zero the existing data. That makes sure that if we had
+				// something of size zero but with capacity, we don't re-use the
+				// existing space (which others may also use). This is just to
+				// satisfy paranoia/OCD and not expected to matter in practice.
+				ba.Txn.ResetObservedTimestamps()
+				// OrigTimestamp is the HLC timestamp at which the Txn started, so
+				// this effectively means no more uncertainty on this node.
+				ba.Txn.UpdateObservedTimestamp(nDesc.NodeID, ba.Txn.OrigTimestamp)
+			}
 		}
 	}
 
@@ -466,8 +533,31 @@ func (ds *DistSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*roach
 		panic("empty batch")
 	}
 
+	if ba.MaxScanResults != 0 {
+		// Verify that the batch contains only Scan or ReverseScan requests.
+		fwd, rev := false, false
+		for _, req := range ba.Requests {
+			switch req.GetInner().(type) {
+			case *roachpb.ScanRequest:
+				fwd = true
+			case *roachpb.ReverseScanRequest:
+				rev = true
+			default:
+				return nil, roachpb.NewErrorf("batch with limit contains non-scan requests")
+			}
+		}
+		if fwd && rev {
+			return nil, roachpb.NewErrorf("batch with limit contains both forward and reverse scans")
+		}
+	}
+
 	var rplChunks []*roachpb.BatchResponse
 	parts := ba.Split(false /* don't split ET */)
+	if len(parts) > 1 && ba.MaxScanResults != 0 {
+		// We already verified above that the batch contains only scan requests of the same type.
+		// Such a batch should never need splitting.
+		panic("batch with MaxScanResults needs splitting")
+	}
 	for len(parts) > 0 {
 		part := parts[0]
 		ba.Requests = part
@@ -490,7 +580,7 @@ func (ds *DistSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*roach
 		}
 		// Propagate transaction from last reply to next request. The final
 		// update is taken and put into the response's main header.
-		ba.Txn.Update(rpl.Header().Txn)
+		ba.Txn.Update(rpl.Txn)
 		rplChunks = append(rplChunks, rpl)
 		parts = parts[1:]
 	}
@@ -498,8 +588,9 @@ func (ds *DistSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*roach
 	reply := rplChunks[0]
 	for _, rpl := range rplChunks[1:] {
 		reply.Responses = append(reply.Responses, rpl.Responses...)
+		reply.CollectedSpans = append(reply.CollectedSpans, rpl.CollectedSpans...)
 	}
-	*reply.Header() = rplChunks[len(rplChunks)-1].BatchResponse_Header
+	reply.BatchResponse_Header = rplChunks[len(rplChunks)-1].BatchResponse_Header
 	return reply, nil
 }
 
@@ -512,19 +603,36 @@ func (ds *DistSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*roach
 func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error, bool) {
 	isReverse := ba.IsReverse()
 
-	sp := tracing.SpanFromContext(ctx)
+	ctx, cleanup := tracing.EnsureContext(ctx, ds.Tracer)
+	defer cleanup()
 
 	// The minimal key range encompassing all requests contained within.
 	// Local addressing has already been resolved.
 	// TODO(tschottdorf): consider rudimentary validation of the batch here
 	// (for example, non-range requests with EndKey, or empty key ranges).
-	rs := keys.Range(ba)
+	rs, err := keys.Range(ba)
+	if err != nil {
+		return nil, roachpb.NewError(err), false
+	}
 	var br *roachpb.BatchResponse
+
 	// Send the request to one range per iteration.
 	for {
-		considerIntents := false
+		// Increase the sequence counter only once before sending RPCs to
+		// the ranges involved in this chunk of the batch (as opposed to for
+		// each RPC individually). On RPC errors, there's no guarantee that
+		// the request hasn't made its way to the target regardless of the
+		// error; we'd like the second execution to be caught by the sequence
+		// cache if that happens. There is a small chance that that we address
+		// a range twice in this chunk (stale/suboptimal descriptors due to
+		// splits/merges) which leads to a transaction retry.
+		// TODO(tschottdorf): it's possible that if we don't evict from the
+		//   cache we could be in for a busy loop.
+		ba.SetNewRequest()
+
 		var curReply *roachpb.BatchResponse
 		var desc *roachpb.RangeDescriptor
+		var evictToken evictionToken
 		var needAnother bool
 		var pErr *roachpb.Error
 		var finished bool
@@ -532,13 +640,13 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 			// Get range descriptor (or, when spanning range, descriptors). Our
 			// error handling below may clear them on certain errors, so we
 			// refresh (likely from the cache) on every retry.
-			sp.LogEvent("meta descriptor lookup")
-			var evictDesc func()
-			desc, needAnother, evictDesc, pErr = ds.getDescriptors(rs, considerIntents, isReverse)
+			log.Trace(ctx, "meta descriptor lookup")
+			desc, needAnother, evictToken, pErr = ds.getDescriptors(rs, evictToken, isReverse)
 
 			// getDescriptors may fail retryably if the first range isn't
 			// available via Gossip.
 			if pErr != nil {
+				log.Trace(ctx, "range descriptor lookup failed: "+pErr.String())
 				if pErr.Retryable {
 					if log.V(1) {
 						log.Warning(pErr)
@@ -546,6 +654,8 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 					continue
 				}
 				break
+			} else {
+				log.Trace(ctx, "looked up range descriptor")
 			}
 
 			if needAnother && br == nil {
@@ -575,8 +685,19 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 			// descriptor. Example revscan [a,g), first desc lookup for "g"
 			// returns descriptor [c,d) -> [d,g) is never scanned.
 			// We evict and retry in such a case.
-			if (isReverse && !desc.ContainsKeyRange(desc.StartKey, rs.EndKey)) || (!isReverse && !desc.ContainsKeyRange(rs.Key, desc.EndKey)) {
-				evictDesc()
+			includesFrontOfCurSpan := func(rd *roachpb.RangeDescriptor) bool {
+				if isReverse {
+					// This approach is needed because rs.EndKey is exclusive.
+					return desc.ContainsKeyRange(desc.StartKey, rs.EndKey)
+				}
+				return desc.ContainsKey(rs.Key)
+			}
+			if !includesFrontOfCurSpan(desc) {
+				if err := evictToken.Evict(); err != nil {
+					return nil, roachpb.NewError(err), false
+				}
+				// On addressing errors, don't backoff; retry immediately.
+				r.Reset()
 				continue
 			}
 
@@ -596,8 +717,7 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 				if trErr != nil {
 					return nil, roachpb.NewError(trErr)
 				}
-
-				return ds.sendSingleRange(sp, truncBA, desc)
+				return ds.sendSingleRange(ctx, truncBA, desc)
 			}()
 			// If sending succeeded, break this loop.
 			if pErr == nil {
@@ -608,7 +728,7 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 			if log.V(1) {
 				log.Warningf("failed to invoke %s: %s", ba, pErr)
 			}
-			sp.LogEvent(fmt.Sprintf("reply error: %T", pErr.GetDetail()))
+			log.Trace(ctx, fmt.Sprintf("reply error: %T", pErr.GetDetail()))
 
 			// Error handling below.
 			// If retryable, allow retry. For range not found or range
@@ -622,30 +742,51 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 				// We may simply not be trying to talk to the up-to-date
 				// replicas, so clearing the descriptor here should be a good
 				// idea.
-				// TODO(tschottdorf): If a replica group goes dead, this
-				// will cause clients to put high read pressure on the first
-				// range, so there should be some rate limiting here.
-				evictDesc()
+				if err := evictToken.Evict(); err != nil {
+					return nil, roachpb.NewError(err), false
+				}
 				if tErr.CanRetry() {
 					continue
 				}
-			case *roachpb.RangeNotFoundError, *roachpb.RangeKeyMismatchError:
-				// Range descriptor might be out of date - evict it.
-				evictDesc()
+			case *roachpb.RangeNotFoundError:
+				// Range descriptor might be out of date - evict it. This is
+				// likely the result of a rebalance.
+				if err := evictToken.Evict(); err != nil {
+					return nil, roachpb.NewError(err), false
+				}
 				// On addressing errors, don't backoff; retry immediately.
 				r.Reset()
 				if log.V(1) {
 					log.Warning(tErr)
 				}
-				// On retries, allow [uncommitted] intents on range descriptor
-				// lookups to be returned 50% of the time in order to succeed
-				// at finding the transaction record pointed to by the intent
-				// itself. The 50% probability of returning either the current
-				// intent or the previously committed value balances between
-				// the two cases where the intent's txn hasn't yet been
-				// committed (the previous value is correct), or the intent's
-				// txn has been committed (the intent value is correct).
-				considerIntents = true
+				continue
+			case *roachpb.RangeKeyMismatchError:
+				// Range descriptor might be out of date - evict it. This is
+				// likely the result of a range split. If we have new range
+				// descriptors, insert them instead as long as they are different
+				// from the last descriptor to avoid endless loops.
+				var replacements []roachpb.RangeDescriptor
+				different := func(rd *roachpb.RangeDescriptor) bool {
+					return !desc.RSpan().Equal(rd.RSpan())
+				}
+				if tErr.MismatchedRange != nil && different(tErr.MismatchedRange) {
+					replacements = append(replacements, *tErr.MismatchedRange)
+				}
+				if tErr.SuggestedRange != nil && different(tErr.SuggestedRange) {
+					if includesFrontOfCurSpan(tErr.SuggestedRange) {
+						replacements = append(replacements, *tErr.SuggestedRange)
+
+					}
+				}
+				// Same as Evict() if replacements is empty.
+				if err := evictToken.EvictAndReplace(replacements...); err != nil {
+					return nil, roachpb.NewError(err), false
+				}
+				// On addressing errors, don't backoff; retry immediately.
+				r.Reset()
+				if log.V(1) {
+					log.Warning(tErr)
+				}
 				continue
 			case *roachpb.NotLeaderError:
 				newLeader := tErr.Leader
@@ -657,7 +798,9 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 						if log.V(1) {
 							log.Infof("error indicates unknown leader %s, expunging descriptor %s", newLeader, desc)
 						}
-						evictDesc()
+						if err := evictToken.Evict(); err != nil {
+							return nil, roachpb.NewError(err), false
+						}
 					}
 				} else {
 					// If the new leader is unknown, we were talking to a
@@ -670,7 +813,9 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 					// another node (at a lower level), and then if it reaches
 					// this level then we know we've exhausted our options and
 					// must clear the cache.
-					evictDesc()
+					if err := evictToken.Evict(); err != nil {
+						return nil, roachpb.NewError(err), false
+					}
 					newLeader = &roachpb.ReplicaDescriptor{}
 				}
 				// Next, cache the new leader.
@@ -713,6 +858,40 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 			// Combine the new response with the existing one.
 			if err := br.Combine(curReply); err != nil {
 				return nil, roachpb.NewError(err), false
+			}
+		}
+
+		if ba.MaxScanResults > 0 {
+			// Count how many results we received.
+			var numResults int64
+			for _, resp := range curReply.Responses {
+				if cResp, ok := resp.GetInner().(roachpb.Countable); ok {
+					numResults += cResp.Count()
+				}
+			}
+			if numResults > ba.MaxScanResults {
+				panic(fmt.Sprintf("received %d results, limit was %d", numResults, ba.MaxScanResults))
+			}
+			ba.MaxScanResults -= numResults
+			if ba.MaxScanResults == 0 {
+				// We are done with this batch. Some requests might have NoopResponses; we must
+				// replace them with empty responses of the proper type.
+				for i, req := range ba.Requests {
+					if _, ok := br.Responses[i].GetInner().(*roachpb.NoopResponse); !ok {
+						continue
+					}
+					union := roachpb.ResponseUnion{}
+					var reply roachpb.Response
+					if _, ok := req.GetInner().(*roachpb.ScanRequest); ok {
+						reply = &roachpb.ScanResponse{}
+					} else {
+						_ = req.GetInner().(*roachpb.ReverseScanRequest)
+						reply = &roachpb.ReverseScanResponse{}
+					}
+					union.MustSetInner(reply)
+					br.Responses[i] = union
+				}
+				return br, nil, false
 			}
 		}
 
@@ -764,10 +943,8 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 					// We've hit max results for this piece of the batch. Mask
 					// it out (we've copied the requests slice above, so this
 					// is kosher).
-					ba.Requests[i].Reset() // necessary (no one-of?)
-					if !ba.Requests[i].SetValue(&roachpb.NoopRequest{}) {
-						panic("RequestUnion excludes NoopRequest")
-					}
+					union := &ba.Requests[i] // avoid working on copy
+					union.MustSetInner(&noopRequest)
 					continue
 				}
 				// The request isn't saturated yet.
@@ -786,7 +963,7 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 			// We use the StartKey of the current descriptor as opposed to the
 			// EndKey of the previous one since that doesn't have bugs when
 			// stale descriptors come into play.
-			rs.EndKey = prev(ba, desc.StartKey)
+			rs.EndKey, err = prev(ba, desc.StartKey)
 		} else {
 			// In next iteration, query next range.
 			// It's important that we use the EndKey of the current descriptor
@@ -795,9 +972,12 @@ func (ds *DistSender) sendChunk(ctx context.Context, ba roachpb.BatchRequest) (*
 			// one, and unless both descriptors are stale, the next descriptor's
 			// StartKey would move us to the beginning of the current range,
 			// resulting in a duplicate scan.
-			rs.Key = next(ba, desc.EndKey)
+			rs.Key, err = next(ba, desc.EndKey)
 		}
-		sp.LogEvent("querying next range")
+		if err != nil {
+			return nil, roachpb.NewError(err), false
+		}
+		log.Trace(ctx, "querying next range")
 	}
 }
 

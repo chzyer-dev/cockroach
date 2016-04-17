@@ -19,34 +19,32 @@ package server
 
 import (
 	"compress/gzip"
-	"encoding/json"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
-	"net/rpc"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	assetfs "github.com/elazarl/go-bindata-assetfs"
+	opentracing "github.com/opentracing/opentracing-go"
 	"google.golang.org/grpc"
 
 	snappy "github.com/cockroachdb/c-snappy"
+	"github.com/cockroachdb/cmux"
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
-	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/kv"
-	crpc "github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/server/status"
 	"github.com/cockroachdb/cockroach/sql"
-	"github.com/cockroachdb/cockroach/sql/driver"
 	"github.com/cockroachdb/cockroach/sql/pgwire"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/ts"
-	"github.com/cockroachdb/cockroach/ui"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/cockroachdb/cockroach/util/grpcutil"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/metric"
@@ -63,39 +61,31 @@ var (
 
 // Server is the cockroach server node.
 type Server struct {
-	ctx *Context
-
-	listener net.Listener // Only used in tests.
-
-	mux           *http.ServeMux
-	httpReady     chan struct{}
-	clock         *hlc.Clock
-	rpcContext    *crpc.Context
-	rpc           *crpc.Server
-	grpc          *grpc.Server
-	gossip        *gossip.Gossip
-	storePool     *storage.StorePool
-	db            *client.DB
-	kvDB          *kv.DBServer
-	sqlServer     sql.Server
-	pgServer      *pgwire.Server
-	node          *Node
-	recorder      *status.NodeStatusRecorder
-	admin         *adminServer
-	status        *statusServer
-	tsDB          *ts.DB
-	tsServer      *ts.Server
-	raftTransport storage.RaftTransport
-
-	// registry is the root metrics Registry in a Cockroach node. Adding metrics directly to this
-	// registry should be rare. Instead, add more specialized registries to this one. Refer to the
-	// package docs for util/metric for more information on metrics.
-	registry *metric.Registry
-
+	Tracer              opentracing.Tracer
+	ctx                 *Context
+	mux                 *http.ServeMux
+	clock               *hlc.Clock
+	rpcContext          *rpc.Context
+	grpc                *grpc.Server
+	gossip              *gossip.Gossip
+	storePool           *storage.StorePool
+	db                  *client.DB
+	kvDB                *kv.DBServer
+	pgServer            pgwire.Server
+	node                *Node
+	recorder            *status.MetricsRecorder
+	runtime             status.RuntimeStatSampler
+	admin               *adminServer
+	status              *statusServer
+	tsDB                *ts.DB
+	tsServer            *ts.Server
+	raftTransport       *storage.RaftTransport
 	stopper             *stop.Stopper
 	sqlExecutor         *sql.Executor
 	leaseMgr            *sql.LeaseManager
 	schemaChangeManager *sql.SchemaChangeManager
+	parsedUpdatesURL    *url.URL
+	parsedReportingURL  *url.URL
 }
 
 // NewServer creates a Server from a server.Context.
@@ -109,7 +99,7 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 	}
 
 	if ctx.Insecure {
-		log.Warning("running in insecure mode, this is strongly discouraged. See --insecure and --certs.")
+		log.Warning("running in insecure mode, this is strongly discouraged. See --insecure.")
 	}
 	// Try loading the TLS configs before anything else.
 	if _, err := ctx.GetServerTLSConfig(); err != nil {
@@ -120,27 +110,23 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 	}
 
 	s := &Server{
-		ctx:       ctx,
-		mux:       http.NewServeMux(),
-		httpReady: make(chan struct{}),
-		clock:     hlc.NewClock(hlc.UnixNano),
-		registry:  metric.NewRegistry(),
-		stopper:   stopper,
+		Tracer:  tracing.NewTracer(),
+		ctx:     ctx,
+		mux:     http.NewServeMux(),
+		clock:   hlc.NewClock(hlc.UnixNano),
+		stopper: stopper,
 	}
 	s.clock.SetMaxOffset(ctx.MaxOffset)
 
-	s.rpcContext = crpc.NewContext(&ctx.Context, s.clock, stopper)
-	stopper.RunWorker(func() {
-		s.rpcContext.RemoteClocks.MonitorRemoteOffsets(stopper)
-	})
-
-	s.rpc = crpc.NewServer(s.rpcContext)
+	s.rpcContext = rpc.NewContext(&ctx.Context, s.clock, stopper)
+	s.rpcContext.HeartbeatCB = func() {
+		if err := s.rpcContext.RemoteClocks.VerifyClockOffset(); err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	s.gossip = gossip.New(s.rpcContext, s.ctx.GossipBootstrapResolvers, stopper)
 	s.storePool = storage.NewStorePool(s.gossip, s.clock, ctx.TimeUntilStoreDead, stopper)
-
-	feed := util.NewFeed(stopper)
-	tracer := tracing.NewTracer()
 
 	// A custom RetryOptions is created which uses stopper.ShouldDrain() as
 	// the Closer. This prevents infinite retry loops from occurring during
@@ -160,60 +146,69 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 		RPCContext:      s.rpcContext,
 		RPCRetryOptions: &retryOpts,
 	}, s.gossip)
-	sender := kv.NewTxnCoordSender(ds, s.clock, ctx.Linearizable, tracer, s.stopper)
+	txnRegistry := metric.NewRegistry()
+	txnMetrics := kv.NewTxnMetrics(txnRegistry)
+	sender := kv.NewTxnCoordSender(ds, s.clock, ctx.Linearizable, s.Tracer, s.stopper, txnMetrics)
 	s.db = client.NewDB(sender)
 
-	s.grpc = grpc.NewServer()
-	s.raftTransport = newRPCTransport(s.gossip, s.grpc, s.rpcContext)
-	s.stopper.AddCloser(s.raftTransport)
+	s.grpc = rpc.NewServer(s.rpcContext)
+	s.raftTransport = storage.NewRaftTransport(storage.GossipAddressResolver(s.gossip), s.grpc, s.rpcContext)
 
 	s.kvDB = kv.NewDBServer(&s.ctx.Context, sender, stopper)
-	if err := s.kvDB.RegisterRPC(s.rpc); err != nil {
-		return nil, err
-	}
+	roachpb.RegisterExternalServer(s.grpc, s.kvDB)
 
 	s.leaseMgr = sql.NewLeaseManager(0, *s.db, s.clock)
 	s.leaseMgr.RefreshLeases(s.stopper, s.db, s.gossip)
-	s.sqlExecutor = sql.NewExecutor(*s.db, s.gossip, s.leaseMgr, s.stopper)
-	s.sqlServer = sql.MakeServer(&s.ctx.Context, s.sqlExecutor)
-	if err := s.sqlServer.RegisterRPC(s.rpc); err != nil {
-		return nil, err
+	eCtx := sql.ExecutorContext{
+		DB:           s.db,
+		Gossip:       s.gossip,
+		LeaseManager: s.leaseMgr,
+		Clock:        s.clock,
+		TestingKnobs: &ctx.TestingKnobs.ExecutorTestingKnobs,
 	}
 
-	s.pgServer = pgwire.NewServer(&pgwire.Context{
-		Context:  &s.ctx.Context,
-		Executor: s.sqlServer.Executor,
-		Stopper:  stopper,
-	})
+	sqlRegistry := metric.NewRegistry()
+	s.sqlExecutor = sql.NewExecutor(eCtx, s.stopper, sqlRegistry)
+
+	s.pgServer = pgwire.MakeServer(&s.ctx.Context, s.sqlExecutor, sqlRegistry)
 
 	// TODO(bdarnell): make StoreConfig configurable.
 	nCtx := storage.StoreContext{
-		Clock:           s.clock,
-		DB:              s.db,
-		Gossip:          s.gossip,
-		Transport:       s.raftTransport,
-		ScanInterval:    s.ctx.ScanInterval,
-		ScanMaxIdleTime: s.ctx.ScanMaxIdleTime,
-		EventFeed:       feed,
-		Tracer:          tracer,
-		StorePool:       s.storePool,
+		Clock:                          s.clock,
+		DB:                             s.db,
+		Gossip:                         s.gossip,
+		Transport:                      s.raftTransport,
+		ScanInterval:                   s.ctx.ScanInterval,
+		ScanMaxIdleTime:                s.ctx.ScanMaxIdleTime,
+		ConsistencyCheckInterval:       s.ctx.ConsistencyCheckInterval,
+		ConsistencyCheckPanicOnFailure: s.ctx.ConsistencyCheckPanicOnFailure,
+		Tracer:    s.Tracer,
+		StorePool: s.storePool,
 		SQLExecutor: sql.InternalExecutor{
 			LeaseManager: s.leaseMgr,
 		},
 		LogRangeEvents: true,
 		AllocatorOptions: storage.AllocatorOptions{
 			AllowRebalance: true,
-			Mode:           s.ctx.BalanceMode,
 		},
+		TestingKnobs: ctx.TestingKnobs.StoreTestingKnobs,
 	}
-	subRegistries := []status.NodeSubregistry{
-		{"pgwire", s.pgServer.Registry()},
-		{"sql", s.sqlExecutor.Registry()},
-	}
-	s.node = NewNode(nCtx, s.registry, s.stopper, subRegistries)
-	s.admin = newAdminServer(s.db, s.stopper)
+
+	s.recorder = status.NewMetricsRecorder(s.clock)
+	s.recorder.AddNodeRegistry("sql.%s", sqlRegistry)
+	s.recorder.AddNodeRegistry("txn.%s", txnRegistry)
+	s.recorder.AddNodeRegistry("clock-offset.%s", s.rpcContext.RemoteClocks.Registry())
+
+	s.runtime = status.MakeRuntimeStatSampler(s.clock)
+	s.recorder.AddNodeRegistry("sys.%s", s.runtime.Registry())
+
+	s.node = NewNode(nCtx, s.recorder, s.stopper, txnMetrics)
+	roachpb.RegisterInternalServer(s.grpc, s.node)
+
+	s.admin = newAdminServer(s.db, s.stopper, s.sqlExecutor, ds, s.node)
 	s.tsDB = ts.NewDB(s.db)
 	s.tsServer = ts.NewServer(s.tsDB)
+	s.status = newStatusServer(s.db, s.gossip, s.recorder, s.ctx)
 
 	return s, nil
 }
@@ -221,66 +216,189 @@ func NewServer(ctx *Context, stopper *stop.Stopper) (*Server, error) {
 // Start starts the server on the specified port, starts gossip and
 // initializes the node using the engines from the server's context.
 func (s *Server) Start() error {
+	s.initHTTP()
+
 	tlsConfig, err := s.ctx.GetServerTLSConfig()
 	if err != nil {
 		return err
 	}
 
-	unresolvedAddr := util.NewUnresolvedAddr("tcp", s.ctx.Addr)
-	ln, err := util.ListenAndServe(s.stopper, s, unresolvedAddr, tlsConfig)
+	// The following code is a specialization of util/net.go's ListenAndServe
+	// which adds pgwire support. A single port is used to serve all protocols
+	// (pg, http, h2) via the following construction:
+	//
+	// non-TLS case:
+	// net.Listen -> cmux.New
+	//               |
+	//               -  -> pgwire.Match -> pgwire.Server.ServeConn
+	//               -  -> cmux.Any -> grpc.(*Server).Serve
+	//
+	// TLS case:
+	// net.Listen -> cmux.New
+	//               |
+	//               -  -> pgwire.Match -> pgwire.Server.ServeConn
+	//               -  -> cmux.Any -> grpc.(*Server).Serve
+	//
+	// Note that the difference between the TLS and non-TLS cases exists due to
+	// Go's lack of an h2c (HTTP2 Clear Text) implementation. See inline comments
+	// in util.ListenAndServe for an explanation of how h2c is implemented there
+	// and here.
+
+	ln, err := net.Listen("tcp", s.ctx.Addr)
 	if err != nil {
 		return err
 	}
-	s.listener = ln // Only used in tests.
-
-	if err := officializeAddr(unresolvedAddr, ln.Addr()); err != nil {
+	unresolvedAddr, err := officialAddr(s.ctx.Addr, ln.Addr())
+	if err != nil {
 		return err
 	}
+	s.ctx.Addr = unresolvedAddr.String()
+	s.rpcContext.SetLocalInternalServer(s.node, s.ctx.Addr)
 
-	s.rpcContext.SetLocalServer(s.rpc, unresolvedAddr.String())
+	s.stopper.RunWorker(func() {
+		<-s.stopper.ShouldDrain()
+		if err := ln.Close(); err != nil {
+			log.Fatal(err)
+		}
+	})
+
+	m := cmux.New(ln)
+	pgL := m.Match(pgwire.Match)
+	anyL := m.Match(cmux.Any())
+
+	httpLn, err := net.Listen("tcp", s.ctx.HTTPAddr)
+	if err != nil {
+		return err
+	}
+	unresolvedHTTPAddr, err := officialAddr(s.ctx.HTTPAddr, httpLn.Addr())
+	if err != nil {
+		return err
+	}
+	s.ctx.HTTPAddr = unresolvedHTTPAddr.String()
+
+	s.stopper.RunWorker(func() {
+		<-s.stopper.ShouldDrain()
+		if err := httpLn.Close(); err != nil {
+			log.Fatal(err)
+		}
+	})
+
+	if tlsConfig != nil {
+		httpMux := cmux.New(httpLn)
+		clearL := httpMux.Match(cmux.HTTP1Fast())
+		tlsL := httpMux.Match(cmux.Any())
+
+		s.stopper.RunWorker(func() {
+			util.FatalIfUnexpected(httpMux.Serve())
+		})
+
+		util.ServeHandler(s.stopper, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// TODO(tamird): s/308/http.StatusPermanentRedirect/ when it exists.
+			http.Redirect(w, r, "https://"+r.Host+r.RequestURI, 308)
+		}), clearL, tlsConfig)
+
+		httpLn = tls.NewListener(tlsL, tlsConfig)
+	}
+
+	serveConn := util.ServeHandler(s.stopper, s, httpLn, tlsConfig)
+
+	s.stopper.RunWorker(func() {
+		util.FatalIfUnexpected(s.grpc.Serve(anyL))
+	})
+
+	s.stopper.RunWorker(func() {
+		util.FatalIfUnexpected(serveConn(pgL, func(conn net.Conn) {
+			if err := s.pgServer.ServeConn(conn); err != nil && !util.IsClosedConnection(err) {
+				log.Error(err)
+			}
+		}))
+	})
+
+	if len(s.ctx.SocketFile) != 0 {
+		// Unix socket enabled: postgres protocol only.
+		unixLn, err := net.Listen("unix", s.ctx.SocketFile)
+		if err != nil {
+			return err
+		}
+
+		s.stopper.RunWorker(func() {
+			<-s.stopper.ShouldDrain()
+			if err := unixLn.Close(); err != nil {
+				log.Fatal(err)
+			}
+		})
+
+		s.stopper.RunWorker(func() {
+			util.FatalIfUnexpected(serveConn(unixLn, func(conn net.Conn) {
+				if err := s.pgServer.ServeConn(conn); err != nil && !util.IsClosedConnection(err) {
+					log.Error(err)
+				}
+			}))
+		})
+	}
 
 	s.gossip.Start(s.grpc, unresolvedAddr)
 
-	if err := s.node.start(s.rpc, unresolvedAddr, s.ctx.Engines, s.ctx.NodeAttributes); err != nil {
+	if err := s.node.start(unresolvedAddr, s.ctx.Engines, s.ctx.NodeAttributes); err != nil {
 		return err
 	}
 
 	// Begin recording runtime statistics.
-	runtime := status.NewRuntimeStatRecorder(s.node.Descriptor.NodeID, s.clock)
-	s.tsDB.PollSource(runtime, s.ctx.MetricsFrequency, ts.Resolution10s, s.stopper)
+	s.startSampleEnvironment(s.ctx.MetricsSampleInterval)
 
 	// Begin recording time series data collected by the status monitor.
-	s.recorder = status.NewNodeStatusRecorder(s.node.status, s.clock)
-	s.tsDB.PollSource(s.recorder, s.ctx.MetricsFrequency, ts.Resolution10s, s.stopper)
+	s.tsDB.PollSource(s.recorder, s.ctx.MetricsSampleInterval, ts.Resolution10s, s.stopper)
 
 	// Begin recording status summaries.
-	s.startWriteSummaries()
+	s.node.startWriteSummaries(s.ctx.MetricsSampleInterval)
 
-	s.sqlServer.SetNodeID(s.node.Descriptor.NodeID)
+	s.sqlExecutor.SetNodeID(s.node.Descriptor.NodeID)
 	// Create and start the schema change manager only after a NodeID
 	// has been assigned.
 	s.schemaChangeManager = sql.NewSchemaChangeManager(*s.db, s.gossip, s.leaseMgr)
 	s.schemaChangeManager.Start(s.stopper)
 
-	s.status = newStatusServer(s.db, s.gossip, s.registry, s.ctx)
+	s.periodicallyCheckForUpdates()
 
-	log.Infof("starting %s server at %s", s.ctx.HTTPRequestScheme(), unresolvedAddr)
-	s.initHTTP()
+	log.Infof("starting %s server at %s", s.ctx.HTTPRequestScheme(), unresolvedHTTPAddr)
+	log.Infof("starting grpc/postgres server at %s", unresolvedAddr)
+	if len(s.ctx.SocketFile) != 0 {
+		log.Infof("starting postgres server at unix:%s", s.ctx.SocketFile)
+	}
 
-	return s.pgServer.Start(util.NewUnresolvedAddr("tcp", s.ctx.PGAddr))
+	s.stopper.RunWorker(func() {
+		util.FatalIfUnexpected(m.Serve())
+	})
+
+	// Register admin service. Must happen after serving starts.
+	s.stopper.AddCloser(s.admin)
+	RegisterAdminServer(s.grpc, s.admin)
+	return s.admin.RegisterGRPCGateway(s.ctx)
 }
+
+// startSampleEnvironment begins a worker that periodically instructs the
+// runtime stat sampler to sample the environment.
+func (s *Server) startSampleEnvironment(frequency time.Duration) {
+	// Immediately record summaries once on server startup.
+	s.stopper.RunWorker(func() {
+		ticker := time.NewTicker(frequency)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.runtime.SampleEnvironment()
+			case <-s.stopper.ShouldStop():
+				return
+			}
+		}
+	})
+}
+
+var uiFileSystem http.FileSystem
 
 // initHTTP registers http prefixes.
 func (s *Server) initHTTP() {
-	s.mux.Handle(rpc.DefaultRPCPath, s.rpc)
-
-	s.mux.Handle("/", grpcutil.GRPCHandlerFunc(s.grpc, http.FileServer(
-		&assetfs.AssetFS{
-			Asset:     ui.Asset,
-			AssetDir:  ui.AssetDir,
-			AssetInfo: ui.AssetInfo,
-		},
-	)))
+	s.mux.Handle("/", http.FileServer(uiFileSystem))
 
 	// The admin server handles both /debug/ and /_admin/
 	// TODO(marc): when cookie-based authentication exists,
@@ -290,67 +408,6 @@ func (s *Server) initHTTP() {
 	s.mux.Handle(statusPrefix, s.status)
 	s.mux.Handle(healthEndpoint, s.status)
 	s.mux.Handle(ts.URLPrefix, s.tsServer)
-
-	// The SQL endpoints handles its own authentication, verifying user
-	// credentials against the requested user.
-	s.mux.Handle(driver.Endpoint, s.sqlServer)
-
-	close(s.httpReady)
-}
-
-// startWriteSummaries begins periodically persisting status summaries for the
-// node and its stores.
-func (s *Server) startWriteSummaries() {
-	s.stopper.RunWorker(func() {
-		ticker := time.NewTicker(s.ctx.MetricsFrequency)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				s.stopper.RunTask(func() {
-					if err := s.writeSummaries(); err != nil {
-						log.Error(err)
-					}
-				})
-			case <-s.stopper.ShouldStop():
-				return
-			}
-		}
-	})
-}
-
-// writeSummaries retrieves status summaries from the supplied
-// NodeStatusRecorder and persists them to the cockroach data store.
-func (s *Server) writeSummaries() error {
-	nodeStatus, storeStatuses := s.recorder.GetStatusSummaries()
-	if nodeStatus != nil {
-		key := keys.NodeStatusKey(int32(nodeStatus.Desc.NodeID))
-		if pErr := s.db.Put(key, nodeStatus); pErr != nil {
-			return pErr.GoError()
-		}
-		if log.V(1) {
-			statusJSON, err := json.Marshal(nodeStatus)
-			if err != nil {
-				log.Errorf("error marshaling nodeStatus to json: %s", err)
-			}
-			log.Infof("node %d status: %s", nodeStatus.Desc.NodeID, statusJSON)
-		}
-	}
-
-	for _, ss := range storeStatuses {
-		key := keys.StoreStatusKey(int32(ss.Desc.StoreID))
-		if pErr := s.db.Put(key, &ss); pErr != nil {
-			return pErr.GoError()
-		}
-		if log.V(1) {
-			statusJSON, err := json.Marshal(&ss)
-			if err != nil {
-				log.Errorf("error marshaling storeStatus to json: %s", err)
-			}
-			log.Infof("store %d status: %s", ss.Desc.StoreID, statusJSON)
-		}
-	}
-	return nil
 }
 
 // Stop stops the server.
@@ -361,39 +418,26 @@ func (s *Server) Stop() {
 // ServeHTTP is necessary to implement the http.Handler interface. It
 // will snappy a response if the appropriate request headers are set.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Check if we're draining; if so return 503, service unavailable.
-	if !s.stopper.RunTask(func() {
-		// This is our base handler, so catch all panics and make sure they stick.
-		defer log.FatalOnPanic()
+	// This is our base handler, so catch all panics and make sure they stick.
+	defer log.FatalOnPanic()
 
-		// If server is not available, return 503 http response code.
-		select {
-		case <-s.httpReady:
-			// Proceed.
-		default:
-			http.Error(w, "node not yet available", http.StatusServiceUnavailable)
-			return
-		}
-		// Disable caching of responses.
-		w.Header().Set("Cache-control", "no-cache")
+	// Disable caching of responses.
+	w.Header().Set("Cache-control", "no-cache")
 
-		ae := r.Header.Get(util.AcceptEncodingHeader)
-		switch {
-		case strings.Contains(ae, util.SnappyEncoding):
-			w.Header().Set(util.ContentEncodingHeader, util.SnappyEncoding)
-			s := newSnappyResponseWriter(w)
-			defer s.Close()
-			w = s
-		case strings.Contains(ae, util.GzipEncoding):
-			w.Header().Set(util.ContentEncodingHeader, util.GzipEncoding)
-			gzw := newGzipResponseWriter(w)
-			defer gzw.Close()
-			w = gzw
-		}
-		s.mux.ServeHTTP(w, r)
-	}) {
-		http.Error(w, "service is draining", http.StatusServiceUnavailable)
+	ae := r.Header.Get(util.AcceptEncodingHeader)
+	switch {
+	case strings.Contains(ae, util.SnappyEncoding):
+		w.Header().Set(util.ContentEncodingHeader, util.SnappyEncoding)
+		s := newSnappyResponseWriter(w)
+		defer s.Close()
+		w = s
+	case strings.Contains(ae, util.GzipEncoding):
+		w.Header().Set(util.ContentEncodingHeader, util.GzipEncoding)
+		gzw := newGzipResponseWriter(w)
+		defer gzw.Close()
+		w = gzw
 	}
+	s.mux.ServeHTTP(w, r)
 }
 
 type gzipResponseWriter struct {
@@ -454,15 +498,15 @@ func (w *snappyResponseWriter) Close() {
 	}
 }
 
-func officializeAddr(unresolvedAddr *util.UnresolvedAddr, resolvedAddr net.Addr) error {
-	unresolvedHost, unresolvedPort, err := net.SplitHostPort(unresolvedAddr.String())
+func officialAddr(unresolvedAddr string, resolvedAddr net.Addr) (*util.UnresolvedAddr, error) {
+	unresolvedHost, unresolvedPort, err := net.SplitHostPort(unresolvedAddr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	resolvedHost, resolvedPort, err := net.SplitHostPort(resolvedAddr.String())
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var host string
@@ -487,7 +531,5 @@ func officializeAddr(unresolvedAddr *util.UnresolvedAddr, resolvedAddr net.Addr)
 		port = resolvedPort
 	}
 
-	unresolvedAddr.AddressField = net.JoinHostPort(host, port)
-
-	return nil
+	return util.NewUnresolvedAddr(resolvedAddr.Network(), net.JoinHostPort(host, port)), nil
 }

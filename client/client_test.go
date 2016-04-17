@@ -22,20 +22,22 @@ package client_test
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/config"
 	"github.com/cockroachdb/cockroach/roachpb"
+	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
-	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/retry"
 	"github.com/cockroachdb/cockroach/util/stop"
 	"github.com/gogo/protobuf/proto"
@@ -48,18 +50,12 @@ var testUser = server.TestUser
 // (on call to reset()) for clients which need to wait on a command
 // being sent.
 type notifyingSender struct {
-	waiter  *sync.WaitGroup
+	notify  chan struct{}
 	wrapped client.Sender
 }
 
-func (ss *notifyingSender) reset(waiter *sync.WaitGroup) {
-	waiter.Add(1)
-	ss.waiter = waiter
-}
-
-func (ss *notifyingSender) wait() {
-	ss.waiter.Wait()
-	ss.waiter = nil
+func (ss *notifyingSender) reset(notify chan struct{}) {
+	ss.notify = notify
 }
 
 func (ss *notifyingSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -67,9 +63,12 @@ func (ss *notifyingSender) Send(ctx context.Context, ba roachpb.BatchRequest) (*
 	if br != nil && br.Error != nil {
 		panic(roachpb.ErrorUnexpectedlySet(ss.wrapped, br))
 	}
-	if ss.waiter != nil {
-		ss.waiter.Done()
+
+	select {
+	case ss.notify <- struct{}{}:
+	default:
 	}
+
 	return br, pErr
 }
 
@@ -78,25 +77,23 @@ func createTestClient(t *testing.T, stopper *stop.Stopper, addr string) *client.
 }
 
 func createTestClientForUser(t *testing.T, stopper *stop.Stopper, addr, user string) *client.DB {
-	db, err := client.Open(stopper, fmt.Sprintf("rpcs://%s@%s?certs=%s",
-		user, addr, security.EmbeddedCertsDir))
+	rpcContext := rpc.NewContext(&base.Context{
+		User:       user,
+		SSLCA:      filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
+		SSLCert:    filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.crt", user)),
+		SSLCertKey: filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.key", user)),
+	}, nil, stopper)
+	sender, err := client.NewSender(rpcContext, addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return db
+	return client.NewDB(sender)
 }
 
 // createTestNotifyClient creates a new client which connects using an HTTP
 // sender to the server at addr. It contains a waitgroup to allow waiting.
-func createTestNotifyClient(stopper *stop.Stopper, addr string, priority roachpb.UserPriority) (*client.DB, *notifyingSender) {
-	db, err := client.Open(stopper, fmt.Sprintf("rpcs://%s@%s?certs=%s",
-		security.NodeUser,
-		addr,
-		security.EmbeddedCertsDir))
-	if err != nil {
-		log.Fatal(err)
-	}
-
+func createTestNotifyClient(t *testing.T, stopper *stop.Stopper, addr string, priority roachpb.UserPriority) (*client.DB, *notifyingSender) {
+	db := createTestClient(t, stopper, addr)
 	sender := &notifyingSender{wrapped: db.GetSender()}
 	return client.NewDBWithPriority(sender, priority), sender
 }
@@ -106,7 +103,7 @@ func createTestNotifyClient(stopper *stop.Stopper, addr string, priority roachpb
 // where the non-transactional put can push the txn, we expect the
 // transaction's value to be written after all retries are complete.
 func TestClientRetryNonTxn(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	s.SetRangeRetryOptions(retry.Options{
@@ -146,7 +143,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 			txnPri = 2
 		}
 
-		db, sender := createTestNotifyClient(s.Stopper(), s.ServingAddr(), -clientPri)
+		db, sender := createTestNotifyClient(t, s.Stopper(), s.ServingAddr(), -clientPri)
 
 		// doneCall signals when the non-txn read or write has completed.
 		doneCall := make(chan struct{})
@@ -164,24 +161,30 @@ func TestClientRetryNonTxn(t *testing.T) {
 			if pErr := txn.Put(key, "txn-value"); pErr != nil {
 				return pErr
 			}
-			// The wait group lets us pause txn until after the non-txn method has run once.
-			wg := sync.WaitGroup{}
 			// On the first true, send the non-txn put or get.
 			if count == 1 {
 				// We use a "notifying" sender here, which allows us to know exactly when the
 				// call has been processed; otherwise, we'd be dependent on timing.
-				sender.reset(&wg)
+				// The channel lets us pause txn until after the non-txn method has run once.
+				// Use a channel length of size 1 to guarantee a notification through a
+				// non-blocking send.
+				notify := make(chan struct{}, 1)
+				sender.reset(notify)
 				// We must try the non-txn put or get in a goroutine because
 				// it might have to retry and will only succeed immediately in
 				// the event we can push.
 				go func() {
 					var pErr *roachpb.Error
-					for i := 0; ; i++ {
+					for {
 						if _, ok := test.args.(*roachpb.GetRequest); ok {
 							_, pErr = db.Get(key)
 						} else {
 							pErr = db.Put(key, "value")
 						}
+						// The above Get/Put() calls Send() which releases
+						// notify below; the txn proceeds to succeed.
+						// The above Get/Put() is repeated until no WriteIntentError
+						// is seen.
 						if _, ok := pErr.GetDetail().(*roachpb.WriteIntentError); !ok {
 							break
 						}
@@ -191,7 +194,7 @@ func TestClientRetryNonTxn(t *testing.T) {
 						t.Fatalf("%d: expected success on non-txn call to %s; got %s", i, test.args.Method(), pErr)
 					}
 				}()
-				sender.wait()
+				<-notify
 			}
 			return nil
 		})
@@ -234,7 +237,7 @@ func setTxnRetryBackoff(backoff time.Duration) func() {
 // TestClientRunTransaction verifies some simple transaction isolation
 // semantics.
 func TestClientRunTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	defer setTxnRetryBackoff(1 * time.Millisecond)()
@@ -295,7 +298,7 @@ func TestClientRunTransaction(t *testing.T) {
 // TestClientGetAndPutProto verifies gets and puts of protobufs using the
 // client's convenience methods.
 func TestClientGetAndPutProto(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
@@ -316,7 +319,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 
 	readZoneConfig := &config.ZoneConfig{}
 	if pErr := db.GetProto(key, readZoneConfig); pErr != nil {
-		t.Fatalf("unable to get proto: %v", pErr)
+		t.Fatalf("unable to get proto: %s", pErr)
 	}
 	if !proto.Equal(zoneConfig, readZoneConfig) {
 		t.Errorf("expected %+v, but found %+v", zoneConfig, readZoneConfig)
@@ -326,7 +329,7 @@ func TestClientGetAndPutProto(t *testing.T) {
 // TestClientGetAndPut verifies gets and puts of using the client's convenience
 // methods.
 func TestClientGetAndPut(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
@@ -337,13 +340,35 @@ func TestClientGetAndPut(t *testing.T) {
 	}
 	gr, pErr := db.Get(testUser + "/key")
 	if pErr != nil {
-		t.Fatalf("unable to get value: %v", pErr)
-	}
-	if gr.Timestamp().IsZero() {
-		t.Error("expected non-zero timestamp")
+		t.Fatalf("unable to get value: %s", pErr)
 	}
 	if !bytes.Equal(value, gr.ValueBytes()) {
 		t.Errorf("expected values equal; %s != %s", value, gr.ValueBytes())
+	}
+	if gr.Value.Timestamp.Equal(roachpb.ZeroTimestamp) {
+		t.Fatalf("expected non-zero timestamp; got empty")
+	}
+}
+
+func TestClientPutInline(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := server.StartTestServer(t)
+	defer s.Stop()
+	db := createTestClient(t, s.Stopper(), s.ServingAddr())
+
+	value := []byte("value")
+	if pErr := db.PutInline(testUser+"/key", value); pErr != nil {
+		t.Fatalf("unable to put value: %s", pErr)
+	}
+	gr, pErr := db.Get(testUser + "/key")
+	if pErr != nil {
+		t.Fatalf("unable to get value: %s", pErr)
+	}
+	if !bytes.Equal(value, gr.ValueBytes()) {
+		t.Errorf("expected values equal; %s != %s", value, gr.ValueBytes())
+	}
+	if ts := gr.Value.Timestamp; !ts.Equal(roachpb.ZeroTimestamp) {
+		t.Fatalf("expected zero timestamp; got %s", ts)
 	}
 }
 
@@ -353,7 +378,7 @@ func TestClientGetAndPut(t *testing.T) {
 // gob codec because gob treats pointer values and non-pointer values
 // as equivalent and elides zero-valued defaults on decode.
 func TestClientEmptyValues(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
@@ -381,14 +406,11 @@ func TestClientEmptyValues(t *testing.T) {
 
 // TestClientBatch runs a batch of increment calls and then verifies the
 // results.
-// TODO(tschottdorf): some assertions disabled, see #1891.
 func TestClientBatch(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
-
-	skipBecauseOf1891 := true // TODO(tschottdorf): remove when unnecessary
 
 	keys := []roachpb.Key{}
 	{
@@ -418,27 +440,44 @@ func TestClientBatch(t *testing.T) {
 		if pErr := db.Run(b); pErr != nil {
 			t.Error(pErr)
 		}
+		client.CheckKVs(t, b.Results[0].Rows, keys[0], 0, keys[1], 1, keys[2], 2, keys[3], 3, keys[4], 4)
+		client.CheckKVs(t, b.Results[1].Rows, keys[5], 5, keys[6], 6, keys[7], 7, keys[8], 8, keys[9], 9)
+	}
 
-		scan1 := b.Results[0].Rows
-		scan2 := b.Results[1].Rows
-		if len(scan1) != 5 || len(scan2) != 5 {
-			t.Fatalf("expected scan results to include 5 and 5 rows; got %d and %d",
-				len(scan1), len(scan2))
+	// Try a limited batch of 2 scans.
+	{
+		b := &client.Batch{MaxScanResults: 7}
+		b.Scan(testUser+"/key 00", testUser+"/key 05", 0)
+		b.Scan(testUser+"/key 05", testUser+"/key 10", 0)
+		if pErr := db.Run(b); pErr != nil {
+			t.Error(pErr)
 		}
-		for i := 0; i < 5; i++ {
-			if key := roachpb.Key(scan1[i].Key); !key.Equal(keys[i]) {
-				t.Errorf("expected scan1 key %d to be %q; got %q", i, keys[i], key)
-			}
-			if val := scan1[i].ValueInt(); val != int64(i) {
-				t.Errorf("expected scan1 result %d to be %d; got %d", i, i, val)
-			}
-			if key := roachpb.Key(scan2[i].Key); !key.Equal(keys[i+5]) {
-				t.Errorf("expected scan2 key %d to be %q; got %q", i, keys[i+5], key)
-			}
-			if val := scan2[i].ValueInt(); val != int64(i+5) {
-				t.Errorf("expected scan2 result %d to be %d; got %d", i, i+5, val)
-			}
+		client.CheckKVs(t, b.Results[0].Rows, keys[0], 0, keys[1], 1, keys[2], 2, keys[3], 3, keys[4], 4)
+		client.CheckKVs(t, b.Results[1].Rows, keys[5], 5, keys[6], 6)
+	}
+
+	// Try a limited batch of 2 scans.
+	{
+		b := &client.Batch{MaxScanResults: 7}
+		b.Scan(testUser+"/key 05", testUser+"/key 10", 0)
+		b.Scan(testUser+"/key 00", testUser+"/key 05", 0)
+		if pErr := db.Run(b); pErr != nil {
+			t.Error(pErr)
 		}
+		client.CheckKVs(t, b.Results[0].Rows, keys[5], 5, keys[6], 6, keys[7], 7, keys[8], 8, keys[9], 9)
+		client.CheckKVs(t, b.Results[1].Rows, keys[0], 0, keys[1], 1)
+	}
+
+	// Try a limited batch of 2 scans.
+	{
+		b := &client.Batch{MaxScanResults: 3}
+		b.Scan(testUser+"/key 00", testUser+"/key 05", 0)
+		b.Scan(testUser+"/key 05", testUser+"/key 10", 0)
+		if pErr := db.Run(b); pErr != nil {
+			t.Error(pErr)
+		}
+		client.CheckKVs(t, b.Results[0].Rows, keys[0], 0, keys[1], 1, keys[2], 2)
+		client.CheckKVs(t, b.Results[1].Rows)
 	}
 
 	// Try 2 reverse scans.
@@ -449,30 +488,44 @@ func TestClientBatch(t *testing.T) {
 		if pErr := db.Run(b); pErr != nil {
 			t.Error(pErr)
 		}
+		client.CheckKVs(t, b.Results[0].Rows, keys[4], 4, keys[3], 3, keys[2], 2, keys[1], 1, keys[0], 0)
+		client.CheckKVs(t, b.Results[1].Rows, keys[9], 9, keys[8], 8, keys[7], 7, keys[6], 6, keys[5], 5)
+	}
 
-		revScan1 := b.Results[0].Rows
-		revScan2 := b.Results[1].Rows
-		expectedCount := 5
-		rev1TopIndex := 4
-		rev2TopIndex := 9
-		if len(revScan1) != expectedCount || len(revScan2) != expectedCount {
-			t.Errorf("expected reverse scan results to include 5 and 5 rows; got %d and %d",
-				len(revScan1), len(revScan2))
+	// Try a limited batch of 2 reverse scans.
+	{
+		b := &client.Batch{MaxScanResults: 7}
+		b.ReverseScan(testUser+"/key 00", testUser+"/key 05", 0)
+		b.ReverseScan(testUser+"/key 05", testUser+"/key 10", 0)
+		if pErr := db.Run(b); pErr != nil {
+			t.Error(pErr)
 		}
-		for i := 0; i < expectedCount; i++ {
-			if key := roachpb.Key(revScan1[i].Key); !key.Equal(keys[rev1TopIndex-i]) {
-				t.Errorf("expected revScan1 key %d to be %q; got %q", i, keys[rev1TopIndex-i], key)
-			}
-			if val := revScan1[i].ValueInt(); val != int64(rev1TopIndex-i) {
-				t.Errorf("expected revScan1 result %d to be %d; got %d", i, rev1TopIndex-i, val)
-			}
-			if key := roachpb.Key(revScan2[i].Key); !key.Equal(keys[rev2TopIndex-i]) {
-				t.Errorf("expected revScan2 key %d to be %q; got %q", i, keys[rev2TopIndex-i], key)
-			}
-			if val := revScan2[i].ValueInt(); val != int64(rev2TopIndex-i) {
-				t.Errorf("expected revScan2 result %d to be %d; got %d", i, rev2TopIndex-i, val)
-			}
+		client.CheckKVs(t, b.Results[0].Rows, keys[4], 4, keys[3], 3, keys[2], 2, keys[1], 1, keys[0], 0)
+		client.CheckKVs(t, b.Results[1].Rows, keys[9], 9, keys[8], 8)
+	}
+
+	// Try a limited batch of 2 reverse scans.
+	{
+		b := &client.Batch{MaxScanResults: 7}
+		b.ReverseScan(testUser+"/key 05", testUser+"/key 10", 0)
+		b.ReverseScan(testUser+"/key 00", testUser+"/key 05", 0)
+		if pErr := db.Run(b); pErr != nil {
+			t.Error(pErr)
 		}
+		client.CheckKVs(t, b.Results[0].Rows, keys[9], 9, keys[8], 8, keys[7], 7, keys[6], 6, keys[5], 5)
+		client.CheckKVs(t, b.Results[1].Rows, keys[4], 4, keys[3], 3)
+	}
+
+	// Try a limited batch of 2 reverse scans.
+	{
+		b := &client.Batch{MaxScanResults: 3}
+		b.ReverseScan(testUser+"/key 00", testUser+"/key 05", 0)
+		b.ReverseScan(testUser+"/key 05", testUser+"/key 10", 0)
+		if pErr := db.Run(b); pErr != nil {
+			t.Error(pErr)
+		}
+		client.CheckKVs(t, b.Results[0].Rows, keys[4], 4, keys[3], 3, keys[2], 2)
+		client.CheckKVs(t, b.Results[1].Rows)
 	}
 
 	// Induce a non-transactional failure.
@@ -494,7 +547,7 @@ func TestClientBatch(t *testing.T) {
 					break
 				}
 			}
-			if !foundError && !skipBecauseOf1891 {
+			if !foundError {
 				t.Error("results did not contain an error")
 			}
 		}
@@ -521,7 +574,7 @@ func TestClientBatch(t *testing.T) {
 					break
 				}
 			}
-			if !foundError && !skipBecauseOf1891 {
+			if !foundError {
 				t.Error("results did not contain an error")
 			}
 		}
@@ -603,7 +656,7 @@ func concurrentIncrements(db *client.DB, t *testing.T) {
 // for the concrete situation described in:
 // https://groups.google.com/forum/#!topic/cockroach-db/LdrC5_T0VNw
 func TestConcurrentIncrements(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
@@ -612,7 +665,7 @@ func TestConcurrentIncrements(t *testing.T) {
 	// more often. It'll increase test duration though.
 	for k := 0; k < 5; k++ {
 		if pErr := db.DelRange(testUser+"/value-0", testUser+"/value-1x"); pErr != nil {
-			t.Fatalf("%d: unable to clean up: %v", k, pErr)
+			t.Fatalf("%d: unable to clean up: %s", k, pErr)
 		}
 		concurrentIncrements(db, t)
 	}
@@ -620,7 +673,7 @@ func TestConcurrentIncrements(t *testing.T) {
 
 // TestClientPermissions verifies permission enforcement.
 func TestClientPermissions(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 
@@ -632,7 +685,7 @@ func TestClientPermissions(t *testing.T) {
 	testCases := []struct {
 		path    string
 		client  *client.DB
-		success bool
+		allowed bool
 	}{
 		{"foo", rootClient, false},
 		{"foo", nodeClient, true},
@@ -651,14 +704,68 @@ func TestClientPermissions(t *testing.T) {
 	}
 
 	value := []byte("value")
+	const matchErr = "is not allowed"
 	for tcNum, tc := range testCases {
 		pErr := tc.client.Put(tc.path, value)
-		if pErr == nil != tc.success {
-			t.Errorf("#%d: expected success=%t, got err=%s", tcNum, tc.success, pErr)
+		if (pErr == nil) != tc.allowed || (!tc.allowed && !testutils.IsPError(pErr, matchErr)) {
+			t.Errorf("#%d: expected allowed=%t, got err=%s", tcNum, tc.allowed, pErr)
 		}
 		_, pErr = tc.client.Get(tc.path)
-		if pErr == nil != tc.success {
-			t.Errorf("#%d: expected success=%t, got err=%s", tcNum, tc.success, pErr)
+		if (pErr == nil) != tc.allowed || (!tc.allowed && !testutils.IsPError(pErr, matchErr)) {
+			t.Errorf("#%d: expected allowed=%t, got err=%s", tcNum, tc.allowed, pErr)
+		}
+	}
+}
+
+// TestInconsistentReads tests that the methods that generate inconsistent reads
+// generate outgoing requests with an INCONSISTENT read consistency.
+func TestInconsistentReads(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Mock out DistSender's sender function to check the read consistency for
+	// outgoing BatchRequests and return an empty reply.
+	var senderFn client.SenderFunc
+	senderFn = func(_ context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
+		if ba.ReadConsistency != roachpb.INCONSISTENT {
+			return nil, roachpb.NewErrorf("BatchRequest has unexpected ReadConsistency %s",
+				ba.ReadConsistency)
+		}
+		return ba.CreateReply(), nil
+	}
+	db := client.NewDB(senderFn)
+
+	// Perform inconsistent reads through the mocked sender function.
+	{
+		key := roachpb.Key([]byte("key"))
+		if _, pErr := db.GetInconsistent(key); pErr != nil {
+			t.Fatal(pErr)
+		}
+	}
+
+	{
+		key := roachpb.Key([]byte("key"))
+		var p roachpb.BatchRequest
+		if pErr := db.GetProtoInconsistent(key, &p); pErr != nil {
+			t.Fatal(pErr)
+		}
+	}
+
+	{
+		key1 := roachpb.Key([]byte("key1"))
+		key2 := roachpb.Key([]byte("key2"))
+		const dontCareMaxRows = 1000
+		if _, pErr := db.ScanInconsistent(key1, key2, dontCareMaxRows); pErr != nil {
+			t.Fatal(pErr)
+		}
+	}
+
+	{
+		key := roachpb.Key([]byte("key"))
+		ba := db.NewBatch()
+		ba.ReadConsistency = roachpb.INCONSISTENT
+		ba.Get(key)
+		if pErr := db.Run(ba); pErr != nil {
+			t.Fatal(pErr)
 		}
 	}
 }

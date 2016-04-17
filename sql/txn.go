@@ -36,22 +36,6 @@ func (p *planner) BeginTransaction(n *parser.BeginTransaction) (planNode, error)
 	return &emptyNode{}, nil
 }
 
-// CommitTransaction commits a transaction.
-func (p *planner) CommitTransaction(n *parser.CommitTransaction) (planNode, *roachpb.Error) {
-	pErr := p.txn.Commit()
-	// Reset transaction.
-	p.resetTxn()
-	return &emptyNode{}, pErr
-}
-
-// RollbackTransaction rolls back a transaction.
-func (p *planner) RollbackTransaction(n *parser.RollbackTransaction) (planNode, *roachpb.Error) {
-	pErr := p.txn.Rollback()
-	// Reset transaction.
-	p.resetTxn()
-	return &emptyNode{}, pErr
-}
-
 // SetTransaction sets a transaction's isolation level
 func (p *planner) SetTransaction(n *parser.SetTransaction) (planNode, error) {
 	if err := p.setIsolationLevel(n.Isolation); err != nil {
@@ -81,10 +65,22 @@ func (p *planner) setUserPriority(userPriority parser.UserPriority) error {
 	case parser.UnspecifiedUserPriority:
 		return nil
 	case parser.Low:
+		if p.execCtx.TestingKnobs.FixTxnPriority {
+			p.txn.InternalSetPriority(1)
+			return nil
+		}
 		return p.txn.SetUserPriority(roachpb.LowUserPriority)
 	case parser.Normal:
+		if p.execCtx.TestingKnobs.FixTxnPriority {
+			p.txn.InternalSetPriority(10000)
+			return nil
+		}
 		return p.txn.SetUserPriority(roachpb.NormalUserPriority)
 	case parser.High:
+		if p.execCtx.TestingKnobs.FixTxnPriority {
+			p.txn.InternalSetPriority(1000000000)
+			return nil
+		}
 		return p.txn.SetUserPriority(roachpb.HighUserPriority)
 	default:
 		return util.Errorf("unknown user priority: %s", userPriority)

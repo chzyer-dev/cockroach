@@ -101,18 +101,19 @@ func NewErrorf(format string, a ...interface{}) *Error {
 
 // String implements fmt.Stringer.
 func (e *Error) String() string {
+	if e == nil {
+		return "<nil>"
+	}
 	return e.Message
 }
 
 type internalError Error
 
-// Error implements error.
 func (e *internalError) Error() string {
 	return (*Error)(e).String()
 }
 
-// message returns an error message.
-func (e *internalError) message(pErr *Error) string {
+func (e *internalError) message(_ *Error) string {
 	return (*Error)(e).String()
 }
 
@@ -121,7 +122,6 @@ func (e *internalError) CanRetry() bool {
 	return e.Retryable
 }
 
-// canRestartTransaction implements the transactionRestartError interface.
 func (e *internalError) canRestartTransaction() TransactionRestart {
 	return e.TransactionRestart
 }
@@ -131,7 +131,7 @@ var _ ErrorDetailInterface = &internalError{}
 // ErrorDetailInterface is an interface for each error detail.
 type ErrorDetailInterface interface {
 	// message returns an error message.
-	message(pErr *Error) string
+	message(*Error) string
 }
 
 // CanRetry implements the retry.Retryable interface.
@@ -192,6 +192,9 @@ func (e *Error) SetTxn(txn *Transaction) {
 
 // GetTxn returns the txn.
 func (e *Error) GetTxn() *Transaction {
+	if e == nil {
+		return nil
+	}
 	return e.UnexposedTxn
 }
 
@@ -200,37 +203,47 @@ func (e *Error) SetErrorIndex(index int32) {
 	e.Index = &ErrPosition{Index: index}
 }
 
-// Error formats error.
+// StripErrorTransaction strips the txn information in the error.
+func (e *Error) StripErrorTransaction() {
+	// Do not call SetTxn() as we do not want to update e.Message with nil txn.
+	e.UnexposedTxn = nil
+}
+
+func (e *ErrorWithPGCode) Error() string {
+	return e.message(nil)
+}
+
+func (e *ErrorWithPGCode) message(_ *Error) string {
+	return e.Message
+}
+
+var _ ErrorDetailInterface = &ErrorWithPGCode{}
+
 func (e *NodeUnavailableError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (*NodeUnavailableError) message(pErr *Error) string {
+func (*NodeUnavailableError) message(_ *Error) string {
 	return "node unavailable; try another peer"
 }
 
 var _ ErrorDetailInterface = &NodeUnavailableError{}
 
-// Error formats error.
 func (e *NotLeaderError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *NotLeaderError) message(pErr *Error) string {
+func (e *NotLeaderError) message(_ *Error) string {
 	return fmt.Sprintf("range %d: replica %s not leader; leader is %s", e.RangeID, e.Replica, e.Leader)
 }
 
 var _ ErrorDetailInterface = &NotLeaderError{}
 
-// Error formats error.
 func (e *LeaseRejectedError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *LeaseRejectedError) message(pErr *Error) string {
+func (e *LeaseRejectedError) message(_ *Error) string {
 	return fmt.Sprintf("cannot replace lease %s with %s: %s", e.Existing, e.Requested, e.Message)
 }
 
@@ -249,13 +262,11 @@ func NewSendError(msg string, canRetry bool) *SendError {
 	return &SendError{Message: msg, Retryable: canRetry}
 }
 
-// Error formats error.
 func (s SendError) Error() string {
 	return s.message(nil)
 }
 
-// message returns an error message.
-func (s *SendError) message(pErr *Error) string {
+func (s *SendError) message(_ *Error) string {
 	return "failed to send RPC: " + s.Message
 }
 
@@ -271,13 +282,11 @@ func NewRangeNotFoundError(rangeID RangeID) *RangeNotFoundError {
 	}
 }
 
-// Error formats error.
 func (e *RangeNotFoundError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *RangeNotFoundError) message(pErr *Error) string {
+func (e *RangeNotFoundError) message(_ *Error) string {
 	return fmt.Sprintf("range %d was not found", e.RangeID)
 }
 
@@ -293,20 +302,18 @@ func NewRangeKeyMismatchError(start, end Key, desc *RangeDescriptor) *RangeKeyMi
 	return &RangeKeyMismatchError{
 		RequestStartKey: start,
 		RequestEndKey:   end,
-		Range:           desc,
+		MismatchedRange: desc,
 	}
 }
 
-// Error formats error.
 func (e *RangeKeyMismatchError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *RangeKeyMismatchError) message(pErr *Error) string {
-	if e.Range != nil {
+func (e *RangeKeyMismatchError) message(_ *Error) string {
+	if e.MismatchedRange != nil {
 		return fmt.Sprintf("key range %s-%s outside of bounds of range %s-%s",
-			e.RequestStartKey, e.RequestEndKey, e.Range.StartKey, e.Range.EndKey)
+			e.RequestStartKey, e.RequestEndKey, e.MismatchedRange.StartKey, e.MismatchedRange.EndKey)
 	}
 	return fmt.Sprintf("key range %s-%s could not be located within a range on store", e.RequestStartKey, e.RequestEndKey)
 }
@@ -318,12 +325,10 @@ func (*RangeKeyMismatchError) CanRetry() bool {
 
 var _ ErrorDetailInterface = &RangeNotFoundError{}
 
-// Error formats error.
 func (e *TransactionAbortedError) Error() string {
 	return fmt.Sprintf("txn aborted")
 }
 
-// message returns an error message.
 func (e *TransactionAbortedError) message(pErr *Error) string {
 	return fmt.Sprintf("txn aborted %s", pErr.GetTxn())
 }
@@ -331,7 +336,6 @@ func (e *TransactionAbortedError) message(pErr *Error) string {
 var _ ErrorDetailInterface = &TransactionAbortedError{}
 var _ transactionRestartError = &TransactionAbortedError{}
 
-// canRestartTransaction implements the transactionRestartError interface.
 func (*TransactionAbortedError) canRestartTransaction() TransactionRestart {
 	return TransactionRestart_BACKOFF
 }
@@ -344,15 +348,15 @@ func NewTransactionAbortedError() *TransactionAbortedError {
 // NewTransactionPushError initializes a new TransactionPushError.
 // The argument is copied.
 func NewTransactionPushError(pusheeTxn Transaction) *TransactionPushError {
+	// Note: this error will cause a txn restart. The error that the client
+	// receives contains a txn that might have a modified priority.
 	return &TransactionPushError{PusheeTxn: pusheeTxn.Clone()}
 }
 
-// Error formats error.
 func (e *TransactionPushError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
 func (e *TransactionPushError) message(pErr *Error) string {
 	if pErr.GetTxn() == nil {
 		return fmt.Sprintf("failed to push %s", e.PusheeTxn)
@@ -363,7 +367,6 @@ func (e *TransactionPushError) message(pErr *Error) string {
 var _ ErrorDetailInterface = &TransactionPushError{}
 var _ transactionRestartError = &TransactionPushError{}
 
-// canRestartTransaction implements the transactionRestartError interface.
 func (*TransactionPushError) canRestartTransaction() TransactionRestart {
 	return TransactionRestart_BACKOFF
 }
@@ -373,14 +376,12 @@ func NewTransactionRetryError() *TransactionRetryError {
 	return &TransactionRetryError{}
 }
 
-// Error formats error.
 // TODO(kaneda): Delete this method once we fully unimplement error for every
 // error detail.
 func (e *TransactionRetryError) Error() string {
 	return fmt.Sprintf("retry txn")
 }
 
-// message returns an error message.
 func (e *TransactionRetryError) message(pErr *Error) string {
 	return fmt.Sprintf("retry txn %s", pErr.GetTxn())
 }
@@ -388,10 +389,24 @@ func (e *TransactionRetryError) message(pErr *Error) string {
 var _ ErrorDetailInterface = &TransactionRetryError{}
 var _ transactionRestartError = &TransactionRetryError{}
 
-// canRestartTransaction implements the transactionRestartError interface.
 func (*TransactionRetryError) canRestartTransaction() TransactionRestart {
 	return TransactionRestart_IMMEDIATE
 }
+
+// NewTransactionReplayError initializes a new TransactionReplayError.
+func NewTransactionReplayError() *TransactionReplayError {
+	return &TransactionReplayError{}
+}
+
+func (e *TransactionReplayError) Error() string {
+	return fmt.Sprintf("replay txn")
+}
+
+func (e *TransactionReplayError) message(pErr *Error) string {
+	return fmt.Sprintf("replay txn %s", pErr.GetTxn())
+}
+
+var _ ErrorDetailInterface = &TransactionReplayError{}
 
 // NewTransactionStatusError initializes a new TransactionStatusError from
 // the given message.
@@ -399,25 +414,21 @@ func NewTransactionStatusError(msg string) *TransactionStatusError {
 	return &TransactionStatusError{Msg: msg}
 }
 
-// Error formats error.
 func (e *TransactionStatusError) Error() string {
 	return e.Msg
 }
 
-// message returns an error message.
 func (e *TransactionStatusError) message(pErr *Error) string {
 	return fmt.Sprintf("txn %s: %s", pErr.GetTxn(), e.Msg)
 }
 
 var _ ErrorDetailInterface = &TransactionStatusError{}
 
-// Error formats error.
 func (e *WriteIntentError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *WriteIntentError) message(pErr *Error) string {
+func (e *WriteIntentError) message(_ *Error) string {
 	var keys []Key
 	for _, intent := range e.Intents {
 		keys = append(keys, intent.Key)
@@ -427,127 +438,115 @@ func (e *WriteIntentError) message(pErr *Error) string {
 
 var _ ErrorDetailInterface = &WriteIntentError{}
 
-// Error formats error.
 func (e *WriteTooOldError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *WriteTooOldError) message(pErr *Error) string {
-	return fmt.Sprintf("write too old: timestamp %s <= %s", e.Timestamp, e.ExistingTimestamp)
+func (e *WriteTooOldError) message(_ *Error) string {
+	return fmt.Sprintf("write at timestamp %s too old; wrote at %s", e.Timestamp, e.ActualTimestamp)
 }
 
 var _ ErrorDetailInterface = &WriteTooOldError{}
+var _ transactionRestartError = &WriteTooOldError{}
 
-// Error formats error.
+func (*WriteTooOldError) canRestartTransaction() TransactionRestart {
+	return TransactionRestart_IMMEDIATE
+}
+
+// NewReadWithinUncertaintyIntervalError creates a new uncertainty retry error.
+// The read and existing timestamps are purely informational and used for
+// formatting the error message.
+func NewReadWithinUncertaintyIntervalError(readTS, existingTS Timestamp) *ReadWithinUncertaintyIntervalError {
+	return &ReadWithinUncertaintyIntervalError{
+		ReadTimestamp:     readTS,
+		ExistingTimestamp: existingTS,
+	}
+}
+
 func (e *ReadWithinUncertaintyIntervalError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *ReadWithinUncertaintyIntervalError) message(pErr *Error) string {
-	return fmt.Sprintf("read at time %s encountered previous write with future timestamp %s within uncertainty interval", e.Timestamp, e.ExistingTimestamp)
+func (e *ReadWithinUncertaintyIntervalError) message(_ *Error) string {
+	return fmt.Sprintf("read at time %s encountered previous write with future timestamp %s within uncertainty interval", e.ReadTimestamp, e.ExistingTimestamp)
 }
 
 var _ ErrorDetailInterface = &ReadWithinUncertaintyIntervalError{}
 var _ transactionRestartError = &ReadWithinUncertaintyIntervalError{}
 
-// canRestartTransaction implements the transactionRestartError interface.
 func (*ReadWithinUncertaintyIntervalError) canRestartTransaction() TransactionRestart {
 	return TransactionRestart_IMMEDIATE
 }
 
-// Error formats error.
 func (e *OpRequiresTxnError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *OpRequiresTxnError) message(pErr *Error) string {
+func (e *OpRequiresTxnError) message(_ *Error) string {
 	return "the operation requires transactional context"
 }
 
 var _ ErrorDetailInterface = &OpRequiresTxnError{}
 
-// Error formats error.
 func (e *ConditionFailedError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *ConditionFailedError) message(pErr *Error) string {
+func (e *ConditionFailedError) message(_ *Error) string {
 	return fmt.Sprintf("unexpected value: %s", e.ActualValue)
 }
 
 var _ ErrorDetailInterface = &ConditionFailedError{}
 
-// Error formats error.
 func (e *RaftGroupDeletedError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (*RaftGroupDeletedError) message(pErr *Error) string {
+func (*RaftGroupDeletedError) message(_ *Error) string {
 	return "raft group deleted"
 }
 
 var _ ErrorDetailInterface = &RaftGroupDeletedError{}
 
-// Error formats error.
 func (e *ReplicaCorruptionError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (e *ReplicaCorruptionError) message(pErr *Error) string {
-	return fmt.Sprintf("replica corruption (processed=%t): %s", e.Processed, e.ErrorMsg)
+func (e *ReplicaCorruptionError) message(_ *Error) string {
+	msg := fmt.Sprintf("replica corruption (processed=%t)", e.Processed)
+	if e.ErrorMsg != "" {
+		msg += ": " + e.ErrorMsg
+	}
+	return msg
 }
 
 var _ ErrorDetailInterface = &ReplicaCorruptionError{}
 
-// Error formats error.
 func (e *LeaseVersionChangedError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (*LeaseVersionChangedError) message(pErr *Error) string {
+func (*LeaseVersionChangedError) message(_ *Error) string {
 	return "lease version changed"
 }
 
 var _ ErrorDetailInterface = &LeaseVersionChangedError{}
 
-// Error formats error.
 func (e *DidntUpdateDescriptorError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (*DidntUpdateDescriptorError) message(pErr *Error) string {
+func (*DidntUpdateDescriptorError) message(_ *Error) string {
 	return "didn't update the table descriptor"
 }
 
 var _ ErrorDetailInterface = &DidntUpdateDescriptorError{}
 
-// Error formats error.
-func (e *SqlTransactionAbortedError) Error() string {
-	return e.message(nil)
-}
-
-// message returns an error message.
-func (*SqlTransactionAbortedError) message(pErr *Error) string {
-	return "current transaction is aborted, commands ignored until end of transaction block"
-}
-
-var _ ErrorDetailInterface = &SqlTransactionAbortedError{}
-
-// Error formats error.
 func (e *ExistingSchemaChangeLeaseError) Error() string {
 	return e.message(nil)
 }
 
-// message returns an error message.
-func (*ExistingSchemaChangeLeaseError) message(pErr *Error) string {
+func (*ExistingSchemaChangeLeaseError) message(_ *Error) string {
 	return "an outstanding schema change lease exists"
 }
 

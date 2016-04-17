@@ -18,16 +18,19 @@ package roachpb
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"math/rand"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"gopkg.in/inf.v0"
 
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/randutil"
 	"github.com/cockroachdb/cockroach/util/uuid"
 )
 
@@ -43,19 +46,36 @@ func TestKeyNext(t *testing.T) {
 		t.Errorf("expected next key to be greater")
 	}
 
+	extraCap := make([]byte, 2, 4)
+	extraCap[0] = 'x'
+	extraCap[1] = 'o'
+
+	noExtraCap := make([]byte, 2, 2)
+	noExtraCap[0] = 'x'
+	noExtraCap[1] = 'o'
+
 	testCases := []struct {
-		key  Key
-		next Key
+		key           Key
+		next          Key
+		expReallocate int // 0 for don't test, -1 for not expected, 1 for expected.
 	}{
-		{nil, Key("\x00")},
-		{Key(""), Key("\x00")},
-		{Key("test key"), Key("test key\x00")},
-		{Key("\xff"), Key("\xff\x00")},
-		{Key("xoxo\x00"), Key("xoxo\x00\x00")},
+		{nil, Key("\x00"), 0},
+		{Key(""), Key("\x00"), 0},
+		{Key("test key"), Key("test key\x00"), 0},
+		{Key("\xff"), Key("\xff\x00"), 0},
+		{Key("xoxo\x00"), Key("xoxo\x00\x00"), 0},
+		{Key(extraCap), Key("xo\x00"), -1},
+		{Key(noExtraCap), Key("xo\x00"), 1},
 	}
 	for i, c := range testCases {
-		if !bytes.Equal(c.key.Next(), c.next) {
-			t.Errorf("%d: unexpected next bytes for %q: %q", i, c.key, c.key.Next())
+		next := c.key.Next()
+		if !bytes.Equal(next, c.next) {
+			t.Errorf("%d: unexpected next bytes for %q: %q", i, c.key, next)
+		}
+		if c.expReallocate != 0 {
+			if expect, reallocated := c.expReallocate > 0, (&next[0] != &c.key[0]); expect != reallocated {
+				t.Errorf("%d: unexpected next reallocation = %t, found reallocation = %t", i, expect, reallocated)
+			}
 		}
 	}
 }
@@ -291,6 +311,12 @@ func TestValueChecksumWithBytes(t *testing.T) {
 	if err := v.Verify(k); err == nil {
 		t.Error("expected checksum verification failure on different value")
 	}
+	// Test ClearChecksum and reinitialization of checksum.
+	v.ClearChecksum()
+	v.InitChecksum(k)
+	if err := v.Verify(k); err != nil {
+		t.Error(err)
+	}
 }
 
 func TestSetGetChecked(t *testing.T) {
@@ -396,21 +422,21 @@ func TestTransactionString(t *testing.T) {
 	ts1 := makeTS(10, 11)
 	txn := Transaction{
 		TxnMeta: TxnMeta{
+			Isolation: SERIALIZABLE,
 			Key:       Key("foo"),
 			ID:        txnID,
 			Epoch:     2,
 			Timestamp: makeTS(20, 21),
+			Priority:  957356782,
 		},
 		Name:          "name",
-		Priority:      957356782,
-		Isolation:     SERIALIZABLE,
 		Status:        COMMITTED,
 		LastHeartbeat: &ts1,
 		OrigTimestamp: makeTS(30, 31),
 		MaxTimestamp:  makeTS(40, 41),
 	}
 	expStr := `"name" id=d7aa0f5e key="foo" rw=false pri=44.58039917 iso=SERIALIZABLE stat=COMMITTED ` +
-		`epo=2 ts=0.000000020,21 orig=0.000000030,31 max=0.000000040,41`
+		`epo=2 ts=0.000000020,21 orig=0.000000030,31 max=0.000000040,41 wto=false`
 
 	if str := txn.String(); str != expStr {
 		t.Errorf("expected txn %s; got %s", expStr, str)
@@ -418,55 +444,72 @@ func TestTransactionString(t *testing.T) {
 
 	var txnEmpty Transaction
 	_ = txnEmpty.String() // prevent regression of NPE
-}
 
-// TestNodeList verifies that its exported methods Add() and Contain()
-// operate as expected.
-func TestNodeList(t *testing.T) {
-	sn := NodeList{}
-	items := append([]int{109, 104, 102, 108, 1000}, rand.Perm(100)...)
-	for i := range items {
-		n := NodeID(items[i])
-		if sn.Contains(n) {
-			t.Fatalf("%d: false positive hit for %d on slice %v",
-				i, n, sn.Nodes)
-		}
-		// Add this item and, for good measure, all the previous ones.
-		for j := i; j >= 0; j-- {
-			sn.Add(NodeID(items[j]))
-		}
-		if nodes := sn.Nodes; len(nodes) != i+1 {
-			t.Fatalf("%d: missing values or duplicates: %v",
-				i, nodes)
-		}
-		if !sn.Contains(n) {
-			t.Fatalf("%d: false negative hit for %d on slice %v",
-				i, n, sn.Nodes)
-		}
+	var cmd RaftCommand
+	cmd.Cmd.Txn = &txn
+	if actStr, idStr := fmt.Sprintf("%s", &cmd), txn.ID.String(); !strings.Contains(actStr, idStr) {
+		t.Fatalf("expected to find '%s' in '%s'", idStr, actStr)
 	}
 }
 
-var ts = makeTS(10, 11)
+// TestTransactionObservedTimestamp verifies that txn.{Get,Update}ObservedTimestamp work as
+// advertised.
+func TestTransactionObservedTimestamp(t *testing.T) {
+	var txn Transaction
+	rng, seed := randutil.NewPseudoRand()
+	t.Logf("running with seed %d", seed)
+	ids := append([]int{109, 104, 102, 108, 1000}, rand.Perm(100)...)
+	timestamps := make(map[NodeID]Timestamp, len(ids))
+	for i := 0; i < len(ids); i++ {
+		timestamps[NodeID(i)] = ZeroTimestamp.Add(rng.Int63(), 0)
+	}
+	for i, n := range ids {
+		nodeID := NodeID(n)
+		if ts, ok := txn.GetObservedTimestamp(nodeID); ok {
+			t.Fatalf("%d: false positive hit %s in %v", nodeID, ts, ids[:i+1])
+		}
+		txn.UpdateObservedTimestamp(nodeID, timestamps[nodeID])
+		txn.UpdateObservedTimestamp(nodeID, MaxTimestamp) // should be noop
+		if exp, act := i+1, len(txn.ObservedTimestamps); act != exp {
+			t.Fatalf("%d: expected %d entries, got %d: %v", nodeID, exp, act, txn.ObservedTimestamps)
+		}
+	}
+	for _, m := range ids {
+		checkID := NodeID(m)
+		exp := timestamps[checkID]
+		if act, _ := txn.GetObservedTimestamp(checkID); !act.Equal(exp) {
+			t.Fatalf("%d: expected %s, got %s", checkID, exp, act)
+		}
+	}
+
+	var emptyTxn Transaction
+	ts := ZeroTimestamp.Add(1, 2)
+	emptyTxn.UpdateObservedTimestamp(NodeID(1), ts)
+	if actTS, _ := emptyTxn.GetObservedTimestamp(NodeID(1)); !actTS.Equal(ts) {
+		t.Fatalf("unexpected: %s (wanted %s)", actTS, ts)
+	}
+}
+
 var nonZeroTxn = Transaction{
 	TxnMeta: TxnMeta{
-		Key:       Key("foo"),
-		ID:        uuid.NewV4(),
-		Epoch:     2,
-		Timestamp: makeTS(20, 21),
+		Isolation:  SNAPSHOT,
+		Key:        Key("foo"),
+		ID:         uuid.NewV4(),
+		Epoch:      2,
+		Timestamp:  makeTS(20, 21),
+		Priority:   957356782,
+		Sequence:   123,
+		BatchIndex: 1,
 	},
-	Name:          "name",
-	Priority:      957356782,
-	Isolation:     SNAPSHOT,
-	Status:        COMMITTED,
-	LastHeartbeat: &Timestamp{1, 2},
-	OrigTimestamp: makeTS(30, 31),
-	MaxTimestamp:  makeTS(40, 41),
-	CertainNodes: NodeList{
-		Nodes: []NodeID{101, 103, 105},
-	},
-	Writing:  true,
-	Sequence: 123,
-	Intents:  []Span{{Key: []byte("a"), EndKey: []byte("b")}},
+	Name:               "name",
+	Status:             COMMITTED,
+	LastHeartbeat:      &Timestamp{1, 2},
+	OrigTimestamp:      makeTS(30, 31),
+	MaxTimestamp:       makeTS(40, 41),
+	ObservedTimestamps: map[NodeID]Timestamp{1: makeTS(1, 2)},
+	Writing:            true,
+	WriteTooOld:        true,
+	Intents:            []Span{{Key: []byte("a"), EndKey: []byte("b")}},
 }
 
 func TestTransactionUpdate(t *testing.T) {
@@ -510,6 +553,9 @@ func TestTransactionClone(t *testing.T) {
 	}
 	if !reflect.DeepEqual(expFields, fields) {
 		t.Fatalf("%s != %s", expFields, fields)
+	}
+	if !reflect.DeepEqual(nonZeroTxn, txn) {
+		t.Fatalf("e = %v, v = %v", nonZeroTxn, txn)
 	}
 }
 
@@ -626,6 +672,35 @@ func TestMakePriorityLimits(t *testing.T) {
 	}
 }
 
+func TestSpanOverlaps(t *testing.T) {
+	sA := Span{Key: []byte("a")}
+	sD := Span{Key: []byte("d")}
+	sAtoC := Span{Key: []byte("a"), EndKey: []byte("c")}
+	sBtoD := Span{Key: []byte("b"), EndKey: []byte("d")}
+
+	testData := []struct {
+		s1, s2   Span
+		overlaps bool
+	}{
+		{sA, sA, true},
+		{sA, sD, false},
+		{sA, sBtoD, false},
+		{sBtoD, sA, false},
+		{sD, sBtoD, false},
+		{sBtoD, sD, false},
+		{sA, sAtoC, true},
+		{sAtoC, sA, true},
+		{sAtoC, sAtoC, true},
+		{sAtoC, sBtoD, true},
+		{sBtoD, sAtoC, true},
+	}
+	for i, test := range testData {
+		if o := test.s1.Overlaps(test.s2); o != test.overlaps {
+			t.Errorf("%d: expected overlap %t; got %t between %s vs. %s", i, test.overlaps, o, test.s1, test.s2)
+		}
+	}
+}
+
 // TestRSpanContains verifies methods to check whether a key
 // or key range is contained within the span.
 func TestRSpanContains(t *testing.T) {
@@ -717,6 +792,187 @@ func TestRSpanIntersect(t *testing.T) {
 		desc.EndKey = test.endKey
 		if _, err := rs.Intersect(&desc); err == nil {
 			t.Errorf("%d: unexpected success", i)
+		}
+	}
+}
+
+func TestLeaseCovers(t *testing.T) {
+	mk := func(ds ...int64) (sl []Timestamp) {
+		for _, d := range ds {
+			sl = append(sl, ZeroTimestamp.Add(d, 0))
+		}
+		return sl
+	}
+
+	ts10 := mk(10)[0]
+	ts1K := mk(1000)[0]
+
+	for i, test := range []struct {
+		lease   Lease
+		in, out []Timestamp
+	}{
+		{
+			lease: Lease{
+				StartStasis: mk(1)[0],
+				Expiration:  ts1K,
+			},
+			in:  mk(0),
+			out: mk(1, 100, 500, 999, 1000),
+		},
+		{
+			lease: Lease{
+				Start:       ts10,
+				StartStasis: mk(500)[0],
+				Expiration:  ts1K,
+			},
+			out: mk(500, 999, 1000, 1001, 2000),
+			// Note that the lease covers timestamps before its start timestamp.
+			in: mk(0, 9, 10, 300, 499),
+		},
+	} {
+		for _, ts := range test.in {
+			if !test.lease.Covers(ts) {
+				t.Errorf("%d: should contain %s", i, ts)
+			}
+		}
+		for _, ts := range test.out {
+			if test.lease.Covers(ts) {
+				t.Errorf("%d: must not contain %s", i, ts)
+			}
+		}
+	}
+}
+
+func BenchmarkValueSetBytes(b *testing.B) {
+	v := Value{}
+	bytes := make([]byte, 16)
+
+	for i := 0; i < b.N; i++ {
+		v.SetBytes(bytes)
+	}
+}
+
+func BenchmarkValueSetFloat(b *testing.B) {
+	v := Value{}
+	f := 1.1
+
+	for i := 0; i < b.N; i++ {
+		v.SetFloat(f)
+	}
+}
+
+func BenchmarkValueSetInt(b *testing.B) {
+	v := Value{}
+	in := int64(1)
+
+	for i := 0; i < b.N; i++ {
+		v.SetInt(in)
+	}
+}
+
+func BenchmarkValueSetProto(b *testing.B) {
+	v := Value{}
+	p := &Value{}
+
+	for i := 0; i < b.N; i++ {
+		if err := v.SetProto(p); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValueSetTime(b *testing.B) {
+	v := Value{}
+	ti := time.Time{}
+
+	for i := 0; i < b.N; i++ {
+		v.SetTime(ti)
+	}
+}
+
+func BenchmarkValueSetDecimal(b *testing.B) {
+	v := Value{}
+	dec := inf.NewDec(11, 1)
+
+	for i := 0; i < b.N; i++ {
+		if err := v.SetDecimal(dec); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValueGetBytes(b *testing.B) {
+	v := Value{}
+	bytes := make([]byte, 16)
+	v.SetBytes(bytes)
+
+	for i := 0; i < b.N; i++ {
+		if _, err := v.GetBytes(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValueGetFloat(b *testing.B) {
+	v := Value{}
+	f := 1.1
+	v.SetFloat(f)
+
+	for i := 0; i < b.N; i++ {
+		if _, err := v.GetFloat(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValueGetInt(b *testing.B) {
+	v := Value{}
+	in := int64(1)
+	v.SetInt(in)
+
+	for i := 0; i < b.N; i++ {
+		if _, err := v.GetInt(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValueGetProto(b *testing.B) {
+	v := Value{}
+	p, dst := &Value{}, &Value{}
+	if err := v.SetProto(p); err != nil {
+		b.Fatal(err)
+	}
+
+	for i := 0; i < b.N; i++ {
+		if err := v.GetProto(dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValueGetTime(b *testing.B) {
+	v := Value{}
+	ti := time.Time{}
+	v.SetTime(ti)
+
+	for i := 0; i < b.N; i++ {
+		if _, err := v.GetTime(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValueGetDecimal(b *testing.B) {
+	v := Value{}
+	dec := inf.NewDec(11, 1)
+	if err := v.SetDecimal(dec); err != nil {
+		b.Fatal(err)
+	}
+
+	for i := 0; i < b.N; i++ {
+		if _, err := v.GetDecimal(); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

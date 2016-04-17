@@ -18,6 +18,7 @@ package encoding
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"reflect"
@@ -28,6 +29,7 @@ import (
 	"gopkg.in/inf.v0"
 
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/duration"
 )
 
 const (
@@ -37,29 +39,40 @@ const (
 	// it's used in keys used as span boundaries for index scans.
 	encodedNotNull = 0x01
 
-	floatNaN              = encodedNotNull + 1
-	floatNegativeInfinity = floatNaN + 1
-	floatNegLarge         = floatNegativeInfinity + 1
-	floatNegMedium        = floatNegLarge + 11
-	floatNegSmall         = floatNegMedium + 1
-	floatZero             = floatNegSmall + 1
-	floatPosSmall         = floatZero + 1
-	floatPosMedium        = floatPosSmall + 1
-	floatPosLarge         = floatPosMedium + 11
-	floatInfinity         = floatPosLarge + 1
-	floatNaNDesc          = floatInfinity + 1 // NaN encoded descendingly
-	floatTerminator       = 0x00
+	floatNaN     = encodedNotNull + 1
+	floatNeg     = floatNaN + 1
+	floatZero    = floatNeg + 1
+	floatPos     = floatZero + 1
+	floatNaNDesc = floatPos + 1 // NaN encoded descendingly
 
-	bytesMarker     byte = floatNaNDesc + 1
-	timeMarker      byte = bytesMarker + 1
-	bytesDescMarker byte = timeMarker + 1
-	timeDescMarker  byte = bytesDescMarker + 1
+	// The gap between floatNaNDesc and bytesMarker was left for
+	// compatibility reasons.
+	bytesMarker          byte = 0x12
+	bytesDescMarker      byte = bytesMarker + 1
+	timeMarker           byte = bytesDescMarker + 1
+	durationBigNegMarker byte = timeMarker + 1 // Only used for durations < MinInt64 nanos.
+	durationMarker       byte = durationBigNegMarker + 1
+	durationBigPosMarker byte = durationMarker + 1 // Only used for durations > MaxInt64 nanos.
+
+	decimalNaN              = durationBigPosMarker + 1
+	decimalNegativeInfinity = decimalNaN + 1
+	decimalNegLarge         = decimalNegativeInfinity + 1
+	decimalNegMedium        = decimalNegLarge + 11
+	decimalNegSmall         = decimalNegMedium + 1
+	decimalZero             = decimalNegSmall + 1
+	decimalPosSmall         = decimalZero + 1
+	decimalPosMedium        = decimalPosSmall + 1
+	decimalPosLarge         = decimalPosMedium + 11
+	decimalInfinity         = decimalPosLarge + 1
+	decimalNaNDesc          = decimalInfinity + 1 // NaN encoded descendingly
+	decimalTerminator       = 0x00
 
 	// IntMin is chosen such that the range of int tags does not overlap the
 	// ascii character set that is frequently used in testing.
-	IntMin   = 0x80
-	intZero  = IntMin + 8
-	intSmall = IntMax - intZero - 8 // 109
+	IntMin      = 0x80
+	intMaxWidth = 8
+	intZero     = IntMin + intMaxWidth
+	intSmall    = IntMax - intZero - intMaxWidth // 109
 	// IntMax is the maximum int tag value.
 	IntMax = 0xfd
 
@@ -69,6 +82,9 @@ const (
 )
 
 const (
+	// EncodedDurationMaxLen is the largest number of bytes used when encoding a
+	// Duration.
+	EncodedDurationMaxLen = 1 + 3*binary.MaxVarintLen64 // 3 varints are encoded.
 	// BytesDescMarker is exported for testing.
 	BytesDescMarker = bytesDescMarker
 )
@@ -162,6 +178,8 @@ func DecodeUint64Descending(b []byte) ([]byte, uint64, error) {
 	leftover, v, err := DecodeUint64Ascending(b)
 	return leftover, ^v, err
 }
+
+const maxVarintSize = 9
 
 // EncodeVarintAscending encodes the int64 value using a variable length
 // (length-prefixed) representation. The length is encoded as a single
@@ -419,7 +437,7 @@ func EncodeBytesDescending(b []byte, data []byte) []byte {
 // are appended to r. The remainder of the input buffer and the
 // decoded []byte are returned.
 func DecodeBytesAscending(b []byte, r []byte) ([]byte, []byte, error) {
-	return decodeBytesInternal(b, r, ascendingEscapes)
+	return decodeBytesInternal(b, r, ascendingEscapes, true)
 }
 
 // DecodeBytesDescending decodes a []byte value from the input buffer
@@ -432,16 +450,18 @@ func DecodeBytesDescending(b []byte, r []byte) ([]byte, []byte, error) {
 	if r == nil {
 		r = []byte{}
 	}
-	b, r, err := decodeBytesInternal(b, r, descendingEscapes)
+	b, r, err := decodeBytesInternal(b, r, descendingEscapes, true)
 	onesComplement(r)
 	return b, r, err
 }
 
-func decodeBytesInternal(b []byte, r []byte, e escapes) ([]byte, []byte, error) {
-	if len(b) == 0 || b[0] != e.marker {
-		return nil, nil, util.Errorf("did not find marker %#x in buffer %#x", e.marker, b)
+func decodeBytesInternal(b []byte, r []byte, e escapes, expectMarker bool) ([]byte, []byte, error) {
+	if expectMarker {
+		if len(b) == 0 || b[0] != e.marker {
+			return nil, nil, util.Errorf("did not find marker %#x in buffer %#x", e.marker, b)
+		}
+		b = b[1:]
 	}
-	b = b[1:]
 
 	for {
 		i := bytes.IndexByte(b, e.escape)
@@ -589,21 +609,20 @@ func DecodeIfNotNull(b []byte) ([]byte, bool) {
 // EncodeTime(b2, t1), Compare(b1, b2) < 0. The time zone offset not
 // included in the encoding.
 func EncodeTimeAscending(b []byte, t time.Time) []byte {
-	// Read the unix absolute time. This is the absolute time and is
-	// not time zone offset dependent.
-	b = append(b, timeMarker)
-	b = EncodeVarintAscending(b, t.Unix())
-	b = EncodeVarintAscending(b, int64(t.Nanosecond()))
-	return b
+	return encodeTime(b, t.Unix(), int64(t.Nanosecond()))
 }
 
 // EncodeTimeDescending is the descending version of EncodeTimeAscending.
 func EncodeTimeDescending(b []byte, t time.Time) []byte {
+	return encodeTime(b, ^t.Unix(), ^int64(t.Nanosecond()))
+}
+
+func encodeTime(b []byte, unix, nanos int64) []byte {
 	// Read the unix absolute time. This is the absolute time and is
 	// not time zone offset dependent.
-	b = append(b, timeDescMarker)
-	b = EncodeVarintDescending(b, t.Unix())
-	b = EncodeVarintDescending(b, int64(t.Nanosecond()))
+	b = append(b, timeMarker)
+	b = EncodeVarintAscending(b, unix)
+	b = EncodeVarintAscending(b, nanos)
 	return b
 }
 
@@ -611,15 +630,7 @@ func EncodeTimeDescending(b []byte, t time.Time) []byte {
 // EncodeTime. The remainder of the input buffer and the decoded
 // time.Time are returned.
 func DecodeTimeAscending(b []byte) ([]byte, time.Time, error) {
-	if PeekType(b) != Time {
-		return nil, time.Time{}, util.Errorf("did not find marker")
-	}
-	b = b[1:]
-	b, sec, err := DecodeVarintAscending(b)
-	if err != nil {
-		return b, time.Time{}, err
-	}
-	b, nsec, err := DecodeVarintAscending(b)
+	b, sec, nsec, err := decodeTime(b)
 	if err != nil {
 		return b, time.Time{}, err
 	}
@@ -628,19 +639,112 @@ func DecodeTimeAscending(b []byte) ([]byte, time.Time, error) {
 
 // DecodeTimeDescending is the descending version of DecodeTimeAscending.
 func DecodeTimeDescending(b []byte) ([]byte, time.Time, error) {
-	if PeekType(b) != TimeDesc {
-		return nil, time.Time{}, util.Errorf("did not find marker")
+	b, sec, nsec, err := decodeTime(b)
+	if err != nil {
+		return b, time.Time{}, err
+	}
+	return b, time.Unix(^sec, ^nsec), nil
+}
+
+func decodeTime(b []byte) (r []byte, sec int64, nsec int64, err error) {
+	if PeekType(b) != Time {
+		return nil, 0, 0, util.Errorf("did not find marker")
 	}
 	b = b[1:]
-	b, sec, err := DecodeVarintDescending(b)
+	b, sec, err = DecodeVarintAscending(b)
 	if err != nil {
-		return b, time.Time{}, err
+		return b, 0, 0, err
 	}
-	b, nsec, err := DecodeVarintDescending(b)
+	b, nsec, err = DecodeVarintAscending(b)
 	if err != nil {
-		return b, time.Time{}, err
+		return b, 0, 0, err
 	}
-	return b, time.Unix(sec, nsec), nil
+	return b, sec, nsec, nil
+}
+
+// EncodeDurationAscending encodes a duration.Duration value, appends it to the
+// supplied buffer, and returns the final buffer. The encoding is guaranteed to
+// be ordered such that if t1.Compare(t2) < 0 (or = 0 or > 0) then bytes.Compare
+// will order them the same way after encoding.
+func EncodeDurationAscending(b []byte, d duration.Duration) ([]byte, error) {
+	sortNanos, months, days, err := d.Encode()
+	if err != nil {
+		// TODO(dan): Handle this using d.EncodeBigInt() and the
+		// durationBigNeg/durationBigPos markers.
+		return b, err
+	}
+	b = append(b, durationMarker)
+	b = EncodeVarintAscending(b, sortNanos)
+	b = EncodeVarintAscending(b, months)
+	b = EncodeVarintAscending(b, days)
+	return b, nil
+}
+
+// EncodeDurationDescending is the descending version of EncodeDurationAscending.
+func EncodeDurationDescending(b []byte, d duration.Duration) ([]byte, error) {
+	sortNanos, months, days, err := d.Encode()
+	if err != nil {
+		// TODO(dan): Handle this using d.EncodeBigInt() and the
+		// durationBigNeg/durationBigPos markers.
+		return b, err
+	}
+	b = append(b, durationMarker)
+	b = EncodeVarintDescending(b, sortNanos)
+	b = EncodeVarintDescending(b, months)
+	b = EncodeVarintDescending(b, days)
+	return b, nil
+}
+
+// DecodeDurationAscending decodes a duration.Duration value which was encoded
+// using EncodeDurationAscending. The remainder of the input buffer and the
+// decoded duration.Duration are returned.
+func DecodeDurationAscending(b []byte) ([]byte, duration.Duration, error) {
+	if PeekType(b) != Duration {
+		return nil, duration.Duration{}, util.Errorf("did not find marker %x", b)
+	}
+	b = b[1:]
+	b, sortNanos, err := DecodeVarintAscending(b)
+	if err != nil {
+		return b, duration.Duration{}, err
+	}
+	b, months, err := DecodeVarintAscending(b)
+	if err != nil {
+		return b, duration.Duration{}, err
+	}
+	b, days, err := DecodeVarintAscending(b)
+	if err != nil {
+		return b, duration.Duration{}, err
+	}
+	d, err := duration.Decode(sortNanos, months, days)
+	if err != nil {
+		return b, duration.Duration{}, err
+	}
+	return b, d, nil
+}
+
+// DecodeDurationDescending is the descending version of DecodeDurationAscending.
+func DecodeDurationDescending(b []byte) ([]byte, duration.Duration, error) {
+	if PeekType(b) != Duration {
+		return nil, duration.Duration{}, util.Errorf("did not find marker")
+	}
+	b = b[1:]
+	b, sortNanos, err := DecodeVarintDescending(b)
+	if err != nil {
+		return b, duration.Duration{}, err
+	}
+	b, months, err := DecodeVarintDescending(b)
+	if err != nil {
+		return b, duration.Duration{}, err
+	}
+	b, days, err := DecodeVarintDescending(b)
+	if err != nil {
+		return b, duration.Duration{}, err
+	}
+	d, err := duration.Decode(sortNanos, months, days)
+	if err != nil {
+		return b, duration.Duration{}, err
+	}
+	return b, d, nil
 }
 
 // Type represents the type of a value encoded by
@@ -654,10 +758,11 @@ const (
 	NotNull
 	Int
 	Float
+	Decimal
 	Bytes
 	BytesDesc // Bytes encoded descendingly
 	Time
-	TimeDesc // Time encoded descendingly
+	Duration
 )
 
 // PeekType peeks at the type of the value encoded at the start of b.
@@ -665,9 +770,9 @@ func PeekType(b []byte) Type {
 	if len(b) >= 1 {
 		m := b[0]
 		switch {
-		case m == encodedNull || m == encodedNullDesc:
+		case m == encodedNull, m == encodedNullDesc:
 			return Null
-		case m == encodedNotNull || m == encodedNotNullDesc:
+		case m == encodedNotNull, m == encodedNotNullDesc:
 			return NotNull
 		case m == bytesMarker:
 			return Bytes
@@ -675,12 +780,14 @@ func PeekType(b []byte) Type {
 			return BytesDesc
 		case m == timeMarker:
 			return Time
-		case m == timeDescMarker:
-			return TimeDesc
+		case m == durationBigNegMarker, m == durationMarker, m == durationBigPosMarker:
+			return Duration
 		case m >= IntMin && m <= IntMax:
 			return Int
 		case m >= floatNaN && m <= floatNaNDesc:
 			return Float
+		case m >= decimalNaN && m <= decimalNaNDesc:
+			return Decimal
 		}
 	}
 	return Unknown
@@ -722,17 +829,13 @@ func prettyPrintFirstValue(b []byte) ([]byte, string, error) {
 		}
 		return b, strconv.FormatInt(i, 10), nil
 	case Float:
-		// Handle float specific values separately.
-		switch b[0] {
-		case floatNaN, floatNaNDesc:
-			return b[1:], strconv.FormatFloat(math.NaN(), 'e', -1, 64), nil
-		case floatInfinity:
-			return b[1:], strconv.FormatFloat(math.Inf(1), 'e', -1, 64), nil
-		case floatNegativeInfinity:
-			return b[1:], strconv.FormatFloat(math.Inf(-1), 'e', -1, 64), nil
+		var f float64
+		b, f, err = DecodeFloatAscending(b)
+		if err != nil {
+			return b, "", err
 		}
-		// Decode both floats and decimals as decimals to avoid
-		// overflow.
+		return b, strconv.FormatFloat(f, 'g', -1, 64), nil
+	case Decimal:
 		var d *inf.Dec
 		b, d, err = DecodeDecimalAscending(b, nil)
 		if err != nil {
@@ -759,14 +862,14 @@ func prettyPrintFirstValue(b []byte) ([]byte, string, error) {
 		if err != nil {
 			return b, "", err
 		}
-		return b, t.UTC().Format(time.UnixDate), nil
-	case TimeDesc:
-		var t time.Time
-		b, t, err = DecodeTimeDescending(b)
+		return b, t.UTC().Format(time.RFC3339Nano), nil
+	case Duration:
+		var d duration.Duration
+		b, d, err = DecodeDurationAscending(b)
 		if err != nil {
 			return b, "", err
 		}
-		return b, t.UTC().Format(time.UnixDate), nil
+		return b, d.String(), nil
 	default:
 		// This shouldn't ever happen, but if it does, return an empty slice.
 		return nil, strconv.Quote(string(b)), nil

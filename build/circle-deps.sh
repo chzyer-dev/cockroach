@@ -9,6 +9,27 @@ function is_shard() {
   test $(($1 % $CIRCLE_NODE_TOTAL)) -eq $CIRCLE_NODE_INDEX
 }
 
+function fetch_docker() {
+  local user="$1"
+  local repo="${2}"
+  local tag="${3}"
+  local name="${user}/${repo}"
+  local ref="${name}:${tag}"
+  if ! docker images --format {{.Repository}}:{{.Tag}} | grep -q "${ref}"; then
+    # If we have a saved image, load it.
+    imgcache="${builder_dir}/${user}.${repo}.tar"
+    if [[ -e "${imgcache}" ]]; then
+      time docker load -i "${imgcache}"
+    fi
+
+    # If we still don't have the tag we want: pull it and save it.
+    if ! docker images --format {{.Repository}}:{{.Tag}} | grep -q "${ref}"; then
+      time docker pull "${ref}"
+      time docker save -o "${imgcache}" "${ref}"
+    fi
+  fi
+}
+
 # This is mildly tricky: This script runs itself recursively. The
 # first time it is run it does not take the if-branch below and
 # executes on the host computer. As a final step it uses the
@@ -16,6 +37,9 @@ function is_shard() {
 # the argument causing the commands in the if-branch to be executed
 # within the docker container.
 if [ "${1-}" = "docker" ]; then
+  go get -u github.com/robfig/glock
+  glock sync -n < GLOCKFILE
+
   # Be careful to keep the dependencies built for each shard in sync
   # with the dependencies used by each shard in circle-test.sh.
 
@@ -37,16 +61,23 @@ if [ "${1-}" = "docker" ]; then
       fi
     done
 
+    for i in npm.installed bower.installed typings.installed; do
+      if [ -f /uicache/$i ]; then
+        cp -a /uicache/$i ui/$i
+      fi
+    done
+
     time make -C ui npm.installed     || rm -rf ui/node_modules/{*,.bin} && make -C ui npm.installed
     time make -C ui bower.installed   || rm -rf ui/bower_components/*    && make -C ui bower.installed
     time make -C ui typings.installed || rm -rf ui/typings/*             && make -C ui typings.installed
 
+    for i in npm.installed bower.installed typings.installed; do
+      cp -a ui/$i /uicache/$i
+    done
+
     # Fix permissions on the ui/typings directory and subdirectories
     # (they lack the execute permission for group/other).
     find /uicache/typings -type d | xargs chmod 0755
-
-    cmds=$(grep '^cmd' GLOCKFILE | grep -v glock | awk '{print $2}')
-    time go install -v ${cmds}
 
     # TODO(pmattis): This works around the problem seen in
     # https://github.com/cockroachdb/cockroach/issues/4013 where
@@ -69,8 +100,6 @@ if [ "${1-}" = "docker" ]; then
     time make install
     time go test -v -i ./...
     time go test -v -c -tags acceptance ./acceptance
-    # Avoid code rot.
-    time go build ./gossip/simulation/...
   fi
 
   exit 0
@@ -107,28 +136,19 @@ mkdir -p "${builder_dir}"
 du -sh "${builder_dir}"
 ls -lah "${builder_dir}"
 
-# The tag for the cockroachdb/builder image. If the image is changed
-# (for example, adding "npm"), a new image should be pushed using
-# "build/builder.sh push" and the new tag value placed here.
-tag="20151210-134003"
+fetch_docker "cockroachdb" "builder" $($(dirname $0)/builder.sh version)
 
-if ! docker images | grep -q "${tag}"; then
-  # If there's a base image cached, load it. A click on CircleCI's "Clear
-  # Cache" will make sure we start with a clean slate.
-  builder="${builder_dir}/builder.${tag}.tar"
-  find "${builder_dir}" -not -path "${builder}" -type f -delete
-  if [[ ! -e "${builder}" ]]; then
-    time docker pull "cockroachdb/builder:${tag}"
-    docker tag -f "cockroachdb/builder:${tag}" "cockroachdb/builder:latest"
-    time docker save "cockroachdb/builder:${tag}" > "${builder}"
-  else
-    time docker load -i "${builder}"
-    docker tag -f "cockroachdb/builder:${tag}" "cockroachdb/builder:latest"
+if is_shard 0; then
+  # See the comment in build/builder.sh about this awk line.
+  postgresTestTag=$(awk -F\" '/postgresTestTag *=/ {print $2}' \
+                      $(dirname $0)/../acceptance/util_test.go)
+  if [ -z "${postgresTestTag}" ]; then
+    echo "unable to determine postgres-test tag"
+    exit 1
   fi
+  # Dockerfile at: https://github.com/cockroachdb/postgres-test
+  fetch_docker "cockroachdb" "postgres-test" "${postgresTestTag}"
 fi
-
-HOME="" go get -u github.com/robfig/glock
-grep -v '^cmd' GLOCKFILE | glock sync -n
 
 # Recursively invoke this script inside the builder docker container,
 # passing "docker" as the first argument.
@@ -155,7 +175,7 @@ if is_shard 2; then
     time ssh node0 sudo chown -R "${USER}.${USER}" "${dir}"
     time rsync -a --delete "${dir}/" node0:"${dir}"
 
-    cmds=$(grep '^cmd' GLOCKFILE | grep -v glock | awk '{print $2}' | awk -F/ '{print $NF}')
+    cmds=$(grep '^cmd ' GLOCKFILE | grep -v glock | awk '{print $2}' | awk -F/ '{print $NF}')
     time ssh node0 mkdir -p "${gopath0}/bin/linux_amd64"
     time ssh node0 sudo chown "${USER}.${USER}" "${gopath0}/bin/linux_amd64"
     for cmd in ${cmds}; do

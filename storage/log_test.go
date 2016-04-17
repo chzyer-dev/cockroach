@@ -22,8 +22,6 @@ import (
 	"fmt"
 	"testing"
 
-	_ "github.com/lib/pq"
-
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/roachpb"
@@ -32,17 +30,18 @@ import (
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/util/leaktest"
+	_ "github.com/cockroachdb/pq"
 )
 
 func TestLogSplits(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 
-	pgUrl, cleanupFn := sqlutils.PGUrl(t, s, security.RootUser, "TestLogSplits")
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s, security.RootUser, "TestLogSplits")
 	defer cleanupFn()
 
-	db, err := sql.Open("postgres", pgUrl.String())
+	db, err := sql.Open("postgres", pgURL.String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,10 +118,27 @@ func TestLogSplits(t *testing.T) {
 	if rows.Err() != nil {
 		t.Fatal(rows.Err())
 	}
+
+	// This code assumes that there is only one TestServer, and thus that
+	// StoreID 1 is present on the testserver. If this assumption changes in the
+	// future, *any* store will work, but a new method will need to be added to
+	// Stores (or a creative usage of VisitStores could suffice).
+	store, pErr := s.Stores().GetStore(roachpb.StoreID(1))
+	if pErr != nil {
+		t.Fatal(pErr)
+	}
+	reg := store.Registry()
+	minSplits := int64(initialSplits + 1)
+	// Verify that the minimimum number of splits has occurred. This is a min
+	// instead of an exact number, because the number of splits seems to vary
+	// between different runs of this test.
+	if a := reg.GetCounter("range.splits").Count(); a < minSplits {
+		t.Errorf("splits = %d < min %d", a, minSplits)
+	}
 }
 
 func TestLogRebalances(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 
@@ -151,15 +167,27 @@ func TestLogRebalances(t *testing.T) {
 			t.Fatal(pErr)
 		}
 	}
+	reg := store.Registry()
+	checkMetrics := func(expAdds, expRemoves int64) {
+		if a, e := reg.GetCounter("range.adds").Count(), expAdds; a != e {
+			t.Errorf("range adds %d != expected %d", a, e)
+		}
+		if a, e := reg.GetCounter("range.removes").Count(), expRemoves; a != e {
+			t.Errorf("range removes %d != expected %d", a, e)
+		}
+	}
 	logEvent(roachpb.ADD_REPLICA)
+	checkMetrics(1 /*add*/, 0 /*remove*/)
 	logEvent(roachpb.ADD_REPLICA)
+	checkMetrics(2 /*adds*/, 0 /*remove*/)
 	logEvent(roachpb.REMOVE_REPLICA)
+	checkMetrics(2 /*adds*/, 1 /*remove*/)
 
 	// Open a SQL connection to verify that the events have been logged.
-	pgUrl, cleanupFn := sqlutils.PGUrl(t, s, security.RootUser, "TestLogRebalances")
+	pgURL, cleanupFn := sqlutils.PGUrl(t, s, security.RootUser, "TestLogRebalances")
 	defer cleanupFn()
 
-	sqlDB, err := sql.Open("postgres", pgUrl.String())
+	sqlDB, err := sql.Open("postgres", pgURL.String())
 	if err != nil {
 		t.Fatal(err)
 	}

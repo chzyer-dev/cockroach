@@ -19,6 +19,7 @@ package server
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"time"
 
 	"github.com/cockroachdb/cockroach/client"
@@ -50,9 +51,45 @@ const (
 	initialSplitsTimeout = 10 * time.Second
 )
 
-// StartTestServer starts a in-memory test server.
+// StartTestServerWithContext starts an in-memory test server.
+// ctx can be nil, in which case a default context will be created.
+func StartTestServerWithContext(t util.Tester, ctx *Context) *TestServer {
+	s := &TestServer{Ctx: ctx}
+	if err := s.Start(); err != nil {
+		if t != nil {
+			t.Fatalf("Could not start server: %v", err)
+		} else {
+			log.Fatalf("Could not start server: %v", err)
+		}
+	}
+	return s
+}
+
+// StartTestServer starts an in-memory test server.
 func StartTestServer(t util.Tester) *TestServer {
-	s := &TestServer{}
+	return StartTestServerWithContext(t, nil)
+}
+
+// StartTestServerJoining starts an in-memory test server that attempts to join `other`.
+func StartTestServerJoining(t util.Tester, other *TestServer) *TestServer {
+	s := &TestServer{Ctx: NewTestContext()}
+	s.Ctx.JoinUsing = other.ServingAddr()
+	if err := s.Start(); err != nil {
+		if t != nil {
+			t.Fatalf("Could not start server: %v", err)
+		} else {
+			log.Fatalf("Could not start server: %v", err)
+		}
+	}
+	log.Infof("Node ID: %d", s.Gossip().GetNodeID())
+	return s
+}
+
+// StartInsecureTestServer starts an insecure in-memory test server.
+func StartInsecureTestServer(t util.Tester) *TestServer {
+	s := &TestServer{Ctx: NewTestContext()}
+	s.Ctx.Insecure = true
+
 	if err := s.Start(); err != nil {
 		if t != nil {
 			t.Fatalf("Could not start server: %v", err)
@@ -74,18 +111,24 @@ func NewTestContext() *Context {
 	// uncertainty intervals.
 	ctx.MaxOffset = 50 * time.Millisecond
 
+	// Test servers start in secure mode by default.
+	ctx.Insecure = false
+
 	// Load test certs. In addition, the tests requiring certs
 	// need to call security.SetReadFileFn(securitytest.Asset)
 	// in their init to mock out the file system calls for calls to AssetFS,
 	// which has the test certs compiled in. Typically this is done
 	// once per package, in main_test.go.
-	ctx.Certs = security.EmbeddedCertsDir
+	ctx.SSLCA = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
+	ctx.SSLCert = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert)
+	ctx.SSLCertKey = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey)
+
 	// Addr defaults to localhost with port set at time of call to
 	// Start() to an available port.
 	// Call TestServer.ServingAddr() for the full address (including bound port).
 	ctx.Addr = "127.0.0.1:0"
-	ctx.PGAddr = "127.0.0.1:0"
-	// Set standard "node" user for intra-cluster traffic.
+	ctx.HTTPAddr = "127.0.0.1:0"
+	// Set standard user for intra-cluster traffic.
 	ctx.User = security.NodeUser
 
 	return ctx
@@ -150,14 +193,6 @@ func (ts *TestServer) DB() *client.DB {
 	return nil
 }
 
-// EventFeed returns the event feed that the server uses to publish events.
-func (ts *TestServer) EventFeed() *util.Feed {
-	if ts != nil {
-		return ts.node.ctx.EventFeed
-	}
-	return nil
-}
-
 // Start starts the TestServer by bootstrapping an in-memory store
 // (defaults to maximum of 100M). The server is started, launching the
 // node RPC server and all HTTP endpoints. Use the value of
@@ -178,16 +213,17 @@ func (ts *TestServer) StartWithStopper(stopper *stop.Stopper) error {
 		stopper = stop.NewStopper()
 	}
 
-	// Change the replication requirements so we don't get log spam
-	// about ranges not being replicated enough.
-	// TODO(marc): set this in the zones table when we have an entry
-	// for the default cluster-wide zone config and remove these
-	// shenanigans about mutating the global default.
-	oldDefaultZC := util.CloneProto(config.DefaultZoneConfig).(*config.ZoneConfig)
-	config.DefaultZoneConfig.ReplicaAttrs = []roachpb.Attributes{{}}
-	stopper.AddCloser(stop.CloserFn(func() {
-		config.DefaultZoneConfig = oldDefaultZC
-	}))
+	// Change the replication requirements so we don't get log spam about ranges
+	// not being replicated enough.
+	cfg := config.DefaultZoneConfig()
+	cfg.ReplicaAttrs = []roachpb.Attributes{{}}
+	fn := config.TestingSetDefaultZoneConfig(cfg)
+	stopper.AddCloser(stop.CloserFn(fn))
+
+	// Needs to be called before NewServer to ensure resolvers are initialized.
+	if err := ts.Ctx.InitNode(); err != nil {
+		return err
+	}
 
 	var err error
 	ts.Server, err = NewServer(ts.Ctx, stopper)
@@ -252,9 +288,14 @@ func (ts *TestServer) Stores() *storage.Stores {
 	return ts.node.stores
 }
 
-// ServingAddr returns the rpc server's address. Should be used by clients.
+// ServingAddr returns the server's address. Should be used by clients.
 func (ts *TestServer) ServingAddr() string {
-	return ts.listener.Addr().String()
+	return ts.ctx.Addr
+}
+
+// HTTPAddr returns the server's HTTP address. Should be used by humans.
+func (ts *TestServer) HTTPAddr() string {
+	return ts.ctx.HTTPAddr
 }
 
 // ServingHost returns the host portion of the rpc server's address.
@@ -266,17 +307,6 @@ func (ts *TestServer) ServingHost() (string, error) {
 // ServingPort returns the port portion of the rpc server's address.
 func (ts *TestServer) ServingPort() (string, error) {
 	_, p, err := net.SplitHostPort(ts.ServingAddr())
-	return p, err
-}
-
-// PGAddr returns the Postgres-protocol endpoint's address.
-func (ts *TestServer) PGAddr() string {
-	return ts.pgServer.Addr().String()
-}
-
-// PGPort returns the port portion of the Postgres-protocol endpoint's address.
-func (ts *TestServer) PGPort() (string, error) {
-	_, p, err := net.SplitHostPort(ts.PGAddr())
 	return p, err
 }
 
@@ -301,16 +331,35 @@ func (ts *TestServer) SetRangeRetryOptions(ro retry.Options) {
 // WriteSummaries records summaries of time-series data, which is required for any tests
 // that query server stats.
 func (ts *TestServer) WriteSummaries() error {
-	return ts.Server.writeSummaries()
+	return ts.node.writeSummaries()
 }
 
-// MustGetCounter returns the value of a counter from the metrics registry. Runs in
-// O(# of metrics) time, which is fine for test code.
-func (ts *TestServer) MustGetCounter(name string) int64 {
+// MustGetSQLCounter returns the value of a counter metric from the server's SQL
+// Executor. Runs in O(# of metrics) time, which is fine for test code.
+func (ts *TestServer) MustGetSQLCounter(name string) int64 {
 	var c int64
 	var found bool
 
-	ts.registry.Each(func(n string, v interface{}) {
+	ts.sqlExecutor.Registry().Each(func(n string, v interface{}) {
+		if name == n {
+			c = v.(*metric.Counter).Count()
+			found = true
+		}
+	})
+	if !found {
+		panic(fmt.Sprintf("couldn't find metric %s", name))
+	}
+	return c
+}
+
+// MustGetSQLNetworkCounter returns the value of a counter metric from the
+// server's SQL server. Runs in O(# of metrics) time, which is fine for test
+// code.
+func (ts *TestServer) MustGetSQLNetworkCounter(name string) int64 {
+	var c int64
+	var found bool
+
+	ts.pgServer.Registry().Each(func(n string, v interface{}) {
 		if name == n {
 			c = v.(*metric.Counter).Count()
 			found = true

@@ -18,9 +18,11 @@ syntax = "proto2";
 package cockroach.roachpb;
 option go_package = "roachpb";
 
-import "cockroach/roachpb/metadata.proto";
 import "cockroach/roachpb/data.proto";
 import "cockroach/roachpb/errors.proto";
+import "cockroach/roachpb/internal_raft.proto";
+import "cockroach/roachpb/metadata.proto";
+import "cockroach/util/tracing/span.proto";
 import weak "gogoproto/gogo.proto";
 
 // ReadConsistencyType specifies what type of consistency is observed
@@ -44,14 +46,6 @@ enum ReadConsistencyType {
 
 // ResponseHeader is returned with every storage node response.
 message ResponseHeader {
-  // timestamp specifies time at which read or write actually was
-  // performed. In the case of both reads and writes, if the timestamp
-  // supplied to the request was 0, the wall time of the node
-  // servicing the request will be set here. Additionally, in the case
-  // of writes, this value may be increased from the timestamp passed
-  // with the Span if the key being written was either read
-  // or written more recently.
-  optional Timestamp timestamp = 2 [(gogoproto.nullable) = false];
   // txn is non-nil if the request specified a non-nil transaction.
   // The transaction timestamp and/or priority may have been updated,
   // depending on the outcome of the request.
@@ -74,6 +68,10 @@ message GetResponse {
 message PutRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   optional Value value = 2 [(gogoproto.nullable) = false];
+  // Specify as true to put the value without a corresponding
+  // timestamp. This option should be used with care as it precludes
+  // the use of this value with transactions.
+  optional bool inline = 3 [(gogoproto.nullable) = false];
 }
 
 // A PutResponse is the return value from the Put() method.
@@ -139,6 +137,7 @@ message DeleteRangeRequest {
   // If 0, *all* entries between key (inclusive) and end_key
   // (exclusive) are deleted. Must be >= 0.
   optional int64 max_entries_to_delete = 2 [(gogoproto.nullable) = false];
+  optional bool return_keys = 3 [(gogoproto.nullable) = false];
 }
 
 // A DeleteRangeResponse is the return value from the DeleteRange()
@@ -146,7 +145,7 @@ message DeleteRangeRequest {
 message DeleteRangeResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // Number of entries removed.
-  optional int64 num_deleted = 2 [(gogoproto.nullable) = false];
+  repeated bytes keys = 2 [(gogoproto.casttype) = "Key"];
 }
 
 // A ScanRequest is the argument to the Scan() method. It specifies the
@@ -179,6 +178,22 @@ message ReverseScanResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // Empty if no rows were scanned.
   repeated KeyValue rows = 2 [(gogoproto.nullable) = false];
+}
+
+// A CheckConsistencyRequest is the argument to the CheckConsistency() method.
+// It specifies the start and end keys for a span of ranges to which a consistency
+// check should be applied. A consistency check on a range involves running a
+// ComputeChecksum on the range followed by a VerifyChecksum.
+message CheckConsistencyRequest {
+  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // log a diff of inconsistencies if such inconsistencies are found.
+  optional bool with_diff = 2 [(gogoproto.nullable) = false];
+}
+
+// A CheckConsistencyResponse is the return value from the CheckConsistency() method.
+// If a replica finds itself to be inconsistent with its leader it will panic.
+message CheckConsistencyResponse {
+  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
 // A BeginTransactionRequest is the argument to the BeginTransaction() method.
@@ -221,8 +236,12 @@ message EndTransactionResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // Remaining time (ns).
   optional int64 commit_wait = 2 [(gogoproto.nullable) = false]; // TODO(tschottdorf): remove this
-  // List of intents resolved by EndTransaction call.
-  repeated bytes resolved = 3 [(gogoproto.casttype) = "Key"];
+  // Obsolete tag. Removed in #5966.
+  repeated bytes DEPRECATED_resolved = 3;
+  // True if the transaction committed on the one phase commit path.
+  // This means that all writes which were part of the transaction
+  // were written as a single, atomic write batch to just one range.
+  optional bool one_phase_commit = 4 [(gogoproto.nullable) = false];
 }
 
 // An AdminSplitRequest is the argument to the AdminSplit() method. The
@@ -290,9 +309,9 @@ message RangeLookupRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   optional int32 max_ranges = 2 [(gogoproto.nullable) = false];
   // consider_intents indicates whether or not intents encountered
-  // while looking up the range info should randomly be returned
-  // to the caller. This is intended to be used when retrying due
-  // to range addressing errors.
+  // while looking up the range info should be returned to the caller.
+  // This is intended to be used when retrying due to range addressing
+  // errors.
   optional bool consider_intents = 3 [(gogoproto.nullable) = false];
   // Use a reverse scan to pre-fill the range descriptor cache instead
   // of an ascending scan.
@@ -307,6 +326,7 @@ message RangeLookupRequest {
 message RangeLookupResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   repeated RangeDescriptor ranges = 2 [(gogoproto.nullable) = false];
+  repeated RangeDescriptor prefetched_ranges = 3 [(gogoproto.nullable) = false];
 }
 
 // A HeartbeatTxnRequest is arguments to the HeartbeatTxn()
@@ -316,6 +336,7 @@ message RangeLookupResponse {
 // gossip protocol.
 message HeartbeatTxnRequest {
   optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  optional Timestamp now = 2 [(gogoproto.nullable) = false];
 }
 
 // A HeartbeatTxnResponse is the return value from the HeartbeatTxn()
@@ -354,6 +375,9 @@ enum PushTxnType {
   // Abort the transaction if it's abandoned, but don't attempt to mutate it
   // otherwise.
   PUSH_TOUCH = 2;
+  // Query and return the latest transaction record if available. If no record
+  // is persisted, returns a zero Pushee.
+  PUSH_QUERY = 3;
 }
 
 // A PushTxnRequest is arguments to the PushTxn() method. It's sent by
@@ -449,14 +473,10 @@ message ResolveIntentRangeRequest {
 }
 
 // A NoopResponse is the return value from a no-op operation.
-message NoopResponse {
-  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-}
+message NoopResponse {}
 
 // A NoopRequest is a no-op.
-message NoopRequest {
-  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-}
+message NoopRequest {}
 
 // A ResolveIntentRangeResponse is the return value from the
 // ResolveIntent() method.
@@ -515,6 +535,51 @@ message LeaderLeaseResponse{
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
 
+// A ComputeChecksumRequest is arguments to the ComputeChecksum() method, to
+// start computing the checksum for the specified range at the snapshot for
+// this request command. A response is returned without the checksum.
+// The computed checksum is later compared to the one supplied
+// through a VerifyChecksumRequest.
+message ComputeChecksumRequest {
+  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // The version used to pick the checksum method. It allows us to use a
+  // consistent checksumming method across replicas.
+  optional uint32 version = 2 [(gogoproto.nullable) = false];
+  // A unique identifier to match a future VerifyChecksumRequest with this request.
+  optional bytes checksum_id = 3 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "ChecksumID",
+      (gogoproto.customtype) = "github.com/cockroachdb/cockroach/util/uuid.UUID"];
+  // Compute a checksum along with a snapshot of the entire range, that will
+  // be used in logging a diff during checksum verification.
+  optional bool snapshot = 4 [(gogoproto.nullable) = false];
+}
+
+// A ComputeChecksumResponse is the response to a ComputeChecksum() operation.
+message ComputeChecksumResponse {
+  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
+// A VerifyChecksumRequest is arguments to the VerifyChecksum() method, to
+// verify the checksum computed on the leader against the one requested
+// earlier through a ComputeChecksumRequest with the same checksum_id.
+message VerifyChecksumRequest {
+  optional Span header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // The version used to pick the checksum method. It allows us to use a
+  // consistent checksumming method across replicas.
+  optional uint32 version = 2 [(gogoproto.nullable) = false];
+  optional bytes checksum_id = 3 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "ChecksumID",
+      (gogoproto.customtype) = "github.com/cockroachdb/cockroach/util/uuid.UUID"];
+  optional bytes checksum = 4;
+  // Used when a diff is requested on observing a checksum mismatch.
+  optional RaftSnapshotData snapshot = 5;
+}
+
+// A VerifyChecksumResponse is the response to a VerifyChecksum() operation.
+message VerifyChecksumResponse {
+  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+}
+
 // A RequestUnion contains exactly one of the optional requests.
 // The values added here must match those in ResponseUnion.
 message RequestUnion {
@@ -541,7 +606,10 @@ message RequestUnion {
   optional TruncateLogRequest truncate_log = 19;
   optional LeaderLeaseRequest leader_lease = 20;
   optional ReverseScanRequest reverse_scan = 21;
-  optional NoopRequest noop = 22;
+  optional ComputeChecksumRequest compute_checksum = 22;
+  optional VerifyChecksumRequest verify_checksum = 23;
+  optional CheckConsistencyRequest check_consistency = 24;
+  optional NoopRequest noop = 25;
 }
 
 // A ResponseUnion contains exactly one of the optional responses.
@@ -570,7 +638,10 @@ message ResponseUnion {
   optional TruncateLogResponse truncate_log = 19;
   optional LeaderLeaseResponse leader_lease = 20;
   optional ReverseScanResponse reverse_scan = 21;
-  optional NoopResponse noop = 22;
+  optional ComputeChecksumResponse compute_checksum = 22;
+  optional VerifyChecksumResponse verify_checksum = 23;
+  optional CheckConsistencyResponse check_consistency = 24;
+  optional NoopResponse noop = 25;
 }
 
 // A Header is attached to a BatchRequest, encapsulating routing and auxiliary
@@ -608,17 +679,17 @@ message Header {
   // operations. The default is CONSISTENT. This value is ignored for
   // write operations.
   optional ReadConsistencyType read_consistency = 6 [(gogoproto.nullable) = false];
+  // trace, if set, is the active span of an OpenTracing distributed trace.
+  optional util.tracing.Span trace = 7;
+  // if set to a non-zero value, limits the total number of results for
+  // Scan/ReverseScan requests in the batch.
+  optional int64 max_scan_results = 8 [(gogoproto.nullable) = false];
 }
 
 
 // A BatchRequest contains one or more requests to be executed in
 // parallel, or if applicable (based on write-only commands and
 // range-locality), as a single update.
-//
-// The Span should contain the Key of the first request
-// in the batch. It also contains the transaction itself; individual
-// calls must not have transactions specified. The same applies to
-// the User and UserPriority fields.
 message BatchRequest {
   option (gogoproto.goproto_stringer) = false;
 
@@ -636,19 +707,43 @@ message BatchResponse {
   message Header {
     // error is non-nil if an error occurred.
     optional Error error = 1;
-    // timestamp specifies time at which read or write actually was
-    // performed. In the case of both reads and writes, if the timestamp
-    // supplied to the request was 0, the wall time of the node
-    // servicing the request will be set here. Additionally, in the case
-    // of writes, this value may be increased from the timestamp passed
-    // with the Span if the key being written was either read
-    // or written more recently.
-    optional Timestamp timestamp = 2 [(gogoproto.nullable) = false];
+    // timestamp is set only for non-transactional responses and denotes the
+    // highest timestamp at which a command from the batch executed. At the
+    // time of writing, it is used solely for informational purposes and tests.
+    optional Timestamp Timestamp = 2 [(gogoproto.nullable) = false];
     // txn is non-nil if the request specified a non-nil
     // transaction. The transaction timestamp and/or priority may have
     // been updated, depending on the outcome of the request.
     optional Transaction txn = 3;
+    // collected_spans is a binary representation of the trace spans
+    // generated during the execution of this request.
+    repeated bytes collected_spans = 4;
+    // now is the current time at the node sending the response,
+    // which can be used by the receiver to update its local HLC.
+    optional Timestamp now = 5 [(gogoproto.nullable) = false];
   }
   optional Header header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   repeated ResponseUnion responses = 2 [(gogoproto.nullable) = false];
+}
+
+// A RaftCommand is a command which can be serialized and sent via
+// raft.
+message RaftCommand {
+  optional int64 range_id = 1 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
+  optional ReplicaDescriptor origin_replica = 2 [(gogoproto.nullable) = false];
+  optional BatchRequest cmd = 3 [(gogoproto.nullable) = false];
+}
+
+// The two services below are identical, except that some internal Request
+// types are not permitted in batches processed by External.Batch. This
+// distinction exists e.g. to prevent command-line tools from accessing
+// internal-only RPC methods.
+
+service Internal {
+  rpc Batch (BatchRequest) returns (BatchResponse) {}
+}
+
+service External {
+  rpc Batch (BatchRequest) returns (BatchResponse) {}
 }

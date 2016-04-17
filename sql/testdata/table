@@ -52,7 +52,7 @@ CREATE TABLE c (
 )
 
 query TTBITTB colnames
-SHOW INDEX FROM c
+SHOW INDEXES FROM c
 ----
 Table Name           Unique Seq Column Direction  Storing
 c     primary        true   1   id     ASC        false
@@ -62,7 +62,7 @@ c     c_foo_bar_idx  false  1   foo    ASC        false
 c     c_foo_bar_idx  false  2   bar    DESC       false
 c     c_bar_key      true   1   bar    ASC        false
 
-# primary keys can never be null 
+# primary keys can never be null
 
 statement ok
 CREATE TABLE d (
@@ -125,19 +125,22 @@ query error table "users" does not exist
 SHOW COLUMNS FROM test.users
 
 query error no database specified
-SHOW INDEX FROM users
+SHOW INDEXES FROM users
 
 query error database "foo" does not exist
-SHOW INDEX FROM foo.users
+SHOW INDEXES FROM foo.users
 
 query error table "users" does not exist
-SHOW INDEX FROM test.users
+SHOW INDEXES FROM test.users
 
 statement ok
 CREATE TABLE test.users (
-  id    INT PRIMARY KEY,
-  name  VARCHAR NOT NULL,
-  title VARCHAR,
+  id        INT PRIMARY KEY,
+  name      VARCHAR NOT NULL,
+  title     VARCHAR,
+  nickname  STRING,
+  username  STRING(10),
+  email     VARCHAR(100),
   INDEX foo (name),
   UNIQUE INDEX bar (id, name)
 )
@@ -145,16 +148,25 @@ CREATE TABLE test.users (
 query TTBT colnames
 SHOW COLUMNS FROM test.users
 ----
-Field Type   Null  Default
-id    INT    false  NULL
-name  STRING false NULL
-title STRING true  NULL
+Field       Type        Null    Default
+id          INT         false   NULL
+name        STRING      false   NULL
+title       STRING      true    NULL
+nickname    STRING      true    NULL
+username    STRING(10)  true    NULL
+email       STRING(100) true    NULL
 
 query TTBITTB colnames
-SHOW INDEX FROM test.users
+SHOW INDEXES FROM test.users
 ----
 Table Name    Unique Seq Column Direction Storing
 users primary true   1   id     ASC       false
 users foo     false  1   name   ASC       false
 users bar     true   1   id     ASC       false
 users bar     true   2   name   ASC       false
+
+statement error invalid NUMERIC precision 0
+CREATE TABLE test.d (x DECIMAL(0, 2))
+
+statement error NUMERIC scale 4 must be between 0 and precision 2
+CREATE TABLE test.d (x DECIMAL(2, 4))

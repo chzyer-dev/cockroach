@@ -95,21 +95,21 @@ func (p *planner) DropDatabase(n *parser.DropDatabase) (planNode, *roachpb.Error
 	// Delete the zone config entry for this database.
 	b.Del(zoneKey)
 
-	p.testingVerifyMetadata = func(systemConfig config.SystemConfig) error {
+	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		for _, key := range [...]roachpb.Key{descKey, nameKey, zoneKey} {
 			if err := expectDeleted(systemConfig, key); err != nil {
 				return err
 			}
 		}
 		return nil
-	}
+	})
 
 	if pErr := p.txn.Run(b); pErr != nil {
 		return nil, pErr
 	}
 
 	// Log Drop Database event.
-	if pErr := MakeEventLogger(p.leaseMgr).insertEventRecord(p.txn,
+	if pErr := MakeEventLogger(p.leaseMgr).InsertEventRecord(p.txn,
 		EventLogDropDatabase,
 		int32(dbDesc.ID),
 		int32(p.evalCtx.NodeID),
@@ -118,7 +118,7 @@ func (p *planner) DropDatabase(n *parser.DropDatabase) (planNode, *roachpb.Error
 			Statement     string
 			User          string
 			DroppedTables []string
-		}{n.Name.String(), n.String(), p.user, tbNameStrings},
+		}{n.Name.String(), n.String(), p.session.User, tbNameStrings},
 	); pErr != nil {
 		return nil, pErr
 	}
@@ -130,12 +130,12 @@ func (p *planner) DropDatabase(n *parser.DropDatabase) (planNode, *roachpb.Error
 //   Notes: postgres allows only the index owner to DROP an index.
 //          mysql requires the INDEX privilege on the table.
 func (p *planner) DropIndex(n *parser.DropIndex) (planNode, *roachpb.Error) {
-	for _, indexQualifiedName := range n.Names {
-		if err := indexQualifiedName.NormalizeTableName(p.session.Database); err != nil {
+	for _, index := range n.IndexList {
+		if err := index.Table.NormalizeTableName(p.session.Database); err != nil {
 			return nil, roachpb.NewError(err)
 		}
 
-		tableDesc, pErr := p.getTableDesc(indexQualifiedName)
+		tableDesc, pErr := p.getTableDesc(index.Table)
 		if pErr != nil {
 			return nil, pErr
 		}
@@ -143,7 +143,7 @@ func (p *planner) DropIndex(n *parser.DropIndex) (planNode, *roachpb.Error) {
 		if err := p.checkPrivilege(&tableDesc, privilege.CREATE); err != nil {
 			return nil, roachpb.NewError(err)
 		}
-		idxName := indexQualifiedName.Index()
+		idxName := string(index.Index)
 		status, i, err := tableDesc.FindIndexByName(idxName)
 		if err != nil {
 			if n.IfExists {
@@ -202,7 +202,7 @@ func (p *planner) DropTable(n *parser.DropTable) (planNode, *roachpb.Error) {
 			return nil, roachpb.NewUErrorf("table %q does not exist", n.Names[i].Table())
 		}
 		// Log a Drop Table event for this table.
-		if pErr := MakeEventLogger(p.leaseMgr).insertEventRecord(p.txn,
+		if pErr := MakeEventLogger(p.leaseMgr).InsertEventRecord(p.txn,
 			EventLogDropTable,
 			int32(droppedDesc.ID),
 			int32(p.evalCtx.NodeID),
@@ -210,7 +210,7 @@ func (p *planner) DropTable(n *parser.DropTable) (planNode, *roachpb.Error) {
 				TableName string
 				Statement string
 				User      string
-			}{droppedDesc.Name, n.String(), p.user},
+			}{droppedDesc.Name, n.String(), p.session.User},
 		); pErr != nil {
 			return nil, pErr
 		}
@@ -277,14 +277,14 @@ func (p *planner) dropTableImpl(names parser.QualifiedNames, index int) (*TableD
 	// Delete the zone config entry for this table.
 	b.Del(zoneKey)
 
-	p.testingVerifyMetadata = func(systemConfig config.SystemConfig) error {
+	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		for _, key := range [...]roachpb.Key{descKey, nameKey, zoneKey} {
 			if err := expectDeleted(systemConfig, key); err != nil {
 				return err
 			}
 		}
 		return nil
-	}
+	})
 
 	if pErr := p.txn.Run(b); pErr != nil {
 		return nil, pErr

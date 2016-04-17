@@ -54,22 +54,35 @@ var normalize = unicode.SpecialCase{
 	},
 }
 
-// normalizeName normalizes to lowercase and Unicode Normalization Form C
+// NormalizeName normalizes to lowercase and Unicode Normalization Form C
 // (NFC).
-func normalizeName(name string) string {
-	return norm.NFC.String(strings.Map(normalize.ToLower, name))
+func NormalizeName(name string) string {
+	lower := strings.Map(normalize.ToLower, name)
+	if isASCII(lower) {
+		return lower
+	}
+	return norm.NFC.String(lower)
 }
 
 // equalName returns true iff the normalizations of a and b are equal.
 func equalName(a, b string) bool {
-	return normalizeName(a) == normalizeName(b)
+	return NormalizeName(a) == NormalizeName(b)
+}
+
+func isASCII(s string) bool {
+	for _, c := range s {
+		if c > unicode.MaxASCII {
+			return false
+		}
+	}
+	return true
 }
 
 // MakeNameMetadataKey returns the key for the name. Pass name == "" in order
 // to generate the prefix key to use to scan over all of the names for the
 // specified parentID.
 func MakeNameMetadataKey(parentID ID, name string) roachpb.Key {
-	name = normalizeName(name)
+	name = NormalizeName(name)
 	k := keys.MakeTablePrefix(uint32(namespaceTable.ID))
 	k = encoding.EncodeUvarintAscending(k, uint64(namespaceTable.PrimaryIndex.ID))
 	k = encoding.EncodeUvarintAscending(k, uint64(parentID))

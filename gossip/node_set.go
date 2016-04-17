@@ -52,15 +52,6 @@ func (as nodeSet) asSlice() []roachpb.NodeID {
 	return slice
 }
 
-// selectRandom returns a random node from the set. Returns 0 if
-// there are no nodes to select.
-func (as nodeSet) selectRandom() roachpb.NodeID {
-	for node := range as.nodes {
-		return node
-	}
-	return 0
-}
-
 // filter returns an nodeSet of nodes which return true when
 // passed to the supplied filter function filterFn. filterFn should
 // return true to keep an node and false to remove an node.
@@ -83,7 +74,9 @@ func (as nodeSet) hasNode(node roachpb.NodeID) bool {
 
 // setMaxSize adjusts the maximum size allowed for the node set.
 func (as *nodeSet) setMaxSize(maxSize int) {
-	as.maxSize = maxSize
+	if as.maxSize != maxSize {
+		as.maxSize = maxSize
+	}
 }
 
 // addNode adds the node to the nodes set.

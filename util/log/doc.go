@@ -40,19 +40,13 @@
 // Log output is buffered and written periodically using Flush. Programs
 // should call Flush before exiting to guarantee all log output is written.
 //
-// Log output is encoded using the roachpb.LogEntry message format. Each
-// log entry is preceded by a 32-bit encoded length. Use the log command
-// to display logs in human-readable form:
-//
-// % cockroach log <log1> [<log2> ...]
-//
 // By default, all log statements write to files in a temporary directory.
 // This package provides several flags that modify this behavior.
 // These are provided via the pflags library; see InitFlags.
 //
 //	--logtostderr=true
 //		Logs are written to standard error instead of to files.
-//	--alsologtostderr=false
+//	--alsologtostderr=INFO
 //		Logs are written to standard error as well as to files.
 //	--log-dir=""
 //		Log files will be written to this directory instead of the

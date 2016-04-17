@@ -571,8 +571,8 @@ timestamps such thats<sub>1</sub> \< s<sub>2</sub>.
 # Logical Map Content
 
 Logically, the map contains a series of reserved system key / value
-pairs covering accounting, range metadata, node accounting and
-permissions before the actual key / value pairs for non-system data
+pairs covering accounting, range metadata and node accounting 
+before the actual key / value pairs for non-system data
 (e.g. the actual meat of the map).
 
 - `\0\0meta1` Range metadata for location of `\0\0meta2`.
@@ -589,9 +589,6 @@ permissions before the actual key / value pairs for non-system data
 - `\0node<node-address0>`: Accounting data for node 0.
 - ...
 - `\0node<node-addressN>`: Accounting data for node N.
-- `\0perm<key0><user0>`: Permissions for user0 for key prefix key0.
-- ...
-- `\0perm<keyN><userN>`: Permissions for userN for key prefix keyN.
 - `\0tree_root`: Range key for root of range-spanning tree.
 - `\0tx<tx-id0>`: Transaction record for transaction 0.
 - ...
@@ -1112,16 +1109,16 @@ particular, the maximum number of hops for gossipped information to take
 before reaching a node is given by `ceil(log(node count) / log(max
 fanout)) + 1`.
 
-# Key-prefix Accounting, Zones & Permissions
+# Key-prefix Accounting and Zones
 
-Arbitrarily fine-grained accounting and permissions are specified via
+Arbitrarily fine-grained accounting is specified via
 key prefixes. Key prefixes can overlap, as is necessary for capturing
 hierarchical relationships. For illustrative purposes, let’s say keys
 specifying rows in a set of databases have the following format:
 
 `<db>:<table>:<primary-key>[:<secondary-key>]`
 
-In this case, we might collect accounting or specify permissions with
+In this case, we might collect accounting with
 key prefixes:
 
 `db1`, `db1:user`, `db1:order`,
@@ -1228,46 +1225,6 @@ it discovers differences, it reconfigures ranges in the same way
 that it rebalances away from busy nodes, via special-case 1:1
 split to a duplicate range comprising the new configuration.
 
-## Permissions
-permissions are stored in the map with keys prefixed by *\0perm* followed by
-the key prefix and user to which the specified permissions apply. The format of
-permissions keys is:
-
-`\0perm<key-prefix><user>`
-
-Permission values are a protobuf containing the permission details;
-please see [config/config.proto](https://github.com/cockroachdb/cockroach/blob/master/config/config.proto) for up-to-date data structures used, the best entry point being `message PermConfig`.
-
-A default system root permission is assumed for the entire map
-with an empty key prefix and read/write as true.
-
-When determining whether or not to allow a read or a write a key
-value (e.g. `db1:user:1` for user `spencer`), a RoachNode would
-read the following permissions values:
-
-```
-\0perm<db1:user:1>spencer
-\0perm<db1:user>spencer
-\0perm<db1>spencer
-\0perm<>spencer
-```
-
-If any prefix in the hierarchy provides the required permission,
-the request is satisfied; otherwise, the request returns an
-error.
-
-The priority for a user permission is used to order requests at
-Raft consensus ranges and for choosing an initial priority for
-distributed transactions. When scheduling operations at the Raft
-consensus range, all outstanding requests are ordered by key
-prefix and each assigned priorities according to key, user and
-arrival time. The next request is chosen probabilistically using
-priorities to weight the choice. Each key can have multiple
-priorities as they’re hierarchical (e.g. for /user/key, one
-priority for root ‘/’, and one for ‘/user/key’). The most general
-priority is used first. If two keys share the most general, then
-they’re compared with the next most general if applicable, and so on.
-
 # Key-Value API
 
 see the protobufs in [roachpb/](https://github.com/cockroachdb/cockroach/blob/master/roachpb),
@@ -1276,3 +1233,141 @@ in particular [roachpb/api.proto](https://github.com/cockroachdb/cockroach/blob/
 # Structured Data API
 
 A preliminary design can be found in the [Go source documentation](https://godoc.org/github.com/cockroachdb/cockroach/sql).
+
+# Appendix
+
+## Datastore Goal Articulation
+
+There are other important axes involved in data-stores which are less
+well understood and/or explained. There is lots of cross-dependency,
+but it's safe to segregate two more of them as (a) scan efficiency,
+and (b) read vs write optimization.
+
+### Datastore Scan Efficiency Spectrum
+
+Scan efficiency refers to the number of IO ops required to scan a set
+of sorted adjacent rows matching a criteria. However, it's a
+complicated topic, because of the options (or lack of options) for
+controlling physical order in different systems.
+
+* Some designs either default to or only support "heap organized"
+  physical records (Oracle, MySQL, Postgres, SQLite, MongoDB). In this
+  design, a naive sorted-scan of an index involves one IO op per
+  record.
+* In these systems it's possible to "fully cover" a sorted-query in an
+  index with some write-amplification.
+* In some systems it's possible to put the primary record data in a
+  sorted btree instead of a heap-table (default in MySQL/Innodb,
+  option in Oracle).
+* Sorted-order LSM NoSQL could be considered index-organized-tables,
+  with efficient scans by the row-key. (HBase).
+* Some NoSQL is not optimized for sorted-order retrieval, because of
+  hash-bucketing, primarily based on the Dynamo design. (Cassandra,
+  Riak)
+
+![Datastore Scan Efficiency Spectrum](/resource/doc/scan-efficiency.png?raw=true)
+
+### Read vs. Write Optimization Spectrum
+
+Read vs write optimization is a product of the underlying sorted-order
+data-structure used. Btrees are read-optimized. Hybrid write-deferred
+trees are a balance of read-and-write optimizations (shuttle-trees,
+fractal-trees, stratified-trees). LSM separates write-incorporation
+into a separate step, offering a tunable amount of read-to-write
+optimization. An "ideal" LSM at 0%-write-incorporation is a log, and
+at 100%-write-incorporation is a btree.
+
+The topic of LSM is confused by the fact that LSM is not an algorithm,
+but a design pattern, and usage of LSM is hindered by the lack of a
+de-facto optimal LSM design. LevelDB/RocksDB is one of the more
+practical LSM implementations, but it is far from optimal. Popular
+text-indicies like Lucene are non-general purpose instances of
+write-optimized LSM.
+
+Further, there is a dependency between access pattern
+(read-modify-write vs blind-write and write-fraction), cache-hitrate,
+and ideal sorted-order algorithm selection. At a certain
+write-fraction and read-cache-hitrate, systems achieve higher total
+throughput with write-optimized designs, at the cost of increased
+worst-case read latency. As either write-fraction or
+read-cache-hitrate approaches 1.0, write-optimized designs provide
+dramatically better sustained system throughput when record-sizes are
+small relative to IO sizes.
+
+Given this information, data-stores can be sliced by their
+sorted-order storage algorithm selection. Btree stores are
+read-optimized (Oracle, SQLServer, Postgres, SQLite2, MySQL, MongoDB,
+CouchDB), hybrid stores are read-optimized with better
+write-throughput (Tokutek MySQL/MongoDB), while LSM-variants are
+write-optimized (HBase, Cassandra, SQLite3/LSM, CockroachDB).
+
+![Read vs. Write Optimization Spectrum](/resource/doc/read-vs-write.png?raw=true)
+
+## Architecture
+
+CockroachDB implements a layered architecture, with various
+subdirectories implementing layers as appropriate. The highest level of
+abstraction is the [SQL layer][5], which depends
+directly on the structured data API. The structured
+data API provides familiar relational concepts such as schemas,
+tables, columns, and indexes. The structured data API in turn depends
+on the [distributed key value store][7] ([kv/][8]). The distributed key
+value store handles the details of range addressing to provide the
+abstraction of a single, monolithic key value store. It communicates
+with any number of [RoachNodes][9] ([server/][10]), storing the actual
+data. Each node contains one or more [stores][11] ([storage/][12]), one per
+physical device.
+
+![CockroachDB Architecture](/resource/doc/architecture.png?raw=true)
+
+Each store contains potentially many ranges, the lowest-level unit of
+key-value data. Ranges are replicated using the [Raft][2] consensus
+protocol. The diagram below is a blown up version of stores from four
+of the five nodes in the previous diagram. Each range is replicated
+three ways using raft. The color coding shows associated range
+replicas.
+
+![Range Architecture Blowup](/resource/doc/architecture-blowup.png?raw=true)
+
+## Client Architecture
+
+RoachNodes serve client traffic using a fully-featured SQL API which accepts requests as either application/x-protobuf or
+application/json. Client implementations consist of an HTTP sender
+(transport) and a transactional sender which implements a simple
+exponential backoff / retry protocol, depending on CockroachDB error
+codes.
+
+The DB client gateway accepts incoming requests and sends them
+through a transaction coordinator, which handles transaction
+heartbeats on behalf of clients, provides optimization pathways, and
+resolves write intents on transaction commit or abort. The transaction
+coordinator passes requests onto a distributed sender, which looks up
+index metadata, caches the results, and routes internode RPC traffic
+based on where the index metadata indicates keys are located in the
+distributed cluster.
+
+In addition to the gateway for external DB client traffic, each RoachNode provides the full key/value API (including all internal methods) via
+a Go RPC server endpoint. The RPC server endpoint forwards requests to one
+or more local stores depending on the specified key range.
+
+Internally, each RoachNode uses the Go implementation of the
+CockroachDB client in order to transactionally update system key/value
+data; for example during split and merge operations to update index
+metadata records. Unlike an external application, the internal client
+eschews the HTTP sender and instead directly shares the transaction
+coordinator and distributed sender used by the DB client gateway.
+
+![Client Architecture](/resource/doc/client-architecture.png?raw=true)
+
+[0]: http://rocksdb.org/
+[1]: https://github.com/google/leveldb
+[2]: https://ramcloud.stanford.edu/wiki/download/attachments/11370504/raft.pdf
+[3]: http://research.google.com/archive/spanner.html
+[4]: http://research.google.com/pubs/pub36971.html
+[5]: https://github.com/cockroachdb/cockroach/tree/master/sql
+[7]: https://godoc.org/github.com/cockroachdb/cockroach/kv
+[8]: https://github.com/cockroachdb/cockroach/tree/master/kv
+[9]: https://godoc.org/github.com/cockroachdb/cockroach/server
+[10]: https://github.com/cockroachdb/cockroach/tree/master/server
+[11]: https://godoc.org/github.com/cockroachdb/cockroach/storage
+[12]: https://github.com/cockroachdb/cockroach/tree/master/storage

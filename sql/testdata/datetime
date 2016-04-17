@@ -91,7 +91,7 @@ SELECT age(timestamp '2001-04-10 22:06:45', timestamp '1957-06-13')
 384190h6m45s
 
 query B
-SELECT age(timestamp '1957-06-13') - age(now(), timestamp '1957-06-13') < interval '10s'
+SELECT age(timestamp '1957-06-13') - age(now(), timestamp '1957-06-13') = interval '0s'
 ----
 true
 
@@ -121,7 +121,7 @@ SELECT now() - current_timestamp = interval '0s'
 true
 
 query B
-SELECT now() - statement_timestamp() = interval '0s'
+SELECT now() - statement_timestamp() < interval '10s'
 ----
 true
 
@@ -160,9 +160,10 @@ a
 statement ok
 COMMIT TRANSACTION
 
-# Test that the transaction_timestamp can differ from the current_timestamp.
+# Check that the current_timestamp, now and transaction_timestamp are the same.
+# Test that the transaction_timestamp can differ from the statement_timestamp.
 # Check that the transaction_timestamp changes with each transaction.
-# We use, SELECT * FROM kv, to insert delays of more than a nonsecond.
+# We use, SELECT * FROM kv, to insert delays of more than a nanosecond.
 statement ok
 BEGIN;
 INSERT INTO kv (k,v) VALUES ('b', transaction_timestamp());
@@ -170,17 +171,129 @@ SELECT * FROM kv;
 INSERT INTO kv (k,v) VALUES ('c', transaction_timestamp());
 SELECT * FROM kv;
 INSERT INTO kv (k,v) VALUES ('d', current_timestamp());
-SELECT * FROM KV;
+SELECT * FROM kv;
+INSERT INTO kv (k,v) VALUES ('e', current_timestamp());
+SELECT * FROM kv;
+INSERT INTO kv (k,v) VALUES ('f', now());
+SELECT * FROM kv;
+INSERT INTO kv (k,v) VALUES ('g', now());
+SELECT * FROM kv;
+INSERT INTO kv (k,v) VALUES ('h', statement_timestamp());
+SELECT * FROM kv;
 COMMIT;
+SELECT * FROM kv;
 BEGIN;
 SELECT * FROM KV;
-INSERT INTO kv (k,v) VALUES ('e', transaction_timestamp());
+INSERT INTO kv (k,v) VALUES ('i', transaction_timestamp());
 COMMIT;
 
 query I
-SELECT COUNT(DISTINCT v) FROM kv
+SELECT COUNT(DISTINCT (v)) FROM kv
 ----
 4
+
+# Test that transaction_timestamp() is consistent in transaction
+# spanning multiple batches of statements.
+statement ok
+DELETE FROM kv
+
+statement ok
+BEGIN;
+INSERT INTO kv (k,v) VALUES ('a', transaction_timestamp());
+SELECT * FROM kv;
+
+statement ok
+INSERT INTO kv (k,v) VALUES ('b', transaction_timestamp());
+SELECT * FROM kv;
+COMMIT;
+
+statement ok
+BEGIN;
+SELECT * FROM KV;
+INSERT INTO kv (k,v) VALUES ('c', transaction_timestamp());
+COMMIT;
+
+query I
+SELECT COUNT(DISTINCT (v)) FROM kv
+----
+2
+
+statement ok
+DROP TABLE kv
+
+statement ok
+CREATE TABLE kv (
+   k INT PRIMARY KEY,
+   v DECIMAL
+)
+
+# Test that cluster_logical_timestamp() is consistent in transactions
+# spanning multiple batches of statements.
+statement ok
+BEGIN;
+INSERT INTO kv (k,v) VALUES (1, cluster_logical_timestamp());
+SELECT * FROM kv;
+
+statement ok
+INSERT INTO kv (k,v) VALUES (2, cluster_logical_timestamp());
+SELECT * FROM kv;
+COMMIT;
+
+statement ok
+BEGIN;
+SELECT * FROM kv;
+INSERT INTO kv (k,v) VALUES (3, cluster_logical_timestamp());
+COMMIT;
+
+query I
+SELECT COUNT(DISTINCT (v)) FROM kv
+----
+2
+
+statement ok
+DELETE FROM kv
+
+statement ok
+CREATE TABLE m (mints DECIMAL)
+
+statement ok
+INSERT INTO m VALUES (cluster_logical_timestamp())
+
+# Test that cluster_logical_timestamp() is monotonic in transaction order
+statement ok
+INSERT INTO kv (k,v) VALUES (1, cluster_logical_timestamp()-(select mints from m));
+SELECT * FROM kv;
+
+statement ok
+INSERT INTO kv (k,v) VALUES (2, cluster_logical_timestamp()-(select mints from m));
+SELECT * FROM kv;
+
+statement ok
+INSERT INTO kv (k,v) VALUES (3, cluster_logical_timestamp()-(select mints from m));
+SELECT * FROM kv;
+
+statement ok
+INSERT INTO kv (k,v) VALUES (4, cluster_logical_timestamp()-(select mints from m));
+SELECT * FROM kv;
+
+statement ok
+INSERT INTO kv (k,v) VALUES (5, cluster_logical_timestamp()-(select mints from m));
+SELECT * FROM kv;
+
+statement ok
+INSERT INTO kv (k,v) VALUES (6, cluster_logical_timestamp()-(select mints from m));
+SELECT * FROM kv;
+
+query I
+SELECT k FROM kv ORDER BY v
+----
+1
+2
+3
+4
+5
+6
+
 
 query I
 SELECT extract(year from timestamp '2001-04-10 12:04:59')

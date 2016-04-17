@@ -16,18 +16,44 @@
 
 package cli
 
-// Context holds parameters needed to setup a server.
-import "github.com/cockroachdb/cockroach/server"
+import (
+	"strings"
+
+	"github.com/cockroachdb/cockroach/server"
+)
+
+// statementsValue is an implementation of pflag.Value that appends any
+// argument to a slice.
+type statementsValue []string
+
+func (s *statementsValue) String() string {
+	return strings.Join(*s, ";")
+}
+
+func (s *statementsValue) Type() string {
+	return "statementsValue"
+}
+
+func (s *statementsValue) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
+type debugContext struct {
+	startKey, endKey string
+	raw              bool
+	values           bool
+}
 
 // Context contains global settings for the command-line client.
 type Context struct {
 	// Embed the server context.
 	server.Context
 
-	// OneShotSQL indicates the SQL client should run the command-line
-	// statement(s) and terminate directly, without presenting a REPL to
-	// the user.
-	OneShotSQL bool
+	// execStmts is a list of statements to execute.
+	execStmts statementsValue
+	// debugContext holds values used by debug cli commands.
+	debug debugContext
 }
 
 // NewContext returns a Context with default values.
@@ -40,5 +66,4 @@ func NewContext() *Context {
 // InitDefaults sets up the default values for a Context.
 func (ctx *Context) InitDefaults() {
 	ctx.Context.InitDefaults()
-	ctx.OneShotSQL = false
 }

@@ -20,11 +20,11 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
-	"sync"
 
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/security"
+	"github.com/cockroachdb/cockroach/sql"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/metric"
 )
 
@@ -44,11 +44,9 @@ var (
 
 // Server implements the server side of the PostgreSQL wire protocol.
 type Server struct {
-	context  *Context
-	listener net.Listener
-	mu       sync.Mutex // Mutex protects the fields below
-	conns    map[net.Conn]struct{}
-	closing  bool
+	context  *base.Context
+	executor *sql.Executor
+
 	registry *metric.Registry
 	metrics  *serverMetrics
 }
@@ -56,102 +54,43 @@ type Server struct {
 type serverMetrics struct {
 	bytesInCount  *metric.Counter
 	bytesOutCount *metric.Counter
+	conns         *metric.Counter
 }
 
-// NewServer creates a Server.
-func NewServer(context *Context) *Server {
-	// Create a registry to hold pgwire stats.
-	reg := metric.NewRegistry()
-	metrics := &serverMetrics{
-		bytesInCount:  reg.Counter("bytesin"),
-		bytesOutCount: reg.Counter("bytesout"),
-	}
-
-	return &Server{
+// MakeServer creates a Server, adding network stats to the given Registry.
+func MakeServer(context *base.Context, executor *sql.Executor, reg *metric.Registry) Server {
+	return Server{
 		context:  context,
-		conns:    make(map[net.Conn]struct{}),
-		metrics:  metrics,
+		executor: executor,
 		registry: reg,
+		metrics: &serverMetrics{
+			conns:         reg.Counter("conns"),
+			bytesInCount:  reg.Counter("bytesin"),
+			bytesOutCount: reg.Counter("bytesout"),
+		},
 	}
 }
 
-// Start a server on the given address.
-func (s *Server) Start(addr net.Addr) error {
-	ln, err := net.Listen(addr.Network(), addr.String())
+// Match returns true if rd appears to be a Postgres connection.
+func Match(rd io.Reader) bool {
+	var buf readBuffer
+	_, err := buf.readUntypedMsg(rd)
 	if err != nil {
-		return err
+		return false
 	}
-	s.listener = ln
-
-	s.context.Stopper.RunWorker(func() {
-		s.serve(ln)
-	})
-
-	s.context.Stopper.RunWorker(func() {
-		<-s.context.Stopper.ShouldStop()
-		s.close()
-	})
-	log.Infof("starting postgres server at %s", ln.Addr())
-	return nil
-}
-
-// Addr returns this Server's address.
-func (s *Server) Addr() net.Addr {
-	return s.listener.Addr()
-}
-
-// serve connections on this listener until it is closed.
-func (s *Server) serve(ln net.Listener) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if !s.isClosing() {
-				log.Error(err)
-			}
-			return
-		}
-
-		s.mu.Lock()
-		s.conns[conn] = struct{}{}
-		s.mu.Unlock()
-
-		go func() {
-			defer func() {
-				s.mu.Lock()
-				delete(s.conns, conn)
-				s.mu.Unlock()
-				conn.Close()
-			}()
-
-			if err := s.serveConn(conn); err != nil {
-				if err != io.EOF && !s.isClosing() {
-					log.Error(err)
-				}
-			}
-		}()
+	version, err := buf.getInt32()
+	if err != nil {
+		return false
 	}
+	return version == version30 || version == versionSSL
 }
 
-func (s *Server) isClosing() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closing
-}
-
-// close this server, and all client connections.
-func (s *Server) close() {
-	s.listener.Close()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closing = true
-	for conn := range s.conns {
-		conn.Close()
-	}
-}
-
-// serveConn serves a single connection, driving the handshake process
+// ServeConn serves a single connection, driving the handshake process
 // and delegating to the appropriate connection type.
-func (s *Server) serveConn(conn net.Conn) error {
+func (s *Server) ServeConn(conn net.Conn) error {
+	s.metrics.conns.Inc(1)
+	defer s.metrics.conns.Dec(1)
+
 	var buf readBuffer
 	n, err := buf.readUntypedMsg(conn)
 	if err != nil {
@@ -197,24 +136,23 @@ func (s *Server) serveConn(conn net.Conn) error {
 	}
 
 	if version == version30 {
-		v3conn := makeV3Conn(conn, s.context.Executor, s.metrics)
-		// This is better than always flushing on error.
-		defer func() {
-			if err := v3conn.wr.Flush(); err != nil {
-				log.Error(err)
-			}
-		}()
-		if errSSLRequired {
-			return v3conn.sendError(ErrSSLRequired)
+		sessionArgs, argsErr := parseOptions(buf.msg)
+		// We make a connection regardless of argsErr. If there was an error parsing
+		// the args, the connection will only be used to send a report of that
+		// error.
+		v3conn := makeV3Conn(conn, s.executor, s.metrics, sessionArgs)
+		defer v3conn.finish()
+		if argsErr != nil {
+			return v3conn.sendInternalError(err.Error())
 		}
-		if err := v3conn.parseOptions(buf.msg); err != nil {
-			return v3conn.sendError(err.Error())
+		if errSSLRequired {
+			return v3conn.sendInternalError(ErrSSLRequired)
 		}
 		if tlsConn, ok := conn.(*tls.Conn); ok {
 			tlsState := tlsConn.ConnectionState()
 			authenticationHook, err := security.UserAuthHook(s.context.Insecure, &tlsState)
 			if err != nil {
-				return v3conn.sendError(err.Error())
+				return v3conn.sendInternalError(err.Error())
 			}
 			return v3conn.serve(authenticationHook)
 		}

@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
-	"github.com/cockroachdb/cockroach/util/tracing"
+	"github.com/cockroachdb/cockroach/util/protoutil"
 )
 
 // A Stores provides methods to access a collection of stores. There's
@@ -77,12 +77,12 @@ func (ls *Stores) HasStore(storeID roachpb.StoreID) bool {
 
 // GetStore looks up the store by store ID. Returns an error
 // if not found.
-func (ls *Stores) GetStore(storeID roachpb.StoreID) (*Store, *roachpb.Error) {
+func (ls *Stores) GetStore(storeID roachpb.StoreID) (*Store, error) {
 	ls.mu.RLock()
 	store, ok := ls.storeMap[storeID]
 	ls.mu.RUnlock()
 	if !ok {
-		return nil, roachpb.NewErrorf("store %d not found", storeID)
+		return nil, util.Errorf("store %d not found", storeID)
 	}
 	return store, nil
 }
@@ -130,54 +130,52 @@ func (ls *Stores) VisitStores(visitor func(s *Store) error) error {
 // executed locally, and the replica is determined via lookup through each
 // store's LookupRange method. The latter path is taken only by unit tests.
 func (ls *Stores) Send(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
-	sp := tracing.SpanFromContext(ctx)
-	var store *Store
-	var pErr *roachpb.Error
-
 	// If we aren't given a Replica, then a little bending over
 	// backwards here. This case applies exclusively to unittests.
 	if ba.RangeID == 0 || ba.Replica.StoreID == 0 {
-		var repl *roachpb.ReplicaDescriptor
-		var rangeID roachpb.RangeID
-		rs := keys.Range(ba)
-		rangeID, repl, pErr = ls.lookupReplica(rs.Key, rs.EndKey)
-		if pErr == nil {
-			ba.RangeID = rangeID
-			ba.Replica = *repl
+		rs, err := keys.Range(ba)
+		if err != nil {
+			return nil, roachpb.NewError(err)
 		}
+		rangeID, repl, err := ls.lookupReplica(rs.Key, rs.EndKey)
+		if err != nil {
+			return nil, roachpb.NewError(err)
+		}
+		ba.RangeID = rangeID
+		ba.Replica = *repl
 	}
 
 	ctx = log.Add(ctx,
 		log.RangeID, ba.RangeID)
 
-	if pErr == nil {
-		store, pErr = ls.GetStore(ba.Replica.StoreID)
+	store, err := ls.GetStore(ba.Replica.StoreID)
+	if err != nil {
+		return nil, roachpb.NewError(err)
 	}
 
-	var br *roachpb.BatchResponse
-	if pErr != nil {
-		return nil, pErr
+	if ba.Txn != nil {
+		// For calls that read data within a txn, we keep track of timestamps
+		// observed from the various participating nodes' HLC clocks. If we have
+		// a timestamp on file for this Node which is smaller than MaxTimestamp,
+		// we can lower MaxTimestamp accordingly. If MaxTimestamp drops below
+		// OrigTimestamp, we effectively can't see uncertainty restarts any
+		// more.
+		// Note that it's not an issue if MaxTimestamp propagates back out to
+		// the client via a returned Transaction update - when updating a Txn
+		// from another, the larger MaxTimestamp wins.
+		if maxTS, ok := ba.Txn.GetObservedTimestamp(ba.Replica.NodeID); ok && maxTS.Less(ba.Txn.MaxTimestamp) {
+			// Copy-on-write to protect others we might be sharing the Txn with.
+			shallowTxn := *ba.Txn
+			// The uncertainty window is [OrigTimestamp, maxTS), so if that window
+			// is empty, there won't be any uncertainty restarts.
+			if !ba.Txn.OrigTimestamp.Less(maxTS) {
+				log.Trace(ctx, "read has no clock uncertainty")
+			}
+			shallowTxn.MaxTimestamp.Backward(maxTS)
+			ba.Txn = &shallowTxn
+		}
 	}
-	// For calls that read data within a txn, we can avoid uncertainty
-	// related retries in certain situations. If the node is in
-	// "CertainNodes", we need not worry about uncertain reads any
-	// more. Setting MaxTimestamp=OrigTimestamp for the operation
-	// accomplishes that. See roachpb.Transaction.CertainNodes for details.
-	if ba.Txn != nil && ba.Txn.CertainNodes.Contains(ba.Replica.NodeID) {
-		// MaxTimestamp = Timestamp corresponds to no clock uncertainty.
-		sp.LogEvent("read has no clock uncertainty")
-		// Copy-on-write to protect others we might be sharing the Txn with.
-		shallowTxn := *ba.Txn
-		// We set to OrigTimestamp because that works for both SNAPSHOT and
-		// SERIALIZABLE: If we used Timestamp instead, we could run into
-		// unnecessary retries at SNAPSHOT. For example, a SNAPSHOT txn at
-		// OrigTimestamp = 1000.0, Timestamp = 2000.0, MaxTimestamp = 3000.0
-		// will always read at 1000, so a MaxTimestamp of 2000 will still let
-		// it restart with uncertainty when it finds a value in (1000, 2000).
-		shallowTxn.MaxTimestamp = ba.Txn.OrigTimestamp
-		ba.Txn = &shallowTxn
-	}
-	br, pErr = store.Send(ctx, ba)
+	br, pErr := store.Send(ctx, ba)
 	if br != nil && br.Error != nil {
 		panic(roachpb.ErrorUnexpectedlySet(store, br))
 	}
@@ -189,16 +187,19 @@ func (ls *Stores) Send(ctx context.Context, ba roachpb.BatchRequest) (*roachpb.B
 // Returns RangeID and replica on success; RangeKeyMismatch error
 // if not found.
 // This is only for testing usage; performance doesn't matter.
-func (ls *Stores) lookupReplica(start, end roachpb.RKey) (rangeID roachpb.RangeID, replica *roachpb.ReplicaDescriptor, pErr *roachpb.Error) {
+func (ls *Stores) lookupReplica(start, end roachpb.RKey) (rangeID roachpb.RangeID, replica *roachpb.ReplicaDescriptor, err error) {
 	ls.mu.RLock()
 	defer ls.mu.RUnlock()
 	var rng *Replica
+	var partialDesc *roachpb.RangeDescriptor
 	for _, store := range ls.storeMap {
 		rng = store.LookupReplica(start, end)
 		if rng == nil {
 			if tmpRng := store.LookupReplica(start, nil); tmpRng != nil {
 				log.Warningf("range not contained in one range: [%s,%s), but have [%s,%s)",
 					start, end, tmpRng.Desc().StartKey, tmpRng.Desc().EndKey)
+				partialDesc = tmpRng.Desc()
+				break
 			}
 			continue
 		}
@@ -208,25 +209,25 @@ func (ls *Stores) lookupReplica(start, end roachpb.RKey) (rangeID roachpb.RangeI
 			continue
 		}
 		// Should never happen outside of tests.
-		return 0, nil, roachpb.NewErrorf(
+		return 0, nil, util.Errorf(
 			"range %+v exists on additional store: %+v", rng, store)
 	}
 	if replica == nil {
-		pErr = roachpb.NewError(roachpb.NewRangeKeyMismatchError(start.AsRawKey(), end.AsRawKey(), nil))
+		err = roachpb.NewRangeKeyMismatchError(start.AsRawKey(), end.AsRawKey(), partialDesc)
 	}
-	return rangeID, replica, pErr
+	return rangeID, replica, err
 }
 
 // FirstRange implements the RangeDescriptorDB interface. It returns the
 // range descriptor which contains KeyMin.
 func (ls *Stores) FirstRange() (*roachpb.RangeDescriptor, *roachpb.Error) {
-	_, replica, pErr := ls.lookupReplica(roachpb.RKeyMin, nil)
-	if pErr != nil {
-		return nil, pErr
+	_, replica, err := ls.lookupReplica(roachpb.RKeyMin, nil)
+	if err != nil {
+		return nil, roachpb.NewError(err)
 	}
-	store, pErr := ls.GetStore(replica.StoreID)
-	if pErr != nil {
-		return nil, pErr
+	store, err := ls.GetStore(replica.StoreID)
+	if err != nil {
+		return nil, roachpb.NewError(err)
 	}
 
 	rpl := store.LookupReplica(roachpb.RKeyMin, nil)
@@ -238,7 +239,9 @@ func (ls *Stores) FirstRange() (*roachpb.RangeDescriptor, *roachpb.Error) {
 
 // RangeLookup implements the RangeDescriptorDB interface. It looks up
 // the descriptors for the given (meta) key.
-func (ls *Stores) RangeLookup(key roachpb.RKey, _ *roachpb.RangeDescriptor, considerIntents, useReverseScan bool) ([]roachpb.RangeDescriptor, *roachpb.Error) {
+func (ls *Stores) RangeLookup(
+	key roachpb.RKey, _ *roachpb.RangeDescriptor, considerIntents, useReverseScan bool,
+) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, *roachpb.Error) {
 	ba := roachpb.BatchRequest{}
 	ba.ReadConsistency = roachpb.INCONSISTENT
 	ba.Add(&roachpb.RangeLookupRequest{
@@ -250,11 +253,12 @@ func (ls *Stores) RangeLookup(key roachpb.RKey, _ *roachpb.RangeDescriptor, cons
 		ConsiderIntents: considerIntents,
 		Reverse:         useReverseScan,
 	})
-	br, pErr := ls.Send(context.Background(), ba)
+	br, pErr := ls.Send(context.TODO(), ba)
 	if pErr != nil {
-		return nil, pErr
+		return nil, nil, pErr
 	}
-	return br.Responses[0].GetInner().(*roachpb.RangeLookupResponse).Ranges, nil
+	resp := br.Responses[0].GetInner().(*roachpb.RangeLookupResponse)
+	return resp.Ranges, resp.PrefetchedRanges, nil
 }
 
 // ReadBootstrapInfo implements the gossip.Storage interface. Read
@@ -271,7 +275,7 @@ func (ls *Stores) ReadBootstrapInfo(bi *gossip.BootstrapInfo) error {
 	// Find the most recent bootstrap info.
 	for _, s := range ls.storeMap {
 		var storeBI gossip.BootstrapInfo
-		ok, err := engine.MVCCGetProto(s.engine, keys.StoreGossipKey(), roachpb.ZeroTimestamp, true, nil, &storeBI)
+		ok, err := engine.MVCCGetProto(context.Background(), s.engine, keys.StoreGossipKey(), roachpb.ZeroTimestamp, true, nil, &storeBI)
 		if err != nil {
 			return err
 		}
@@ -305,10 +309,10 @@ func (ls *Stores) updateBootstrapInfo(bi *gossip.BootstrapInfo) error {
 	}
 	// Update the latest timestamp and set cached version.
 	ls.biLatestTS = bi.Timestamp
-	ls.latestBI = util.CloneProto(bi).(*gossip.BootstrapInfo)
+	ls.latestBI = protoutil.Clone(bi).(*gossip.BootstrapInfo)
 	// Update all stores.
 	for _, s := range ls.storeMap {
-		if err := engine.MVCCPutProto(s.engine, nil, keys.StoreGossipKey(), roachpb.ZeroTimestamp, nil, bi); err != nil {
+		if err := engine.MVCCPutProto(context.Background(), s.engine, nil, keys.StoreGossipKey(), roachpb.ZeroTimestamp, nil, bi); err != nil {
 			return err
 		}
 	}

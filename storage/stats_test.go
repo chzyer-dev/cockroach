@@ -20,12 +20,14 @@ import (
 	"reflect"
 	"testing"
 
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
 func TestRangeStatsEmpty(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tc := testContext{
 		bootstrapMode: bootstrapRangeOnly,
 	}
@@ -39,7 +41,7 @@ func TestRangeStatsEmpty(t *testing.T) {
 }
 
 func TestRangeStatsInit(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	tc.Start(t)
 	defer tc.Stop()
@@ -56,7 +58,7 @@ func TestRangeStatsInit(t *testing.T) {
 		GCBytesAge:      10,
 		LastUpdateNanos: 11,
 	}
-	if err := engine.MVCCSetRangeStats(tc.engine, 1, &ms); err != nil {
+	if err := engine.MVCCSetRangeStats(context.Background(), tc.engine, 1, &ms); err != nil {
 		t.Fatal(err)
 	}
 	s, err := newRangeStats(1, tc.engine)
@@ -69,7 +71,7 @@ func TestRangeStatsInit(t *testing.T) {
 }
 
 func TestRangeStatsMerge(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	tc := testContext{
 		bootstrapMode: bootstrapRangeOnly,
 	}
@@ -100,7 +102,7 @@ func TestRangeStatsMerge(t *testing.T) {
 	expMS := ms
 	expMS.AgeTo(10 * 1E9)
 
-	if err := engine.MVCCGetRangeStats(tc.engine, 1, &initialMS); err != nil {
+	if err := engine.MVCCGetRangeStats(context.Background(), tc.engine, 1, &initialMS); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(ms, expMS) {
@@ -115,7 +117,7 @@ func TestRangeStatsMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	expMS.Add(ms)
-	if err := engine.MVCCGetRangeStats(tc.engine, 1, &ms); err != nil {
+	if err := engine.MVCCGetRangeStats(context.Background(), tc.engine, 1, &ms); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(ms, expMS) {

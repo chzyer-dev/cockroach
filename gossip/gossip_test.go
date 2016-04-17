@@ -19,29 +19,28 @@ package gossip
 import (
 	"bytes"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
 
 	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/gossip/resolver"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/stop"
 )
 
 // TestGossipInfoStore verifies operation of gossip instance infostore.
 func TestGossipInfoStore(t *testing.T) {
-	defer leaktest.AfterTest(t)
-	rpcContext := rpc.NewContext(&base.Context{}, hlc.NewClock(hlc.UnixNano), nil)
+	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
-	g := New(rpcContext, TestBootstrap, stopper)
+	rpcContext := rpc.NewContext(nil, nil, stopper)
+	g := New(rpcContext, nil, stopper)
 	// Have to call g.SetNodeID before call g.AddInfo
 	g.SetNodeID(roachpb.NodeID(1))
 	slice := []byte("b")
@@ -57,24 +56,12 @@ func TestGossipInfoStore(t *testing.T) {
 }
 
 func TestGossipGetNextBootstrapAddress(t *testing.T) {
-	defer leaktest.AfterTest(t)
-
-	// Set up an http server for testing the http load balancer.
-	i := 0
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		i++
-		fmt.Fprintf(w, `{"address": {"network": "tcp", "address": "10.10.0.%d:12345"}}`, i)
-	})
-	s := httptest.NewServer(handler)
-	defer s.Close()
+	defer leaktest.AfterTest(t)()
+	defer resolver.SetLookupTimeout(time.Minute)()
 
 	resolverSpecs := []string{
 		"127.0.0.1:9000",
-		"tcp=127.0.0.1:9001",
-		"unix=/tmp/unix-socket12345",
-		fmt.Sprintf("http-lb=%s", s.Listener.Addr()),
-		"foo=127.0.0.1:9003", // error should not resolve.
-		"http-lb=",           // error should not resolve.
+		"127.0.0.1:9001",
 		"localhost:9004",
 	}
 
@@ -85,24 +72,17 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 			resolvers = append(resolvers, resolver)
 		}
 	}
-	if len(resolvers) != 5 {
-		t.Errorf("expected 5 resolvers; got %d", len(resolvers))
+	if len(resolvers) != 3 {
+		t.Errorf("expected 3 resolvers; got %d", len(resolvers))
 	}
 	g := New(nil, resolvers, nil)
 
-	// Using specified resolvers, fetch bootstrap addresses 10 times
+	// Using specified resolvers, fetch bootstrap addresses 3 times
 	// and verify the results match expected addresses.
 	expAddresses := []string{
 		"127.0.0.1:9000",
 		"127.0.0.1:9001",
-		"/tmp/unix-socket12345",
-		"10.10.0.1:12345",
 		"localhost:9004",
-		"10.10.0.2:12345",
-		"10.10.0.3:12345",
-		"10.10.0.4:12345",
-		"10.10.0.5:12345",
-		"10.10.0.6:12345",
 	}
 	for i := 0; i < len(expAddresses); i++ {
 		if addr := g.getNextBootstrapAddress(); addr == nil {
@@ -113,31 +93,96 @@ func TestGossipGetNextBootstrapAddress(t *testing.T) {
 	}
 }
 
+func TestGossipNoForwardSelf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop()
+	local := startGossip(1, stopper, t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start one loopback client plus enough additional clients to fill the
+	// incoming clients.
+	peers := []*Gossip{local}
+	for i := 0; i < local.server.incoming.maxSize; i++ {
+		peers = append(peers, startGossip(roachpb.NodeID(i+2), stopper, t))
+	}
+
+	for _, peer := range peers {
+		c := newClient(&local.is.NodeAddr)
+
+		util.SucceedsSoon(t, func() error {
+			conn, err := peer.rpcContext.GRPCDial(c.addr.String(), grpc.WithBlock())
+			if err != nil {
+				return err
+			}
+
+			stream, err := NewGossipClient(conn).Gossip(ctx)
+			if err != nil {
+				return err
+			}
+
+			if err := c.requestGossip(peer, peer.is.NodeAddr, stream); err != nil {
+				return err
+			}
+
+			// Wait until the server responds, so we know we're connected.
+			_, err = stream.Recv()
+			return err
+		})
+	}
+
+	const numClients = 50
+	disconnectedCh := make(chan *client)
+	numFailedConns := 0
+
+	// Start a few overflow peers and assert that they don't get forwarded to us
+	// again.
+	for i := 0; i < numClients; i++ {
+		peer := startGossip(roachpb.NodeID(i+local.server.incoming.maxSize+2), stopper, t)
+
+		c := newClient(&local.is.NodeAddr)
+		c.start(peer, disconnectedCh, peer.rpcContext, stopper)
+
+		disconnectedClient := <-disconnectedCh
+		if disconnectedClient != c {
+			t.Fatalf("expected %p to be disconnected, got %p", c, disconnectedClient)
+		} else if c.forwardAddr == nil {
+			// Under high load, clients sometimes fail to connect for reasons
+			// unrelated to the test, so we need to permit some.
+			numFailedConns++
+			t.Logf("node #%d: got nil forwarding address", peer.is.NodeID)
+		} else if *c.forwardAddr == local.is.NodeAddr {
+			t.Errorf("node #%d: got local's forwarding address", peer.is.NodeID)
+		}
+	}
+
+	if numFailedConns > numClients/10 {
+		t.Errorf("%d clients disconnected for unexpected reasons", numFailedConns)
+	}
+}
+
 // TestGossipCullNetwork verifies that a client will be culled from
 // the network periodically (at cullInterval duration intervals).
 func TestGossipCullNetwork(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
-	// Create the local gossip and minPeers peers.
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	local := startGossip(1, stopper, t)
 	local.SetCullInterval(5 * time.Millisecond)
-	peers := []*Gossip{}
-	for i := 0; i < minPeers; i++ {
-		peers = append(peers, startGossip(roachpb.NodeID(i+2), stopper, t))
-	}
 
-	// Start clients to all peers and start the local gossip's manage routine.
 	local.mu.Lock()
-	for _, p := range peers {
-		pAddr := p.is.NodeAddr
-		local.startClient(&pAddr, stopper)
+	for i := 0; i < minPeers; i++ {
+		peer := startGossip(roachpb.NodeID(i+2), stopper, t)
+		local.startClient(&peer.is.NodeAddr, stopper)
 	}
 	local.mu.Unlock()
 	local.manage()
 
-	util.SucceedsWithin(t, 10*time.Second, func() error {
+	util.SucceedsSoon(t, func() error {
 		// Verify that a client is closed within the cull interval.
 		if len(local.Outgoing()) == minPeers-1 {
 			return nil

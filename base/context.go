@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/cli/cliflags"
 	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/util"
 )
@@ -30,22 +31,26 @@ import (
 // Base context defaults.
 const (
 	defaultInsecure = false
-	defaultCertsDir = "certs"
 	defaultUser     = security.RootUser
-	rpcScheme       = "rpc"
-	rpcsScheme      = "rpcs"
 	httpScheme      = "http"
 	httpsScheme     = "https"
 
-	// Default HTTP[S]/RPC[S] port.
-	CockroachPort = "26257"
+	// From IANA Service Name and Transport Protocol Port Number Registry. See
+	// https://www.iana.org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml?search=cockroachdb
+	DefaultPort = "26257"
 
-	// Default PG port.
-	PGPort = "15432"
+	// The default port for HTTP-for-humans.
+	DefaultHTTPPort = "8080"
 
 	// NetworkTimeout is the timeout used for network operations.
 	NetworkTimeout = 3 * time.Second
 )
+
+type lazyTLSConfig struct {
+	once      sync.Once
+	tlsConfig *tls.Config
+	err       error
+}
 
 // Context is embedded by server.Context. A base context is not meant to be
 // used directly, but embedding contexts should call ctx.InitDefaults().
@@ -54,20 +59,21 @@ type Context struct {
 	// This is really not recommended.
 	Insecure bool
 
-	// Certs specifies a directory containing RSA key and x509 certs.
-	// Required unless Insecure is true.
-	Certs string
+	// SSLCA and others contain the paths to the ssl certificates and keys.
+	SSLCA      string // CA certificate
+	SSLCAKey   string // CA key (to sign only)
+	SSLCert    string // Client/server certificate
+	SSLCertKey string // Client/server key
 
 	// User running this process. It could be the user under which
-	// the server is running ("node"), or the user passed in client calls.
+	// the server is running or the user passed in client calls.
 	User string
 
-	// Protects both clientTLSConfig and serverTLSConfig.
-	tlsConfigMu sync.Mutex
 	// clientTLSConfig is the loaded client tlsConfig. It is initialized lazily.
-	clientTLSConfig *tls.Config
+	clientTLSConfig lazyTLSConfig
+
 	// serverTLSConfig is the loaded server tlsConfig. It is initialized lazily.
-	serverTLSConfig *tls.Config
+	serverTLSConfig lazyTLSConfig
 
 	// httpClient is a lazily-initialized http client.
 	// It should be accessed through Context.GetHTTPClient() which will
@@ -80,16 +86,7 @@ type Context struct {
 // InitDefaults sets up the default values for a context.
 func (ctx *Context) InitDefaults() {
 	ctx.Insecure = defaultInsecure
-	ctx.Certs = defaultCertsDir
 	ctx.User = defaultUser
-}
-
-// RPCRequestScheme returns "rpc" or "rpcs" based on the value of Insecure.
-func (ctx *Context) RPCRequestScheme() string {
-	if ctx.Insecure {
-		return rpcScheme
-	}
-	return rpcsScheme
 }
 
 // HTTPRequestScheme returns "http" or "https" based on the value of Insecure.
@@ -102,62 +99,53 @@ func (ctx *Context) HTTPRequestScheme() string {
 
 // GetClientTLSConfig returns the context client TLS config, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise load a config based
-// on the Certs directory. If Certs is empty, use a very permissive config.
-// TODO(marc): empty Certs dir should fail when client certificates are required.
+// on the SSLCert file. If SSLCert is empty, use a very permissive config.
+// TODO(marc): empty SSLCert should fail when client certificates are required.
 func (ctx *Context) GetClientTLSConfig() (*tls.Config, error) {
 	// Early out.
 	if ctx.Insecure {
 		return nil, nil
 	}
 
-	ctx.tlsConfigMu.Lock()
-	defer ctx.tlsConfigMu.Unlock()
-
-	if ctx.clientTLSConfig != nil {
-		return ctx.clientTLSConfig, nil
-	}
-
-	if ctx.Certs != "" {
-		cfg, err := security.LoadClientTLSConfig(ctx.Certs, ctx.User)
-		if err != nil {
-			return nil, util.Errorf("error setting up client TLS config: %s", err)
+	ctx.clientTLSConfig.once.Do(func() {
+		if ctx.SSLCert != "" {
+			ctx.clientTLSConfig.tlsConfig, ctx.clientTLSConfig.err = security.LoadClientTLSConfig(
+				ctx.SSLCA, ctx.SSLCert, ctx.SSLCertKey)
+			if ctx.clientTLSConfig.err != nil {
+				ctx.clientTLSConfig.err = util.Errorf("error setting up client TLS config: %s", ctx.clientTLSConfig.err)
+			}
+		} else {
+			log.Println("no certificates specified: using insecure TLS")
+			ctx.clientTLSConfig.tlsConfig = security.LoadInsecureClientTLSConfig()
 		}
-		ctx.clientTLSConfig = cfg
-	} else {
-		log.Println("no certificates directory specified: using insecure TLS")
-		ctx.clientTLSConfig = security.LoadInsecureClientTLSConfig()
-	}
+	})
 
-	return ctx.clientTLSConfig, nil
+	return ctx.clientTLSConfig.tlsConfig, ctx.clientTLSConfig.err
 }
 
 // GetServerTLSConfig returns the context server TLS config, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise load a config based
-// on the Certs directory. Fails if Insecure=false and Certs="".
+// on the SSLCert file. Fails if Insecure=false and SSLCert="".
 func (ctx *Context) GetServerTLSConfig() (*tls.Config, error) {
 	// Early out.
 	if ctx.Insecure {
 		return nil, nil
 	}
 
-	ctx.tlsConfigMu.Lock()
-	defer ctx.tlsConfigMu.Unlock()
+	ctx.serverTLSConfig.once.Do(func() {
+		if ctx.SSLCert != "" {
+			ctx.serverTLSConfig.tlsConfig, ctx.serverTLSConfig.err = security.LoadServerTLSConfig(
+				ctx.SSLCA, ctx.SSLCert, ctx.SSLCertKey)
+			if ctx.serverTLSConfig.err != nil {
+				ctx.serverTLSConfig.err = util.Errorf("error setting up client TLS config: %s", ctx.serverTLSConfig.err)
+			}
+		} else {
+			ctx.serverTLSConfig.err = util.Errorf("--%s=false, but --%s is empty. Certificates must be specified.",
+				cliflags.InsecureName, cliflags.CertName)
+		}
+	})
 
-	if ctx.serverTLSConfig != nil {
-		return ctx.serverTLSConfig, nil
-	}
-
-	if ctx.Certs == "" {
-		return nil, util.Errorf("--insecure=false, but --certs is empty. We need a certs directory")
-	}
-
-	cfg, err := security.LoadServerTLSConfig(ctx.Certs, ctx.User)
-	if err != nil {
-		return nil, util.Errorf("error setting up server TLS config: %s", err)
-	}
-	ctx.serverTLSConfig = cfg
-
-	return ctx.serverTLSConfig, nil
+	return ctx.serverTLSConfig.tlsConfig, ctx.serverTLSConfig.err
 }
 
 // GetHTTPClient returns the context http client, initializing it
@@ -170,16 +158,15 @@ func (ctx *Context) GetHTTPClient() (*http.Client, error) {
 		return ctx.httpClient, nil
 	}
 
-	if ctx.Insecure {
-		log.Println("running in insecure mode, this is strongly discouraged. See --insecure and --certs.")
-	}
 	tlsConfig, err := ctx.GetClientTLSConfig()
 	if err != nil {
 		return nil, err
 	}
 	ctx.httpClient = &http.Client{
-		Transport: &http.Transport{TLSClientConfig: tlsConfig},
-		Timeout:   NetworkTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+		Timeout: NetworkTimeout,
 	}
 
 	return ctx.httpClient, nil

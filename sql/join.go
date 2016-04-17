@@ -48,9 +48,6 @@ func makeIndexJoin(indexScan *scanNode, exactPrefix int) *indexJoinNode {
 	table.initDescDefaults()
 	table.initOrdering(0)
 
-	// TODO(radu): the join node should be aware of any filtering expressions that refer only to
-	// columns in the index to filter out rows during the join.
-
 	colIDtoRowIndex := map[ColumnID]int{}
 	for _, colID := range table.desc.PrimaryIndex.ColumnIDs {
 		idx, ok := indexScan.colIdxMap[colID]
@@ -68,13 +65,34 @@ func makeIndexJoin(indexScan *scanNode, exactPrefix int) *indexJoinNode {
 	}
 
 	for i := range indexScan.valNeededForCol {
-		// We transfer valNeededForCol to the table node
+		// We transfer valNeededForCol to the table node.
 		table.valNeededForCol[i] = indexScan.valNeededForCol[i]
 
 		// For the index node, we set valNeededForCol for columns that are part of the index.
-		id := indexScan.visibleCols[i].ID
+		id := indexScan.desc.Columns[i].ID
 		_, found := colIDtoRowIndex[id]
 		indexScan.valNeededForCol[i] = found
+	}
+
+	if indexScan.filter != nil {
+		// Transfer the filter to the table node. We must first convert the scanQValues associated
+		// with indexNode.
+		convFunc := func(expr parser.VariableExpr) (ok bool, newExpr parser.VariableExpr) {
+			qval := expr.(*scanQValue)
+			return true, table.getQValue(qval.colIdx)
+		}
+		table.filter = exprConvertVars(indexScan.filter, convFunc)
+
+		// Now we split the filter by extracting the part that can be evaluated using just the index
+		// columns.
+		splitFunc := func(expr parser.VariableExpr) (ok bool, newExpr parser.VariableExpr) {
+			colIdx := expr.(*scanQValue).colIdx
+			if !indexScan.valNeededForCol[colIdx] {
+				return false, nil
+			}
+			return true, indexScan.getQValue(colIdx)
+		}
+		indexScan.filter, table.filter = splitFilter(table.filter, splitFunc)
 	}
 
 	indexScan.initOrdering(exactPrefix)
@@ -99,6 +117,16 @@ func (n *indexJoinNode) Ordering() orderingInfo {
 
 func (n *indexJoinNode) Values() parser.DTuple {
 	return n.table.Values()
+}
+
+func (n *indexJoinNode) MarkDebug(mode explainMode) {
+	if mode != explainDebug {
+		panic(fmt.Sprintf("unknown debug mode %d", mode))
+	}
+	n.explain = mode
+	// Mark both the index and the table scan nodes as debug.
+	n.index.MarkDebug(mode)
+	n.table.MarkDebug(mode)
 }
 
 func (n *indexJoinNode) DebugValues() debugValues {
@@ -127,8 +155,7 @@ func (n *indexJoinNode) Next() bool {
 		}
 
 		// The table is out of rows. Pull primary keys from the index.
-		n.table.kvs = nil
-		n.table.kvIndex = 0
+		n.table.scanInitialized = false
 		n.table.spans = n.table.spans[:0]
 
 		for len(n.table.spans) < joinBatchSize {
@@ -184,4 +211,11 @@ func (n *indexJoinNode) PErr() *roachpb.Error {
 
 func (n *indexJoinNode) ExplainPlan() (name, description string, children []planNode) {
 	return "index-join", "", []planNode{n.index, n.table}
+}
+
+func (n *indexJoinNode) SetLimitHint(numRows int64, soft bool) {
+	if numRows < joinBatchSize {
+		numRows = joinBatchSize
+	}
+	n.index.SetLimitHint(numRows, soft)
 }

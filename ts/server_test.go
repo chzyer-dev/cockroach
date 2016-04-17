@@ -21,15 +21,14 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/ts"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 )
 
 func TestHttpQuery(t *testing.T) {
-	defer leaktest.AfterTest(t)
-	tsrv := &server.TestServer{}
+	defer leaktest.AfterTest(t)()
+	var tsrv server.TestServer
 	if err := tsrv.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +40,7 @@ func TestHttpQuery(t *testing.T) {
 		{
 			Name:   "test.metric",
 			Source: "source1",
-			Datapoints: []*ts.TimeSeriesDatapoint{
+			Datapoints: []ts.TimeSeriesDatapoint{
 				{
 					TimestampNanos: 400 * 1e9,
 					Value:          100.0,
@@ -59,7 +58,7 @@ func TestHttpQuery(t *testing.T) {
 		{
 			Name:   "test.metric",
 			Source: "source2",
-			Datapoints: []*ts.TimeSeriesDatapoint{
+			Datapoints: []ts.TimeSeriesDatapoint{
 				{
 					TimestampNanos: 400 * 1e9,
 					Value:          100.0,
@@ -80,7 +79,7 @@ func TestHttpQuery(t *testing.T) {
 		},
 		{
 			Name: "other.metric",
-			Datapoints: []*ts.TimeSeriesDatapoint{
+			Datapoints: []ts.TimeSeriesDatapoint{
 				{
 					TimestampNanos: 400 * 1e9,
 					Value:          100.0,
@@ -99,12 +98,17 @@ func TestHttpQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedResult := &ts.TimeSeriesQueryResponse{
-		Results: []*ts.TimeSeriesQueryResponse_Result{
+	expectedResult := ts.TimeSeriesQueryResponse{
+		Results: []ts.TimeSeriesQueryResponse_Result{
 			{
-				Name:    "test.metric",
-				Sources: []string{"source1", "source2"},
-				Datapoints: []*ts.TimeSeriesDatapoint{
+				Query: ts.Query{
+					Name:             "test.metric",
+					Sources:          []string{"source1", "source2"},
+					Downsampler:      ts.TimeSeriesQueryAggregator_AVG.Enum(),
+					SourceAggregator: ts.TimeSeriesQueryAggregator_SUM.Enum(),
+					Derivative:       ts.TimeSeriesQueryDerivative_NONE.Enum(),
+				},
+				Datapoints: []ts.TimeSeriesDatapoint{
 					{
 						TimestampNanos: 505 * 1e9,
 						Value:          400.0,
@@ -120,9 +124,14 @@ func TestHttpQuery(t *testing.T) {
 				},
 			},
 			{
-				Name:    "other.metric",
-				Sources: []string{""},
-				Datapoints: []*ts.TimeSeriesDatapoint{
+				Query: ts.Query{
+					Name:             "other.metric",
+					Sources:          []string{""},
+					Downsampler:      ts.TimeSeriesQueryAggregator_AVG.Enum(),
+					SourceAggregator: ts.TimeSeriesQueryAggregator_SUM.Enum(),
+					Derivative:       ts.TimeSeriesQueryDerivative_NONE.Enum(),
+				},
+				Datapoints: []ts.TimeSeriesDatapoint{
 					{
 						TimestampNanos: 505 * 1e9,
 						Value:          200.0,
@@ -133,28 +142,59 @@ func TestHttpQuery(t *testing.T) {
 					},
 				},
 			},
+			{
+				Query: ts.Query{
+					Name:             "test.metric",
+					Sources:          []string{"source1", "source2"},
+					Downsampler:      ts.TimeSeriesQueryAggregator_MAX.Enum(),
+					SourceAggregator: ts.TimeSeriesQueryAggregator_MAX.Enum(),
+					Derivative:       ts.TimeSeriesQueryDerivative_DERIVATIVE.Enum(),
+				},
+				Datapoints: []ts.TimeSeriesDatapoint{
+					{
+						TimestampNanos: 505 * 1e9,
+						Value:          1.0,
+					},
+					{
+						TimestampNanos: 515 * 1e9,
+						Value:          5.0,
+					},
+					{
+						TimestampNanos: 525 * 1e9,
+						Value:          5.0,
+					},
+				},
+			},
 		},
 	}
 
-	response := &ts.TimeSeriesQueryResponse{}
-	session := newTestHTTPSession(t, &base.Context{}, tsrv.ServingAddr())
-	session.PostProto(ts.URLQuery, &ts.TimeSeriesQueryRequest{
+	var response ts.TimeSeriesQueryResponse
+	session := makeTestHTTPSession(t, &tsrv.Ctx.Context, tsrv.HTTPAddr())
+	if err := session.PostProto(ts.URLQuery, &ts.TimeSeriesQueryRequest{
 		StartNanos: 500 * 1e9,
 		EndNanos:   526 * 1e9,
-		Queries: []ts.TimeSeriesQueryRequest_Query{
+		Queries: []ts.Query{
 			{
 				Name: "test.metric",
 			},
 			{
 				Name: "other.metric",
 			},
+			{
+				Name:             "test.metric",
+				Downsampler:      ts.TimeSeriesQueryAggregator_MAX.Enum(),
+				SourceAggregator: ts.TimeSeriesQueryAggregator_MAX.Enum(),
+				Derivative:       ts.TimeSeriesQueryDerivative_DERIVATIVE.Enum(),
+			},
 		},
-	}, response)
+	}, &response); err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range response.Results {
 		sort.Strings(r.Sources)
 	}
 	if !reflect.DeepEqual(response, expectedResult) {
-		t.Fatalf("actual response %v did not match expected response %v",
+		t.Fatalf("actual response \n%v\n did not match expected response \n%v",
 			response, expectedResult)
 	}
 }

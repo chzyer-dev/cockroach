@@ -7,13 +7,11 @@
 
 	It is generated from these files:
 		cockroach/sql/privilege.proto
-		cockroach/sql/session.proto
 		cockroach/sql/structured.proto
 
 	It has these top-level messages:
 		UserPrivileges
 		PrivilegeDescriptor
-		Session
 		ColumnType
 		ColumnDescriptor
 		IndexDescriptor
@@ -37,6 +35,10 @@ var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
 
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+const _ = proto.GoGoProtoPackageIsVersion1
+
 // UserPrivileges describes the list of privileges available for a given user.
 type UserPrivileges struct {
 	User string `protobuf:"bytes,1,opt,name=user" json:"user"`
@@ -44,19 +46,21 @@ type UserPrivileges struct {
 	Privileges uint32 `protobuf:"varint,2,opt,name=privileges" json:"privileges"`
 }
 
-func (m *UserPrivileges) Reset()         { *m = UserPrivileges{} }
-func (m *UserPrivileges) String() string { return proto.CompactTextString(m) }
-func (*UserPrivileges) ProtoMessage()    {}
+func (m *UserPrivileges) Reset()                    { *m = UserPrivileges{} }
+func (m *UserPrivileges) String() string            { return proto.CompactTextString(m) }
+func (*UserPrivileges) ProtoMessage()               {}
+func (*UserPrivileges) Descriptor() ([]byte, []int) { return fileDescriptorPrivilege, []int{0} }
 
 // PrivilegeDescriptor describes a list of users and attached
 // privileges. The list should be sorted by user for fast access.
 type PrivilegeDescriptor struct {
-	Users []*UserPrivileges `protobuf:"bytes,1,rep,name=users" json:"users,omitempty"`
+	Users []UserPrivileges `protobuf:"bytes,1,rep,name=users" json:"users"`
 }
 
-func (m *PrivilegeDescriptor) Reset()         { *m = PrivilegeDescriptor{} }
-func (m *PrivilegeDescriptor) String() string { return proto.CompactTextString(m) }
-func (*PrivilegeDescriptor) ProtoMessage()    {}
+func (m *PrivilegeDescriptor) Reset()                    { *m = PrivilegeDescriptor{} }
+func (m *PrivilegeDescriptor) String() string            { return proto.CompactTextString(m) }
+func (*PrivilegeDescriptor) ProtoMessage()               {}
+func (*PrivilegeDescriptor) Descriptor() ([]byte, []int) { return fileDescriptorPrivilege, []int{1} }
 
 func init() {
 	proto.RegisterType((*UserPrivileges)(nil), "cockroach.sql.UserPrivileges")
@@ -331,7 +335,7 @@ func (m *PrivilegeDescriptor) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Users = append(m.Users, &UserPrivileges{})
+			m.Users = append(m.Users, UserPrivileges{})
 			if err := m.Users[len(m.Users)-1].Unmarshal(data[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -461,3 +465,20 @@ var (
 	ErrInvalidLengthPrivilege = fmt.Errorf("proto: negative length found during unmarshaling")
 	ErrIntOverflowPrivilege   = fmt.Errorf("proto: integer overflow")
 )
+
+var fileDescriptorPrivilege = []byte{
+	// 193 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x09, 0x6e, 0x88, 0x02, 0xff, 0xe2, 0x92, 0x4d, 0xce, 0x4f, 0xce,
+	0x2e, 0xca, 0x4f, 0x4c, 0xce, 0xd0, 0x2f, 0x2e, 0xcc, 0xd1, 0x2f, 0x28, 0xca, 0x2c, 0xcb, 0xcc,
+	0x49, 0x4d, 0x4f, 0xd5, 0x2b, 0x28, 0xca, 0x2f, 0xc9, 0x17, 0xe2, 0x85, 0x4b, 0xeb, 0x01, 0xa5,
+	0xa5, 0x44, 0xd2, 0xf3, 0xd3, 0xf3, 0xc1, 0x32, 0xfa, 0x20, 0x16, 0x44, 0x91, 0x52, 0x00, 0x17,
+	0x5f, 0x68, 0x71, 0x6a, 0x51, 0x00, 0x4c, 0x6f, 0xb1, 0x90, 0x04, 0x17, 0x4b, 0x29, 0x50, 0x44,
+	0x82, 0x51, 0x81, 0x51, 0x83, 0xd3, 0x89, 0xe5, 0xc4, 0x3d, 0x79, 0x86, 0x20, 0xb0, 0x88, 0x90,
+	0x0a, 0x17, 0x17, 0xdc, 0x8e, 0x62, 0x09, 0x26, 0xa0, 0x3c, 0x2f, 0x54, 0x1e, 0x49, 0x1c, 0x68,
+	0xa2, 0x30, 0xdc, 0x34, 0x97, 0xd4, 0xe2, 0xe4, 0xa2, 0xcc, 0x82, 0x92, 0xfc, 0x22, 0x21, 0x4b,
+	0x2e, 0x56, 0x90, 0x21, 0xc5, 0x40, 0x73, 0x99, 0x35, 0xb8, 0x8d, 0x64, 0xf5, 0x50, 0x5c, 0xa7,
+	0x87, 0xea, 0x08, 0xa8, 0xb1, 0x10, 0x1d, 0x4e, 0xb2, 0x27, 0x1e, 0xca, 0x31, 0x9c, 0x78, 0x24,
+	0xc7, 0x78, 0x01, 0x88, 0x6f, 0x00, 0xf1, 0x03, 0x20, 0x9e, 0xf0, 0x58, 0x8e, 0x21, 0x8a, 0x19,
+	0xa8, 0x35, 0x82, 0x01, 0x10, 0x00, 0x00, 0xff, 0xff, 0x1f, 0x14, 0xa5, 0x9b, 0x09, 0x01, 0x00,
+	0x00,
+}

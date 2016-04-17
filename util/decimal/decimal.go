@@ -25,6 +25,8 @@ import (
 	"gopkg.in/inf.v0"
 )
 
+var e = smallExp(inf.NewDec(1, 0), decimalOne, 1000)
+
 // NewDecFromFloat allocates and returns a new Dec set to the given
 // float64 value. The function will panic if the float is NaN or ±Inf.
 func NewDecFromFloat(f float64) *inf.Dec {
@@ -154,6 +156,92 @@ func Sqrt(z, x *inf.Dec, s inf.Scale) *inf.Dec {
 	return z.Round(z, s, inf.RoundHalfUp)
 }
 
+// Cbrt calculates the cube root of x to the specified scale
+// and stores the result in z, which is also the return value.
+//
+// The cube root calculation is implemented using Newton-Raphson
+// method. We start with an initial estimate for cbrt(d), and
+// then iterate:
+//     x_{n+1} = 1/3 * ( 2 * x_n + (d / x_n / x_n) ).
+func Cbrt(z, x *inf.Dec, s inf.Scale) *inf.Dec {
+	switch z {
+	case nil:
+		z = new(inf.Dec)
+	case x:
+		x = new(inf.Dec)
+		x.Set(z)
+	}
+
+	// Validate the sign of x.
+	switch x.Sign() {
+	case -1:
+		// Make sure args aren't mutated and return -Cbrt(-x).
+		x = new(inf.Dec).Neg(x)
+		z = Cbrt(z, x, s)
+		return z.Neg(z)
+	case 0:
+		return z.SetUnscaled(0).SetScale(0)
+	}
+
+	z.Set(x)
+	exp8 := 0
+
+	// Follow Ken Turkowski paper:
+	// https://people.freebsd.org/~lstewart/references/apple_tr_kt32_cuberoot.pdf
+	//
+	// Computing the cube root of any number is reduced to computing
+	// the cube root of a number between 0.125 and 1. After the next loops,
+	// x = z * 8^exp8 will hold.
+	for z.Cmp(decimalOneEighth) < 0 {
+		exp8--
+		z.Mul(z, decimalEight)
+	}
+
+	for z.Cmp(decimalOne) > 0 {
+		exp8++
+		z.Mul(z, decimalOneEighth)
+	}
+
+	// Use this polynomial to approximate the cube root between 0.125 and 1.
+	// z = (-0.46946116 * z + 1.072302) * z + 0.3812513
+	// It will serve as an initial estimate, hence the precision of this
+	// computation may only impact performance, not correctness.
+	z0 := new(inf.Dec).Set(z)
+	z.Mul(z, decimalCbrtC1)
+	z.Add(z, decimalCbrtC2)
+	z.Mul(z, z0)
+	z.Add(z, decimalCbrtC3)
+
+	for ; exp8 < 0; exp8++ {
+		z.Mul(z, decimalHalf)
+	}
+
+	for ; exp8 > 0; exp8-- {
+		z.Mul(z, decimalTwo)
+	}
+
+	z0.Set(z)
+
+	// Loop until convergence.
+	for loop := newLoop("cbrt", x, s, 1); ; {
+		// z = (2.0 * z0 +  x / (z0 * z0) ) / 3.0;
+		z.Set(z0)
+		z.Mul(z, z0)
+		z.QuoRound(x, z, s+2, inf.RoundHalfUp)
+		z.Add(z, z0)
+		z.Add(z, z0)
+		z.QuoRound(z, decimalThree, s+2, inf.RoundHalfUp)
+
+		if loop.done(z) {
+			break
+		}
+		z0.Set(z)
+	}
+
+	// Round to the desired scale.
+	return z.Round(z, s, inf.RoundHalfUp)
+}
+
 // LogN computes the log of x with base n to the specified scale and
 // stores the result in z, which is also the return value. The function
 // will panic if x is a negative number or if n is a negative number.
@@ -241,4 +329,140 @@ func Log(z *inf.Dec, x *inf.Dec, s inf.Scale) *inf.Dec {
 
 	// Round to the desired scale.
 	return z.Round(z, s, inf.RoundHalfUp)
+}
+
+// For integers we use exponentiation by squaring.
+// See: https://en.wikipedia.org/wiki/Exponentiation_by_squaring
+func integerPower(z, x *inf.Dec, y int64, s inf.Scale) *inf.Dec {
+	if z == nil {
+		z = new(inf.Dec)
+	}
+
+	neg := y < 0
+	if neg {
+		y = -y
+	}
+
+	z.Set(decimalOne)
+	for y > 0 {
+		if y%2 == 1 {
+			z = z.Mul(z, x)
+		}
+		y >>= 1
+		x.Mul(x, x)
+	}
+
+	if neg {
+		z = z.QuoRound(decimalOne, z, s+2, inf.RoundHalfUp)
+	}
+	return z.Round(z, s, inf.RoundHalfUp)
+}
+
+// smallExp computes z * e^x using the Taylor series to the specified scale and
+// stores the result in z, which is also the return value. It should be used
+// with small x values only.
+func smallExp(z, x *inf.Dec, s inf.Scale) *inf.Dec {
+	// Allocate if needed and make sure args aren't mutated.
+	if z == nil {
+		z = new(inf.Dec)
+		z.SetUnscaled(1).SetScale(0)
+	}
+	n := new(inf.Dec)
+	tmp := new(inf.Dec).Set(z)
+	for loop := newLoop("exp", z, s, 1); !loop.done(z); {
+		n.Add(n, decimalOne)
+		tmp.Mul(tmp, x)
+		tmp.QuoRound(tmp, n, s+2, inf.RoundHalfUp)
+		z.Add(z, tmp)
+	}
+	// Round to the desired scale.
+	return z.Round(z, s, inf.RoundHalfUp)
+}
+
+// Exp computes (e^n) (where n = a*b with a being an integer and b < 1)
+// to the specified scale and stores the result in z, which is also the
+// return value.
+func Exp(z, n *inf.Dec, s inf.Scale) *inf.Dec {
+	s += 2
+	nn := new(inf.Dec).Set(n)
+	if z == nil {
+		z = new(inf.Dec)
+		z.SetUnscaled(1).SetScale(0)
+	} else {
+		z.SetUnscaled(1).SetScale(0)
+	}
+
+	// We are computing (e^n) by splitting n into an integer and a float
+	// (e.g 3.1 ==> x = 3, y = 0.1), this allows us to write
+	// e^n = e^(x+y) = e^x * e^y
+
+	// Split out x (integer(n))
+	x := new(inf.Dec).Round(nn, 0, inf.RoundDown)
+
+	// Split out y (n - x) which is < 1
+	y := new(inf.Dec).Sub(nn, x)
+
+	// convert x to integer
+	integer, ok := x.Unscaled()
+	if !ok {
+		panic("integer out of range")
+	}
+
+	ex := integerPower(z, new(inf.Dec).Set(e), integer, s+2)
+	return smallExp(ex, y, s-2)
+}
+
+// Pow computes (x^y) as e^(y ln x) to the specified scale and stores
+// the result in z, which is also the return value. If y is not an
+// integer and x is negative nil is returned.
+func Pow(z, x, y *inf.Dec, s inf.Scale) *inf.Dec {
+	s = s + 2
+	if z == nil {
+		z = new(inf.Dec)
+		z.SetUnscaled(1).SetScale(0)
+	}
+
+	// Check if y is of type int.
+	tmp := new(inf.Dec).Abs(y)
+	isInt := tmp.Cmp(new(inf.Dec).Round(tmp, 0, inf.RoundDown)) == 0
+
+	neg := x.Sign() < 0
+
+	if !isInt && neg {
+		return nil
+	}
+
+	// Exponent Precision Explanation (RaduBerinde):
+	// Say we compute the Log with a scale of k. That means that the result we get is:
+	// ln x +/- 10^-k.
+	// This leads to an error of y * 10^-k in the exponent, which leads to a
+	// multiplicative error of e^(y*10^-k) in the result.
+	// For small values of u, e^u can be approximated by 1 + u, so for large k
+	// that error is around 1 + y*10^-k. So the additive error will be x^y * y * 10^-k,
+	// and we want this to be less than 10^-s. This approximately means that k has to be
+	// s + the number of digits before the decimal point in x^y. Which roughly is
+	//
+	// s + <the number of digits before decimal point in x> * y.
+	//
+	// exponent precision = s + <the number of digits before decimal point in x> * y.
+	numDigits := float64(x.UnscaledBig().BitLen()) / digitsToBitsRatio
+	numDigits -= float64(x.Scale())
+
+	// Round up y which should provide us with a threshold in calculating the new scale.
+	yu := float64(new(inf.Dec).Round(y, 0, inf.RoundUp).UnscaledBig().Int64())
+
+	// exponent precision = s + <the number of digits before decimal point in x> * y
+	es := s + inf.Scale(int32(numDigits*yu))
+
+	tmp = new(inf.Dec).Abs(x)
+	Log(tmp, tmp, es)
+	tmp.Mul(tmp, y)
+	Exp(tmp, tmp, es)
+
+	if neg && y.Round(y, 0, inf.RoundDown).UnscaledBig().Bit(0) == 1 {
+		tmp.Neg(tmp)
+	}
+
+	// Round to the desired scale.
+	return z.Round(tmp, s-2, inf.RoundHalfUp)
 }

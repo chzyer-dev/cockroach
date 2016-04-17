@@ -23,9 +23,8 @@ import (
 	"net"
 	"reflect"
 	"strconv"
-	"strings"
 
-	"github.com/lib/pq/oid"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/sql"
@@ -33,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/cockroachdb/cockroach/util/tracing"
+	"github.com/cockroachdb/pq/oid"
 )
 
 //go:generate stringer -type=clientMessageType
@@ -51,6 +51,7 @@ const (
 	clientMsgClose       clientMessageType = 'C'
 	clientMsgBind        clientMessageType = 'B'
 	clientMsgExecute     clientMessageType = 'E'
+	clientMsgFlush       clientMessageType = 'H'
 
 	serverMsgAuth                 serverMessageType = 'R'
 	serverMsgCommandComplete      serverMessageType = 'C'
@@ -63,6 +64,7 @@ const (
 	serverMsgParameterDescription serverMessageType = 't'
 	serverMsgBindComplete         serverMessageType = '2'
 	serverMsgParameterStatus      serverMessageType = 'S'
+	serverMsgNoData               serverMessageType = 'n'
 )
 
 //go:generate stringer -type=prepareType
@@ -95,14 +97,14 @@ type preparedPortal struct {
 }
 
 type v3Conn struct {
+	conn     net.Conn
 	rd       *bufio.Reader
 	wr       *bufio.Writer
-	opts     opts
 	executor *sql.Executor
 	readBuf  readBuffer
 	writeBuf writeBuffer
 	tagBuf   [64]byte
-	session  sql.Session
+	session  *sql.Session
 
 	preparedStatements map[string]preparedStatement
 	preparedPortals    map[string]preparedPortal
@@ -115,12 +117,11 @@ type v3Conn struct {
 	metrics *serverMetrics
 }
 
-type opts struct {
-	user, database string
-}
-
-func makeV3Conn(conn net.Conn, executor *sql.Executor, metrics *serverMetrics) v3Conn {
+func makeV3Conn(
+	conn net.Conn, executor *sql.Executor,
+	metrics *serverMetrics, sessionArgs sql.SessionArgs) v3Conn {
 	return v3Conn{
+		conn:               conn,
 		rd:                 bufio.NewReader(conn),
 		wr:                 bufio.NewWriter(conn),
 		executor:           executor,
@@ -128,40 +129,55 @@ func makeV3Conn(conn net.Conn, executor *sql.Executor, metrics *serverMetrics) v
 		preparedStatements: make(map[string]preparedStatement),
 		preparedPortals:    make(map[string]preparedPortal),
 		metrics:            metrics,
+		session:            sql.NewSession(sessionArgs, executor, conn.RemoteAddr()),
 	}
 }
 
-func (c *v3Conn) parseOptions(data []byte) error {
+func (c *v3Conn) finish() {
+	// This is better than always flushing on error.
+	if err := c.wr.Flush(); err != nil {
+		log.Error(err)
+	}
+	_ = c.conn.Close()
+	c.session.Finish()
+}
+
+func parseOptions(data []byte) (sql.SessionArgs, error) {
+	args := sql.SessionArgs{}
 	buf := readBuffer{msg: data}
 	for {
 		key, err := buf.getString()
 		if err != nil {
-			return util.Errorf("error reading option key: %s", err)
+			return sql.SessionArgs{}, util.Errorf("error reading option key: %s", err)
 		}
 		if len(key) == 0 {
-			return nil
+			break
 		}
 		value, err := buf.getString()
 		if err != nil {
-			return util.Errorf("error reading option value: %s", err)
+			return sql.SessionArgs{}, util.Errorf("error reading option value: %s", err)
 		}
 		switch key {
 		case "database":
-			c.opts.database = value
+			args.Database = value
 		case "user":
-			c.opts.user = value
+			args.User = value
 		default:
 			if log.V(1) {
 				log.Warningf("unrecognized configuration parameter %q", key)
 			}
 		}
 	}
+	return args, nil
 }
 
 func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	if authenticationHook != nil {
-		if err := authenticationHook(c.opts.user, true /* public */); err != nil {
-			return c.sendError(err.Error())
+		if err := authenticationHook(c.session.User, true /* public */); err != nil {
+			return c.sendInternalError(err.Error())
 		}
 	}
 	c.writeBuf.initMsg(serverMsgAuth)
@@ -195,17 +211,24 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 	for {
 		if !c.doingExtendedQueryMessage {
 			c.writeBuf.initMsg(serverMsgReady)
-			var txnStatus byte = 'I'
-			if sessionTxn := c.session.Txn; sessionTxn != nil {
-				switch sessionTxn.Txn.Status {
-				case roachpb.PENDING:
-					txnStatus = 'T'
-				case roachpb.COMMITTED:
-					txnStatus = 'I'
-				case roachpb.ABORTED:
-					txnStatus = 'E'
-				}
+			var txnStatus byte
+			switch c.session.TxnState.State {
+			case sql.Aborted, sql.RestartWait:
+				// We send status "InFailedTransaction" also for state RestartWait
+				// because GO's lib/pq freaks out if we invent a new status.
+				txnStatus = 'E'
+			case sql.Open:
+				txnStatus = 'T'
+			case sql.NoTxn:
+				// We're not in a txn (i.e. the last txn was committed).
+				txnStatus = 'I'
+			case sql.CommitWait:
+				// We need to lie to pgwire and claim that we're still
+				// in a txn. Otherwise drivers freak out.
+				// This state is not part of the Postgres protocol.
+				txnStatus = 'T'
 			}
+
 			if log.V(2) {
 				log.Infof("pgwire: %s: %q", serverMsgReady, txnStatus)
 			}
@@ -213,11 +236,12 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 			if err := c.writeBuf.finishMsg(c.wr); err != nil {
 				return err
 			}
-		}
-		// If the buffer is empty (which is the case if ignoring messages),
-		// this does nothing.
-		if err := c.wr.Flush(); err != nil {
-			return err
+			// We only flush on every message if not doing an extended query.
+			// If we are, wait for an explicit Flush message. See:
+			// http://www.postgresql.org/docs/current/static/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY.
+			if err := c.wr.Flush(); err != nil {
+				return err
+			}
 		}
 		typ, n, err := c.readBuf.readTypedMsg(c.rd)
 		c.metrics.bytesInCount.Inc(int64(n))
@@ -242,14 +266,14 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 
 		case clientMsgSimpleQuery:
 			c.doingExtendedQueryMessage = false
-			err = c.handleSimpleQuery(&c.readBuf)
+			err = c.handleSimpleQuery(ctx, &c.readBuf)
 
 		case clientMsgTerminate:
 			return nil
 
 		case clientMsgParse:
 			c.doingExtendedQueryMessage = true
-			err = c.handleParse(&c.readBuf)
+			err = c.handleParse(ctx, &c.readBuf)
 
 		case clientMsgDescribe:
 			c.doingExtendedQueryMessage = true
@@ -265,10 +289,14 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 
 		case clientMsgExecute:
 			c.doingExtendedQueryMessage = true
-			err = c.handleExecute(&c.readBuf)
+			err = c.handleExecute(ctx, &c.readBuf)
+
+		case clientMsgFlush:
+			c.doingExtendedQueryMessage = true
+			err = c.wr.Flush()
 
 		default:
-			err = c.sendError(fmt.Sprintf("unrecognized client message type %s", typ))
+			err = c.sendInternalError(fmt.Sprintf("unrecognized client message type %s", typ))
 		}
 		if err != nil {
 			return err
@@ -276,16 +304,16 @@ func (c *v3Conn) serve(authenticationHook func(string, bool) error) error {
 	}
 }
 
-func (c *v3Conn) handleSimpleQuery(buf *readBuffer) error {
+func (c *v3Conn) handleSimpleQuery(ctx context.Context, buf *readBuffer) error {
 	query, err := buf.getString()
 	if err != nil {
 		return err
 	}
 
-	return c.executeStatements(query, nil, nil, true)
+	return c.executeStatements(ctx, query, nil, nil, true, 0)
 }
 
-func (c *v3Conn) handleParse(buf *readBuffer) error {
+func (c *v3Conn) handleParse(ctx context.Context, buf *readBuffer) error {
 	name, err := buf.getString()
 	if err != nil {
 		return err
@@ -293,7 +321,7 @@ func (c *v3Conn) handleParse(buf *readBuffer) error {
 	// The unnamed prepared statement can be freely overwritten.
 	if name != "" {
 		if _, ok := c.preparedStatements[name]; ok {
-			return c.sendError(fmt.Sprintf("prepared statement %q already exists", name))
+			return c.sendInternalError(fmt.Sprintf("prepared statement %q already exists", name))
 		}
 	}
 	query, err := buf.getString()
@@ -320,30 +348,36 @@ func (c *v3Conn) handleParse(buf *readBuffer) error {
 		}
 		v, ok := oidToDatum[t]
 		if !ok {
-			return c.sendError(fmt.Sprintf("unknown oid type: %v", t))
+			return c.sendInternalError(fmt.Sprintf("unknown oid type: %v", t))
 		}
 		args[fmt.Sprint(i+1)] = v
 	}
-	cols, pErr := c.executor.Prepare(c.opts.user, query, args)
+	cols, pErr := c.executor.Prepare(ctx, query, c.session, args)
 	if pErr != nil {
-		return c.sendError(pErr.String())
+		return c.sendPError(pErr)
 	}
 	pq := preparedStatement{
 		query:       query,
-		inTypes:     make([]oid.Oid, len(args)),
+		inTypes:     make([]oid.Oid, 0, len(args)),
 		portalNames: make(map[string]struct{}),
 		columns:     cols,
 	}
-	copy(pq.inTypes, inTypeHints)
 	for k, v := range args {
 		i, err := strconv.Atoi(k)
 		if err != nil {
-			return c.sendError(fmt.Sprintf("non-integer parameter name: %s", k))
+			return c.sendInternalError(fmt.Sprintf("non-integer parameter: %s", k))
 		}
 		// ValArgs are 1-indexed, pq.inTypes are 0-indexed.
 		i--
-		if len(pq.inTypes) <= i {
-			return c.sendError("internal error: leftover valargs")
+		if i < 0 {
+			return c.sendInternalError(fmt.Sprintf("there is no parameter $%s", k))
+		}
+		// Grow pq.inTypes to be at least as large as i.
+		for j := len(pq.inTypes); j <= i; j++ {
+			pq.inTypes = append(pq.inTypes, 0)
+			if j < len(inTypeHints) {
+				pq.inTypes[j] = inTypeHints[j]
+			}
 		}
 		// OID to Datum is not a 1-1 mapping (for example, int4 and int8 both map
 		// to DummyInt), so we need to maintain the types sent by the client.
@@ -352,9 +386,15 @@ func (c *v3Conn) handleParse(buf *readBuffer) error {
 		}
 		id, ok := datumToOid[reflect.TypeOf(v)]
 		if !ok {
-			return c.sendError(fmt.Sprintf("unknown datum type: %s", v.Type()))
+			return c.sendInternalError(fmt.Sprintf("unknown datum type: %s", v.Type()))
 		}
 		pq.inTypes[i] = id
+	}
+	for i := range pq.inTypes {
+		if pq.inTypes[i] == 0 {
+			return c.sendInternalError(
+				fmt.Sprintf("could not determine data type of parameter $%d", i+1))
+		}
 	}
 	c.preparedStatements[name] = pq
 	c.writeBuf.initMsg(serverMsgParseComplete)
@@ -364,7 +404,7 @@ func (c *v3Conn) handleParse(buf *readBuffer) error {
 func (c *v3Conn) handleDescribe(buf *readBuffer) error {
 	typ, err := buf.getPrepareType()
 	if err != nil {
-		return c.sendError(err.Error())
+		return c.sendInternalError(err.Error())
 	}
 	name, err := buf.getString()
 	if err != nil {
@@ -374,7 +414,7 @@ func (c *v3Conn) handleDescribe(buf *readBuffer) error {
 	case prepareStatement:
 		stmt, ok := c.preparedStatements[name]
 		if !ok {
-			return c.sendError(fmt.Sprintf("unknown prepared statement %q", name))
+			return c.sendInternalError(fmt.Sprintf("unknown prepared statement %q", name))
 		}
 		c.writeBuf.initMsg(serverMsgParameterDescription)
 		c.writeBuf.putInt16(int16(len(stmt.inTypes)))
@@ -389,11 +429,11 @@ func (c *v3Conn) handleDescribe(buf *readBuffer) error {
 	case preparePortal:
 		prtl, ok := c.preparedPortals[name]
 		if !ok {
-			return c.sendError(fmt.Sprintf("unknown portal %q", name))
+			return c.sendInternalError(fmt.Sprintf("unknown portal %q", name))
 		}
 		stmt, ok := c.preparedStatements[prtl.stmtName]
 		if !ok {
-			return c.sendError(fmt.Sprintf("unknown prepared statement %q", name))
+			return c.sendInternalError(fmt.Sprintf("unknown prepared statement %q", name))
 		}
 
 		return c.sendRowDescription(stmt.columns, prtl.outFormats)
@@ -405,7 +445,7 @@ func (c *v3Conn) handleDescribe(buf *readBuffer) error {
 func (c *v3Conn) handleClose(buf *readBuffer) error {
 	typ, err := buf.getPrepareType()
 	if err != nil {
-		return c.sendError(err.Error())
+		return c.sendInternalError(err.Error())
 	}
 	name, err := buf.getString()
 	if err != nil {
@@ -440,7 +480,7 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 	// The unnamed portal can be freely overwritten.
 	if portalName != "" {
 		if _, ok := c.preparedPortals[portalName]; ok {
-			return c.sendError(fmt.Sprintf("portal %q already exists", portalName))
+			return c.sendInternalError(fmt.Sprintf("portal %q already exists", portalName))
 		}
 	}
 	statementName, err := buf.getString()
@@ -449,34 +489,53 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 	}
 	stmt, ok := c.preparedStatements[statementName]
 	if !ok {
-		return c.sendError(fmt.Sprintf("unknown prepared statement %q", statementName))
+		return c.sendInternalError(fmt.Sprintf("unknown prepared statement %q", statementName))
 	}
+
+	numParams := int16(len(stmt.inTypes))
+	paramFormatCodes := make([]formatCode, numParams)
+
+	// From the docs on number of parameter format codes to bind:
+	// This can be zero to indicate that there are no parameters or that the
+	// parameters all use the default format (text); or one, in which case the
+	// specified format code is applied to all parameters; or it can equal the
+	// actual number of parameters.
+	// http://www.postgresql.org/docs/current/static/protocol-message-formats.html
 	numParamFormatCodes, err := buf.getInt16()
 	if err != nil {
 		return err
 	}
-	numParams := len(stmt.inTypes)
-	paramFormatCodes := make([]formatCode, numParams)
-	for i := range paramFormatCodes[:numParamFormatCodes] {
+	switch numParamFormatCodes {
+	case 0:
+	case 1:
+		// `1` means read one code and apply it to every param.
 		c, err := buf.getInt16()
 		if err != nil {
 			return err
 		}
-		paramFormatCodes[i] = formatCode(c)
-	}
-	if numParamFormatCodes == 1 {
-		fmtCode := paramFormatCodes[0]
-
+		fmtCode := formatCode(c)
 		for i := range paramFormatCodes {
 			paramFormatCodes[i] = fmtCode
 		}
+	case numParams:
+		// Read one format code for each param and apply it to that param.
+		for i := range paramFormatCodes {
+			c, err := buf.getInt16()
+			if err != nil {
+				return err
+			}
+			paramFormatCodes[i] = formatCode(c)
+		}
+	default:
+		return c.sendInternalError(fmt.Sprintf("wrong number of format codes specified: %d for %d paramaters", numParamFormatCodes, numParams))
 	}
+
 	numValues, err := buf.getInt16()
 	if err != nil {
 		return err
 	}
-	if int(numValues) != numParams {
-		return c.sendError(fmt.Sprintf("expected %d parameters, got %d", numParams, numValues))
+	if numValues != numParams {
+		return c.sendInternalError(fmt.Sprintf("expected %d parameters, got %d", numParams, numValues))
 	}
 	params := make([]parser.Datum, numParams)
 	for i, t := range stmt.inTypes {
@@ -494,32 +553,49 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 		}
 		d, err := decodeOidDatum(t, paramFormatCodes[i], b)
 		if err != nil {
-			return c.sendError(fmt.Sprintf("param $%d: %s", i+1, err))
+			return c.sendInternalError(fmt.Sprintf("param $%d: %s", i+1, err))
 		}
 		params[i] = d
 	}
 
+	numColumns := int16(len(stmt.columns))
+	columnFormatCodes := make([]formatCode, numColumns)
+
+	// From the docs on number of result-column format codes to bind:
+	// This can be zero to indicate that there are no result columns or that
+	// the result columns should all use the default format (text); or one, in
+	// which case the specified format code is applied to all result columns
+	// (if any); or it can equal the actual number of result columns of the
+	// query.
+	// http://www.postgresql.org/docs/current/static/protocol-message-formats.html
 	numColumnFormatCodes, err := buf.getInt16()
 	if err != nil {
 		return err
 	}
-	numColumns := len(stmt.columns)
-	columnFormatCodes := make([]formatCode, numColumns)
-	for i := range columnFormatCodes[:numColumnFormatCodes] {
+	switch numColumnFormatCodes {
+	case 0:
+	case 1:
+		// Read one code and apply it to every column.
 		c, err := buf.getInt16()
 		if err != nil {
 			return err
 		}
-		columnFormatCodes[i] = formatCode(c)
-	}
-	if numColumnFormatCodes == 1 {
-		fmtCode := columnFormatCodes[0]
-
+		fmtCode := formatCode(c)
 		for i := range columnFormatCodes {
 			columnFormatCodes[i] = formatCode(fmtCode)
 		}
+	case numColumns:
+		// Read one format code for each column and apply it to that column.
+		for i := range columnFormatCodes {
+			c, err := buf.getInt16()
+			if err != nil {
+				return err
+			}
+			columnFormatCodes[i] = formatCode(c)
+		}
+	default:
+		return c.sendInternalError(fmt.Sprintf("expected 0, 1, or %d for number of format codes, got %d", numColumns, numColumnFormatCodes))
 	}
-
 	stmt.portalNames[portalName] = struct{}{}
 	c.preparedPortals[portalName] = preparedPortal{
 		stmt:       stmt,
@@ -531,49 +607,41 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 	return c.writeBuf.finishMsg(c.wr)
 }
 
-func (c *v3Conn) handleExecute(buf *readBuffer) error {
+func (c *v3Conn) handleExecute(ctx context.Context, buf *readBuffer) error {
 	portalName, err := buf.getString()
 	if err != nil {
 		return err
 	}
 	portal, ok := c.preparedPortals[portalName]
 	if !ok {
-		return c.sendError(fmt.Sprintf("unknown portal %q", portalName))
+		return c.sendInternalError(fmt.Sprintf("unknown portal %q", portalName))
 	}
 	limit, err := buf.getInt32()
 	if err != nil {
 		return err
 	}
-	if limit != 0 {
-		return c.sendError("execute row count limits not supported")
-	}
 
-	return c.executeStatements(portal.stmt.query, portal.params, portal.outFormats, false)
+	return c.executeStatements(ctx, portal.stmt.query, portal.params, portal.outFormats, false, limit)
 }
 
-func (c *v3Conn) executeStatements(stmts string, params []parser.Datum, formatCodes []formatCode, sendDescription bool) error {
+func (c *v3Conn) executeStatements(
+	ctx context.Context,
+	stmts string,
+	params []parser.Datum,
+	formatCodes []formatCode,
+	sendDescription bool,
+	limit int32,
+) error {
 	tracing.AnnotateTrace()
+	results := c.executor.ExecuteStatements(ctx, c.session, stmts, params)
 
-	c.session.Database = c.opts.database
-
-	// TODO(dt): this is a clumsy check better left to the actual parser. #3852
-	if len(strings.TrimSpace(stmts)) == 0 {
+	tracing.AnnotateTrace()
+	if results.Empty {
 		// Skip executor and just send EmptyQueryResponse.
 		c.writeBuf.initMsg(serverMsgEmptyQuery)
 		return c.writeBuf.finishMsg(c.wr)
 	}
-
-	resp, _, err := c.executor.ExecuteStatements(c.opts.user, c.session, stmts, params)
-	if err != nil {
-		return c.sendError(err.Error())
-	}
-
-	c.session.Reset()
-	c.session = resp.Session
-
-	c.opts.database = c.session.Database
-	tracing.AnnotateTrace()
-	return c.sendResponse(resp, formatCodes, sendDescription)
+	return c.sendResponse(results.ResultList, formatCodes, sendDescription, limit)
 }
 
 func (c *v3Conn) sendCommandComplete(tag []byte) error {
@@ -583,7 +651,25 @@ func (c *v3Conn) sendCommandComplete(tag []byte) error {
 	return c.writeBuf.finishMsg(c.wr)
 }
 
-func (c *v3Conn) sendError(errToSend string) error {
+func (c *v3Conn) sendPError(pErr *roachpb.Error) error {
+	var errCode string
+	if sqlErr, ok := pErr.GetDetail().(*roachpb.ErrorWithPGCode); ok {
+		errCode = sqlErr.ErrorCode
+	} else {
+		errCode = sql.CodeInternalError
+	}
+	return c.sendError(errCode, pErr.String())
+}
+
+// TODO(andrei): Figure out the correct codes to send for all the errors
+// in this file and remove this function.
+func (c *v3Conn) sendInternalError(errToSend string) error {
+	return c.sendError(sql.CodeInternalError, errToSend)
+}
+
+// errCode is a postgres error code, plus our extensions.
+// See http://www.postgresql.org/docs/9.5/static/errcodes-appendix.html
+func (c *v3Conn) sendError(errCode string, errToSend string) error {
 	if c.doingExtendedQueryMessage {
 		c.ignoreTillSync = true
 	}
@@ -598,11 +684,7 @@ func (c *v3Conn) sendError(errToSend string) error {
 	if err := c.writeBuf.WriteByte('C'); err != nil {
 		return err
 	}
-	// "XX000" is "internal error".
-	// TODO(bdarnell): map our errors to appropriate postgres error
-	// codes as defined in
-	// http://www.postgresql.org/docs/9.4/static/errcodes-appendix.html
-	if err := c.writeBuf.writeString("XX000"); err != nil {
+	if err := c.writeBuf.writeString(errCode); err != nil {
 		return err
 	}
 	if err := c.writeBuf.WriteByte('M'); err != nil {
@@ -614,19 +696,28 @@ func (c *v3Conn) sendError(errToSend string) error {
 	if err := c.writeBuf.WriteByte(0); err != nil {
 		return err
 	}
-	return c.writeBuf.finishMsg(c.wr)
+	if err := c.writeBuf.finishMsg(c.wr); err != nil {
+		return err
+	}
+	return c.wr.Flush()
 }
 
-func (c *v3Conn) sendResponse(resp sql.Response, formatCodes []formatCode, sendDescription bool) error {
-	if len(resp.Results) == 0 {
+func (c *v3Conn) sendResponse(results sql.ResultList, formatCodes []formatCode, sendDescription bool, limit int32) error {
+	if len(results) == 0 {
 		return c.sendCommandComplete(nil)
 	}
-	for _, result := range resp.Results {
+	for _, result := range results {
 		if result.PErr != nil {
-			if err := c.sendError(result.PErr.String()); err != nil {
+			if err := c.sendPError(result.PErr); err != nil {
 				return err
 			}
-			continue
+			break
+		}
+		if limit != 0 && len(result.Rows) > int(limit) {
+			if err := c.sendInternalError(fmt.Sprintf("execute row count limits not supported: %d of %d", limit, len(result.Rows))); err != nil {
+				return err
+			}
+			break
 		}
 
 		if result.PGTag == "INSERT" {
@@ -701,6 +792,11 @@ func (c *v3Conn) sendResponse(resp sql.Response, formatCodes []formatCode, sendD
 }
 
 func (c *v3Conn) sendRowDescription(columns []sql.ResultColumn, formatCodes []formatCode) error {
+	if len(columns) == 0 {
+		c.writeBuf.initMsg(serverMsgNoData)
+		return c.writeBuf.finishMsg(c.wr)
+	}
+
 	c.writeBuf.initMsg(serverMsgRowDescription)
 	c.writeBuf.putInt16(int16(len(columns)))
 	for i, column := range columns {

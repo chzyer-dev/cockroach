@@ -18,19 +18,19 @@ package kv_test
 
 import (
 	"errors"
-	"reflect"
 	"sync/atomic"
 	"testing"
-	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/keys"
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/roachpb"
 	"github.com/cockroachdb/cockroach/server"
-	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/testutils"
+	"github.com/cockroachdb/cockroach/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/leaktest"
@@ -48,7 +48,7 @@ import (
 // proceed in the event that a write intent is extant at the meta
 // index record being read.
 func TestRangeLookupWithOpenTransaction(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
@@ -58,7 +58,7 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 	key := testutils.MakeKey(keys.Meta1Prefix, roachpb.KeyMax)
 	now := s.Clock().Now()
 	txn := roachpb.NewTransaction("txn", roachpb.Key("foobar"), 0, roachpb.SERIALIZABLE, now, 0)
-	if err := engine.MVCCPutProto(s.Ctx.Engines[0], nil, key, now, txn, &roachpb.RangeDescriptor{}); err != nil {
+	if err := engine.MVCCPutProto(context.Background(), s.Ctx.Engines[0], nil, key, now, txn, &roachpb.RangeDescriptor{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -92,8 +92,17 @@ func setupMultipleRanges(t *testing.T, ts *server.TestServer, splitAt ...string)
 	return db
 }
 
-func TestMultiRangeBatchBounded(t *testing.T) {
-	defer leaktest.AfterTest(t)
+func checkScanResults(t *testing.T, results []client.Result, expResults [][]string) {
+	if len(expResults) != len(results) {
+		t.Fatalf("only got %d results, wanted %d", len(expResults), len(results))
+	}
+	for i, res := range results {
+		client.CheckKeysInKVs(t, res.Rows, expResults[i]...)
+	}
+}
+
+func TestMultiRangeBatchBoundedScans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f")
@@ -101,12 +110,6 @@ func TestMultiRangeBatchBounded(t *testing.T) {
 		if err := db.Put(key, "value"); err != nil {
 			t.Fatal(err)
 		}
-	}
-
-	expResults := [][]string{
-		{"aaa", "b", "bb"},
-		{"a", "aa"},
-		{"cc", "d", "dd"},
 	}
 
 	b := db.NewBatch()
@@ -117,18 +120,52 @@ func TestMultiRangeBatchBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(expResults) != len(b.Results) {
-		t.Fatalf("only got %d results, wanted %d", len(expResults), len(b.Results))
+	checkScanResults(t, b.Results, [][]string{
+		{"aaa", "b", "bb"},
+		{"a", "aa"},
+		{"cc", "d", "dd"},
+	})
+}
+
+func TestMultiRangeBoundedBatch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := server.StartTestServer(t)
+	defer s.Stop()
+
+	db := setupMultipleRanges(t, s, "a", "b", "c", "d", "e", "f")
+	for _, key := range []string{"a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1", "f1", "f2", "f3"} {
+		if err := db.Put(key, "value"); err != nil {
+			t.Fatal(err)
+		}
 	}
-	for i, res := range b.Results {
-		expRes := expResults[i]
-		var actRes []string
-		for _, k := range res.Rows {
-			actRes = append(actRes, string(k.Key))
+
+	for bound := 1; bound <= 20; bound++ {
+		b := db.NewBatch()
+		b.MaxScanResults = int64(bound)
+
+		b.Scan("a", "c", 0)
+		b.Scan("b", "f", 3)
+		b.Scan("c", "g", 0)
+		b.Scan("f1a", "g", 1)
+		if err := db.Run(b); err != nil {
+			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(actRes, expRes) {
-			t.Errorf("%d: got %v, wanted %v", i, actRes, expRes)
+
+		// These are the expected results if there is no bound; we trim them below.
+		expResults := [][]string{
+			{"a1", "a2", "a3", "b1", "b2"},
+			{"b1", "b2", "c1"},
+			{"c1", "c2", "d1", "f1", "f2", "f3"},
+			{"f2"},
 		}
+		rem := bound
+		for i := range expResults {
+			if rem < len(expResults[i]) {
+				expResults[i] = expResults[i][:rem]
+			}
+			rem -= len(expResults[i])
+		}
+		checkScanResults(t, b.Results, expResults)
 	}
 }
 
@@ -136,7 +173,7 @@ func TestMultiRangeBatchBounded(t *testing.T) {
 // multi-range request deals with a range without any active requests after
 // truncation. In that case, the request is skipped.
 func TestMultiRangeEmptyAfterTruncate(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := setupMultipleRanges(t, s, "c", "d")
@@ -145,8 +182,8 @@ func TestMultiRangeEmptyAfterTruncate(t *testing.T) {
 	// any active requests.
 	if pErr := db.Txn(func(txn *client.Txn) *roachpb.Error {
 		b := txn.NewBatch()
-		b.DelRange("a", "b")
-		b.DelRange("e", "f")
+		b.DelRange("a", "b", false)
+		b.DelRange("e", "f", false)
 		return txn.CommitInBatch(b)
 	}); pErr != nil {
 		t.Fatalf("unexpected error on transactional DeleteRange: %s", pErr)
@@ -156,7 +193,7 @@ func TestMultiRangeEmptyAfterTruncate(t *testing.T) {
 // TestMultiRangeScanReverseScanDeleteResolve verifies that Scan, ReverseScan,
 // DeleteRange and ResolveIntentRange work across ranges.
 func TestMultiRangeScanReverseScanDeleteResolve(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := setupMultipleRanges(t, s, "b")
@@ -185,7 +222,7 @@ func TestMultiRangeScanReverseScanDeleteResolve(t *testing.T) {
 	// resolved via ResolveIntentRange upon completion.
 	if pErr := db.Txn(func(txn *client.Txn) *roachpb.Error {
 		b := txn.NewBatch()
-		b.DelRange("a", "d")
+		b.DelRange("a", "d", false)
 		return txn.CommitInBatch(b)
 	}); pErr != nil {
 		t.Fatalf("unexpected error on transactional DeleteRange: %s", pErr)
@@ -210,7 +247,7 @@ func TestMultiRangeScanReverseScanDeleteResolve(t *testing.T) {
 // across ranges that doesn't require read consistency will set a timestamp
 // using the clock local to the distributed sender.
 func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	s := server.StartTestServer(t)
 	defer s.Stop()
@@ -219,22 +256,22 @@ func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 	// Write keys "a" and "b", the latter of which is the first key in the
 	// second range.
 	keys := [2]string{"a", "b"}
-	ts := [2]time.Time{}
+	ts := [2]roachpb.Timestamp{}
 	for i, key := range keys {
 		b := &client.Batch{}
 		b.Put(key, "value")
 		if pErr := db.Run(b); pErr != nil {
 			t.Fatal(pErr)
 		}
-		ts[i] = b.Results[0].Rows[0].Timestamp()
-		log.Infof("%d: %d.%d", i, ts[i].Unix(), ts[i].Nanosecond())
+		ts[i] = s.Clock().Now()
+		log.Infof("%d: %d", i, ts[i])
 		if i == 0 {
-			util.SucceedsWithin(t, time.Second, func() error {
+			util.SucceedsSoon(t, func() error {
 				// Enforce that when we write the second key, it's written
 				// with a strictly higher timestamp. We're dropping logical
 				// ticks and the clock may just have been pushed into the
 				// future, so that's necessary. See #3122.
-				if !s.Clock().PhysicalTime().After(ts[0]) {
+				if !ts[0].Less(s.Clock().Now()) {
 					return errors.New("time stands still")
 				}
 				return nil
@@ -245,42 +282,38 @@ func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 	// Do an inconsistent Scan/ReverseScan from a new DistSender and verify
 	// it does the read at its local clock and doesn't receive an
 	// OpRequiresTxnError. We set the local clock to the timestamp of
-	// the first key to verify it's used to read only key "a".
-	manual := hlc.NewManualClock(ts[1].UnixNano() - 1)
-	clock := hlc.NewClock(manual.UnixNano)
-	ds := kv.NewDistSender(&kv.DistSenderContext{Clock: clock, RPCContext: s.RPCContext()}, s.Gossip())
+	// just above the first key to verify it's used to read only key "a".
+	for _, request := range []roachpb.Request{
+		roachpb.NewScan(roachpb.Key("a"), roachpb.Key("c"), 0),
+		roachpb.NewReverseScan(roachpb.Key("a"), roachpb.Key("c"), 0),
+	} {
+		manual := hlc.NewManualClock(ts[0].WallTime + 1)
+		clock := hlc.NewClock(manual.UnixNano)
+		ds := kv.NewDistSender(&kv.DistSenderContext{Clock: clock, RPCContext: s.RPCContext()}, s.Gossip())
 
-	// Scan.
-	sa := roachpb.NewScan(roachpb.Key("a"), roachpb.Key("c"), 0).(*roachpb.ScanRequest)
-	reply, pErr := client.SendWrappedWith(ds, nil, roachpb.Header{
-		ReadConsistency: roachpb.INCONSISTENT,
-	}, sa)
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
-	sr := reply.(*roachpb.ScanResponse)
+		reply, pErr := client.SendWrappedWith(ds, nil, roachpb.Header{
+			ReadConsistency: roachpb.INCONSISTENT,
+		}, request)
+		if pErr != nil {
+			t.Fatal(pErr)
+		}
 
-	if l := len(sr.Rows); l != 1 {
-		t.Fatalf("expected 1 row; got %d", l)
-	}
-	if key := string(sr.Rows[0].Key); keys[0] != key {
-		t.Errorf("expected key %q; got %q", keys[0], key)
-	}
+		var rows []roachpb.KeyValue
+		switch r := reply.(type) {
+		case *roachpb.ScanResponse:
+			rows = r.Rows
+		case *roachpb.ReverseScanResponse:
+			rows = r.Rows
+		default:
+			t.Fatalf("unexpected response %T: %v", reply, reply)
+		}
 
-	// ReverseScan.
-	rsa := roachpb.NewReverseScan(roachpb.Key("a"), roachpb.Key("c"), 0).(*roachpb.ReverseScanRequest)
-	reply, pErr = client.SendWrappedWith(ds, nil, roachpb.Header{
-		ReadConsistency: roachpb.INCONSISTENT,
-	}, rsa)
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
-	rsr := reply.(*roachpb.ReverseScanResponse)
-	if l := len(rsr.Rows); l != 1 {
-		t.Fatalf("expected 1 row; got %d", l)
-	}
-	if key := string(rsr.Rows[0].Key); keys[0] != key {
-		t.Errorf("expected key %q; got %q", keys[0], key)
+		if l := len(rows); l != 1 {
+			t.Fatalf("expected 1 row; got %d", l)
+		}
+		if key := string(rows[0].Key); keys[0] != key {
+			t.Errorf("expected key %q; got %q", keys[0], key)
+		}
 	}
 }
 
@@ -307,7 +340,7 @@ func initReverseScanTestEnv(s *server.TestServer, t *testing.T) *client.DB {
 // TestSingleRangeReverseScan verifies that ReverseScan gets the right results
 // on a single range.
 func TestSingleRangeReverseScan(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := initReverseScanTestEnv(s, t)
@@ -345,7 +378,7 @@ func TestSingleRangeReverseScan(t *testing.T) {
 // TestMultiRangeReverseScan verifies that ReverseScan gets the right results
 // across multiple ranges.
 func TestMultiRangeReverseScan(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := initReverseScanTestEnv(s, t)
@@ -367,7 +400,7 @@ func TestMultiRangeReverseScan(t *testing.T) {
 // TestReverseScanWithSplitAndMerge verifies that ReverseScan gets the right results
 // across multiple ranges while range splits and merges happen.
 func TestReverseScanWithSplitAndMerge(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := initReverseScanTestEnv(s, t)
@@ -398,7 +431,7 @@ func TestReverseScanWithSplitAndMerge(t *testing.T) {
 }
 
 func TestBadRequest(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	db := createTestClient(t, s.Stopper(), s.ServingAddr())
 	defer s.Stop()
@@ -429,7 +462,7 @@ func TestBadRequest(t *testing.T) {
 // sequence cache is not updated with RangeKeyMismatchError. This is a
 // higher-level version of TestSequenceCacheShouldCache.
 func TestNoSequenceCachePutOnRangeMismatchError(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := setupMultipleRanges(t, s, "b", "c")
@@ -467,29 +500,27 @@ func TestNoSequenceCachePutOnRangeMismatchError(t *testing.T) {
 // propagates the txn data to a next iteration. Use txn.Writing field to
 // verify that.
 func TestPropagateTxnOnError(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	// Set up a filter to so that the first CPut operation will
 	// get a ReadWithinUncertaintyIntervalError.
 	targetKey := roachpb.Key("b")
 	var numGets int32
-	storage.TestingCommandFilter = func(_ roachpb.StoreID, args roachpb.Request, h roachpb.Header) error {
-		if _, ok := args.(*roachpb.ConditionalPutRequest); ok && args.Header().Key.Equal(targetKey) {
-			if atomic.AddInt32(&numGets, 1) == 1 {
-				return &roachpb.ReadWithinUncertaintyIntervalError{
-					Timestamp:         h.Timestamp,
-					ExistingTimestamp: h.Timestamp,
+
+	ctx := server.NewTestContext()
+	ctx.TestingKnobs.StoreTestingKnobs.TestingCommandFilter =
+		func(fArgs storageutils.FilterArgs) *roachpb.Error {
+			_, ok := fArgs.Req.(*roachpb.ConditionalPutRequest)
+			if ok && fArgs.Req.Header().Key.Equal(targetKey) {
+				if atomic.AddInt32(&numGets, 1) == 1 {
+					z := roachpb.ZeroTimestamp
+					pErr := roachpb.NewReadWithinUncertaintyIntervalError(z, z)
+					return roachpb.NewErrorWithTxn(pErr, fArgs.Hdr.Txn)
 				}
-
 			}
+			return nil
 		}
-		return nil
-	}
-	defer func() {
-		storage.TestingCommandFilter = nil
-	}()
-
-	s := server.StartTestServer(t)
+	s := server.StartTestServerWithContext(t, ctx)
 	defer s.Stop()
 	db := setupMultipleRanges(t, s, "b")
 
@@ -545,7 +576,7 @@ func TestPropagateTxnOnError(t *testing.T) {
 // but verifies that txn data are propagated to the next iteration on
 // TransactionPushError.
 func TestPropagateTxnOnPushError(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	s := server.StartTestServer(t)
 	defer s.Stop()
 	db := setupMultipleRanges(t, s, "b")
@@ -553,16 +584,23 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 	waitForWriteIntent := make(chan struct{})
 	waitForTxnRestart := make(chan struct{})
 	waitForTxnCommit := make(chan struct{})
+	lowPriority := int32(1)
+	highPriority := int32(10)
+	key := "a"
 	// Create a goroutine that creates a write intent and waits until
 	// another txn created in this test is restarted.
 	go func() {
 		if pErr := db.Txn(func(txn *client.Txn) *roachpb.Error {
-			if pErr := txn.Put("b", "val"); pErr != nil {
+			// Set high priority so that the intent will not be pushed.
+			txn.InternalSetPriority(highPriority)
+			log.Infof("Creating a write intent with high priority")
+			if pErr := txn.Put(key, "val"); pErr != nil {
 				return pErr
 			}
 			close(waitForWriteIntent)
 			// Wait until another txn in this test is
 			// restarted by a push txn error.
+			log.Infof("Waiting for the txn restart")
 			<-waitForTxnRestart
 			return txn.CommitInBatch(txn.NewBatch())
 		}); pErr != nil {
@@ -572,39 +610,34 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 	}()
 
 	// Wait until a write intent is created by the above goroutine.
+	log.Infof("Waiting for the write intent creation")
 	<-waitForWriteIntent
 
-	// The transaction below is restarted multiple times.
-	// - The first retry is caused by the write intent created on key "b" by the above goroutine.
-	// - The subsequent retries are caused by the write conflict on key "a". Since the txn
-	//   ID is not propagated, a txn of a new epoch always has a new txn ID different
-	//   from the previous txn's. So, the write intent made by the txn of the previous epoch
-	//   is treated as a write made by some different txn.
+	// The transaction below is restarted exactly once. The restart is
+	// caused by the write intent created on key "a" by the above goroutine.
+	// When the txn is retried, the error propagates the txn ID to the next
+	// iteration.
 	epoch := 0
 	var txnID *uuid.UUID
 	if pErr := db.Txn(func(txn *client.Txn) *roachpb.Error {
-		// Set low priority so that the intent will not be pushed.
-		txn.InternalSetPriority(1)
+		// Set low priority so that a write from this txn will not push others.
+		txn.InternalSetPriority(lowPriority)
 
 		epoch++
 
 		if epoch == 2 {
 			close(waitForTxnRestart)
 			// Wait until the txn created by the goroutine is committed.
+			log.Infof("Waiting for the txn commit")
 			<-waitForTxnCommit
 			if !roachpb.TxnIDEqual(txn.Proto.ID, txnID) {
 				t.Errorf("txn ID is not propagated; got %s", txn.Proto.ID)
 			}
 		}
 
-		b := txn.NewBatch()
-		b.Put("a", "val")
-		b.Put("b", "val")
-		// The commit returns an error, but it will not be
-		// passed to the next iteration. txnSender.Send() does
-		// not update the txn data since
-		// TransactionPushError.Transaction() returns nil.
-		pErr := txn.CommitInBatch(b)
+		// The commit returns an error, and it will pass
+		// the txn data to the next iteration.
+		pErr := txn.Put(key, "val")
 		if epoch == 1 {
 			if tErr, ok := pErr.GetDetail().(*roachpb.TransactionPushError); ok {
 				if pErr.GetTxn().ID == nil {
@@ -622,5 +655,11 @@ func TestPropagateTxnOnPushError(t *testing.T) {
 
 	if e := 2; epoch != e {
 		t.Errorf("unexpected epoch; the txn must be attempted %d times, but got %d attempts", e, epoch)
+		if epoch == 1 {
+			// Wait for the completion of the goroutine to see if it successfully commits the txn.
+			close(waitForTxnRestart)
+			log.Infof("Waiting for the txn commit")
+			<-waitForTxnCommit
+		}
 	}
 }

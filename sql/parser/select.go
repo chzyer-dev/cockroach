@@ -33,35 +33,44 @@ type SelectStatement interface {
 	selectStatement()
 }
 
-func (*ParenSelect) selectStatement() {}
-func (*Select) selectStatement()      {}
-func (*Union) selectStatement()       {}
-func (Values) selectStatement()       {}
+func (*ParenSelect) selectStatement()  {}
+func (*SelectClause) selectStatement() {}
+func (*UnionClause) selectStatement()  {}
+func (*ValuesClause) selectStatement() {}
+
+// Select represents a SelectStatement with an ORDER and/or LIMIT.
+type Select struct {
+	Select  SelectStatement
+	OrderBy OrderBy
+	Limit   *Limit
+}
+
+func (node *Select) String() string {
+	return fmt.Sprintf("%s%s%s", node.Select, node.OrderBy, node.Limit)
+}
 
 // ParenSelect represents a parenthesized SELECT/UNION/VALUES statement.
 type ParenSelect struct {
-	Select SelectStatement
+	Select *Select
 }
 
 func (node *ParenSelect) String() string {
 	return fmt.Sprintf("(%s)", node.Select)
 }
 
-// Select represents a SELECT statement.
-type Select struct {
+// SelectClause represents a SELECT statement.
+type SelectClause struct {
 	Distinct    bool
 	Exprs       SelectExprs
 	From        TableExprs
 	Where       *Where
 	GroupBy     GroupBy
 	Having      *Where
-	OrderBy     OrderBy
-	Limit       *Limit
 	Lock        string
 	tableSelect bool
 }
 
-func (node *Select) String() string {
+func (node *SelectClause) String() string {
 	if node.tableSelect && len(node.From) == 1 {
 		return fmt.Sprintf("TABLE %s", node.From[0])
 	}
@@ -69,11 +78,10 @@ func (node *Select) String() string {
 	if node.Distinct {
 		distinct = " DISTINCT"
 	}
-	return fmt.Sprintf("SELECT%s%s%s%s%s%s%s%s%s",
+	return fmt.Sprintf("SELECT%s%s%s%s%s%s%s",
 		distinct, node.Exprs,
 		node.From, node.Where,
-		node.GroupBy, node.Having, node.OrderBy,
-		node.Limit, node.Lock)
+		node.GroupBy, node.Having, node.Lock)
 }
 
 // SelectExprs represents SELECT expressions.
@@ -152,16 +160,40 @@ func (*AliasedTableExpr) tableExpr() {}
 func (*ParenTableExpr) tableExpr()   {}
 func (*JoinTableExpr) tableExpr()    {}
 
+// IndexHints represents "@<index_name>" or "@{param[,param]}" where param is
+// one of:
+//  - FORCE_INDEX=<index_name>
+//  - NO_INDEX_JOIN
+// It is used optionally after a table name in SELECT statements.
+type IndexHints struct {
+	Index       Name
+	NoIndexJoin bool
+}
+
+func (n *IndexHints) String() string {
+	if !n.NoIndexJoin {
+		return fmt.Sprintf("@%s", n.Index)
+	}
+	if n.Index == "" {
+		return "@{NO_INDEX_JOIN}"
+	}
+	return fmt.Sprintf("@{FORCE_INDEX=%s,NO_INDEX_JOIN}", n.Index)
+}
+
 // AliasedTableExpr represents a table expression coupled with an optional
 // alias.
 type AliasedTableExpr struct {
-	Expr SimpleTableExpr
-	As   AliasClause
+	Expr  SimpleTableExpr
+	Hints *IndexHints
+	As    AliasClause
 }
 
 func (node *AliasedTableExpr) String() string {
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "%s", node.Expr)
+	if node.Hints != nil {
+		buf.WriteString(node.Hints.String())
+	}
 	if node.As.Alias != "" {
 		fmt.Fprintf(&buf, " AS %s", node.As)
 	}

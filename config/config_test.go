@@ -18,6 +18,7 @@ package config_test
 
 import (
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
@@ -56,7 +57,7 @@ func kv(k, v []byte) roachpb.KeyValue {
 }
 
 func TestObjectIDForKey(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	testCases := []struct {
 		key     roachpb.RKey
@@ -88,7 +89,7 @@ func TestObjectIDForKey(t *testing.T) {
 }
 
 func TestGet(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	emptyKeys := []roachpb.KeyValue{}
 	someKeys := []roachpb.KeyValue{
@@ -132,7 +133,7 @@ func TestGet(t *testing.T) {
 }
 
 func TestGetLargestID(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		values  []roachpb.KeyValue
 		largest uint32
@@ -172,7 +173,7 @@ func TestGetLargestID(t *testing.T) {
 		}, 12, 0, ""},
 
 		// Real SQL layout.
-		{sql.MakeMetadataSchema().GetInitialValues(), keys.MaxSystemConfigDescID + 1, 0, ""},
+		{sql.MakeMetadataSchema().GetInitialValues(), keys.MaxSystemConfigDescID + 4, 0, ""},
 
 		// Test non-zero max.
 		{[]roachpb.KeyValue{
@@ -211,7 +212,7 @@ func TestGetLargestID(t *testing.T) {
 }
 
 func TestComputeSplits(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 
 	const (
 		start         = keys.MaxReservedDescID + 1
@@ -233,9 +234,13 @@ func TestComputeSplits(t *testing.T) {
 	// Real SQL system with reserved non-system and user database.
 	allSql := append(schema.GetInitialValues(),
 		descriptor(start), descriptor(start+1), descriptor(start+5))
+	sort.Sort(roachpb.KeyValueByKey(allSql))
 
 	allUserSplits := []uint32{start, start + 1, start + 2, start + 3, start + 4, start + 5}
-	allReservedSplits := []uint32{reservedStart, reservedStart + 1, reservedStart + 2}
+	var allReservedSplits []uint32
+	for i := 0; i < schema.TableCount(); i++ {
+		allReservedSplits = append(allReservedSplits, reservedStart+uint32(i))
+	}
 	allSplits := append(allReservedSplits, allUserSplits...)
 
 	testCases := []struct {
@@ -251,10 +256,10 @@ func TestComputeSplits(t *testing.T) {
 		{nil, roachpb.RKeyMin, keys.MakeTablePrefix(start + 10), nil},
 
 		// No user data.
-		{baseSql, roachpb.RKeyMin, roachpb.RKeyMax, allReservedSplits[:1]},
+		{baseSql, roachpb.RKeyMin, roachpb.RKeyMax, allReservedSplits},
 		{baseSql, keys.MakeTablePrefix(start), roachpb.RKeyMax, nil},
 		{baseSql, keys.MakeTablePrefix(start), keys.MakeTablePrefix(start + 10), nil},
-		{baseSql, roachpb.RKeyMin, keys.MakeTablePrefix(start + 10), allReservedSplits[:1]},
+		{baseSql, roachpb.RKeyMin, keys.MakeTablePrefix(start + 10), allReservedSplits},
 
 		// User descriptors.
 		{userSql, keys.MakeTablePrefix(start - 1), roachpb.RKeyMax, allUserSplits},
@@ -287,11 +292,11 @@ func TestComputeSplits(t *testing.T) {
 		// Reserved/User mix.
 		{allSql, roachpb.RKeyMin, roachpb.RKeyMax, allSplits},
 		{allSql, keys.MakeTablePrefix(reservedStart + 1), roachpb.RKeyMax, allSplits[2:]},
-		{allSql, keys.MakeTablePrefix(start), roachpb.RKeyMax, allSplits[4:]},
+		{allSql, keys.MakeTablePrefix(start), roachpb.RKeyMax, allUserSplits[1:]},
 		{allSql, keys.MakeTablePrefix(reservedStart), keys.MakeTablePrefix(start + 10), allSplits[1:]},
-		{allSql, roachpb.RKeyMin, keys.MakeTablePrefix(start + 2), allSplits[:5]},
+		{allSql, roachpb.RKeyMin, keys.MakeTablePrefix(start + 2), allSplits[:6]},
 		{allSql, testutils.MakeKey(keys.MakeTablePrefix(reservedStart), roachpb.RKey("foo")),
-			testutils.MakeKey(keys.MakeTablePrefix(start+5), roachpb.RKey("foo")), allSplits[1:8]},
+			testutils.MakeKey(keys.MakeTablePrefix(start+5), roachpb.RKey("foo")), allSplits[1:9]},
 	}
 
 	cfg := config.SystemConfig{}
@@ -309,6 +314,57 @@ func TestComputeSplits(t *testing.T) {
 		}
 		if !reflect.DeepEqual(splits, expected) {
 			t.Errorf("#%d: bad splits:\ngot: %v\nexpected: %v", tcNum, splits, expected)
+		}
+	}
+}
+
+func TestZoneConfigValidate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		cfg      config.ZoneConfig
+		expected string
+	}{
+		{
+			config.ZoneConfig{},
+			"attributes for at least one replica must be specified in zone config",
+		},
+		{
+			config.ZoneConfig{
+				ReplicaAttrs: make([]roachpb.Attributes, 2),
+			},
+			"at least 3 replicas are required for multi-replica configurations",
+		},
+		{
+			config.ZoneConfig{
+				ReplicaAttrs: make([]roachpb.Attributes, 1),
+			},
+			"RangeMaxBytes 0 less than minimum allowed",
+		},
+		{
+			config.ZoneConfig{
+				ReplicaAttrs:  make([]roachpb.Attributes, 1),
+				RangeMaxBytes: config.DefaultZoneConfig().RangeMaxBytes,
+			},
+			"",
+		},
+		{
+			config.ZoneConfig{
+				ReplicaAttrs:  make([]roachpb.Attributes, 1),
+				RangeMinBytes: config.DefaultZoneConfig().RangeMaxBytes,
+				RangeMaxBytes: config.DefaultZoneConfig().RangeMaxBytes,
+			},
+			"is greater than or equal to RangeMaxBytes",
+		},
+	}
+	for i, c := range testCases {
+		err := c.cfg.Validate()
+		if c.expected == "" {
+			if err != nil {
+				t.Fatalf("%d: expected success, but got %v", i, err)
+			}
+		} else if !testutils.IsError(err, c.expected) {
+			t.Fatalf("%d: expected %s, but got %v", i, c.expected, err)
 		}
 	}
 }

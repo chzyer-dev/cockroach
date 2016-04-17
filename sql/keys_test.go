@@ -25,7 +25,7 @@ import (
 )
 
 func TestNormalizeName(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		in, expected string
 	}{
@@ -34,7 +34,7 @@ func TestNormalizeName(t *testing.T) {
 		{"no\u0308rmalization", "n\u00f6rmalization"}, // NFD -> NFC.
 	}
 	for _, test := range testCases {
-		s := normalizeName(test.in)
+		s := NormalizeName(test.in)
 		if test.expected != s {
 			t.Errorf("%s: expected %s, but found %s", test.in, test.expected, s)
 		}
@@ -42,7 +42,7 @@ func TestNormalizeName(t *testing.T) {
 }
 
 func TestKeyAddress(t *testing.T) {
-	defer leaktest.AfterTest(t)
+	defer leaktest.AfterTest(t)()
 	testCases := []struct {
 		key roachpb.Key
 	}{
@@ -55,7 +55,11 @@ func TestKeyAddress(t *testing.T) {
 	}
 	var lastKey roachpb.Key
 	for i, test := range testCases {
-		result := keys.Addr(test.key).AsRawKey()
+		resultAddr, err := keys.Addr(test.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := resultAddr.AsRawKey()
 		if result.Compare(lastKey) <= 0 {
 			t.Errorf("%d: key address %q is <= %q", i, result, lastKey)
 		}
